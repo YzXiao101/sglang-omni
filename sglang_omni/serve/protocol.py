@@ -209,7 +209,9 @@ class CreateSpeechRequest(BaseModel):
     ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
-    token_count: int | None = Field(default=None, gt=0)  # MOSS-TTS duration token target
+    token_count: int | None = Field(
+        default=None, gt=0
+    )  # MOSS-TTS duration token target
     duration_tokens: int | None = Field(default=None, gt=0)  # alias for token_count
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
 
@@ -240,7 +242,9 @@ class CreateSpeechRequest(BaseModel):
                 raise ValueError('stream_format="audio" requires response_format="pcm"')
 
         if self.token_count is not None and self.duration_tokens is not None:
-            raise ValueError("token_count and duration_tokens are aliases; provide only one")
+            raise ValueError(
+                "token_count and duration_tokens are aliases; provide only one"
+            )
 
         if self.ref_text is not None and self.ref_audio is None:
             raise ValueError("ref_text requires ref_audio")
