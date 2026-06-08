@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
@@ -62,6 +64,29 @@ __all__ = [
     "BailingMoeV2Config",
     "BailingMoeV2ForCausalLM",
 ]
+
+
+@dataclass
+class _WeightLoadCategoryStats:
+    count: int = 0
+    num_bytes: int = 0
+    seconds: float = 0.0
+
+    def add(self, tensor: Any, elapsed_s: float = 0.0) -> None:
+        self.count += 1
+        self.num_bytes += _tensor_nbytes(tensor)
+        self.seconds += elapsed_s
+
+
+def _tensor_nbytes(tensor: Any) -> int:
+    try:
+        return int(tensor.numel() * tensor.element_size())
+    except Exception:
+        return 0
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f}GiB"
 
 
 # ============================================================================
@@ -623,6 +648,7 @@ class BailingMoeV2TextModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights with prefix-based selection and MoE mapping."""
+        text_loader_start_s = time.perf_counter()
 
         from sglang_omni.models.qwen3_omni.components.thinker_model import (
             extract_fused_experts,
@@ -640,6 +666,11 @@ class BailingMoeV2TextModel(nn.Module):
         _skipped_weight_count = 0
         _unmatched_weight_names: list[str] = []
         _gate_up_fused_shards: dict[str, set[int]] = {}
+        _attn_qkv_stats = _WeightLoadCategoryStats()
+        _moe_stats = _WeightLoadCategoryStats()
+        _gate_up_stats = _WeightLoadCategoryStats()
+        _direct_stats = _WeightLoadCategoryStats()
+        _unmatched_stats = _WeightLoadCategoryStats()
 
         for name, loaded_weight in weights:
             # Strip common prefixes from Ming checkpoint
@@ -674,7 +705,11 @@ class BailingMoeV2TextModel(nn.Module):
                     fused_key = name.replace(shard_name, fused_name)
                     if fused_key in params_dict:
                         param = params_dict[fused_key]
+                        load_start_s = time.perf_counter()
                         param.weight_loader(param, loaded_weight, shard_id)
+                        _attn_qkv_stats.add(
+                            loaded_weight, time.perf_counter() - load_start_s
+                        )
                         _loaded_weight_count += 1
                         matched_attn = True
                         break
@@ -702,12 +737,16 @@ class BailingMoeV2TextModel(nn.Module):
                     )
                     if fused_key in params_dict:
                         param = params_dict[fused_key]
+                        load_start_s = time.perf_counter()
                         param.weight_loader(
                             param,
                             loaded_weight,
                             name,
                             shard_id=shard_id,
                             expert_id=expert_id,
+                        )
+                        _moe_stats.add(
+                            loaded_weight, time.perf_counter() - load_start_s
                         )
                         _loaded_weight_count += 1
                         continue
@@ -723,7 +762,11 @@ class BailingMoeV2TextModel(nn.Module):
                 fused_key = name.replace(weight_name, ".gate_up_proj.")
                 if fused_key in params_dict:
                     param = params_dict[fused_key]
+                    load_start_s = time.perf_counter()
                     param.weight_loader(param, loaded_weight, shard_id)
+                    _gate_up_stats.add(
+                        loaded_weight, time.perf_counter() - load_start_s
+                    )
                     _loaded_weight_count += 1
                     _gate_up_fused_shards.setdefault(fused_key, set()).add(shard_id)
                     matched_mlp_gate_up = True
@@ -736,11 +779,14 @@ class BailingMoeV2TextModel(nn.Module):
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                load_start_s = time.perf_counter()
                 weight_loader(param, loaded_weight)
+                _direct_stats.add(loaded_weight, time.perf_counter() - load_start_s)
                 _loaded_weight_count += 1
                 continue
 
             _skipped_weight_count += 1
+            _unmatched_stats.add(loaded_weight)
             _unmatched_weight_names.append(name)
 
         incomplete_gate_up_pairs = {
@@ -765,6 +811,41 @@ class BailingMoeV2TextModel(nn.Module):
             _loaded_weight_count,
             _skipped_weight_count,
             len(_unmatched_weight_names),
+        )
+        text_loader_total_s = time.perf_counter() - text_loader_start_s
+        accounted_load_s = (
+            _attn_qkv_stats.seconds
+            + _moe_stats.seconds
+            + _gate_up_stats.seconds
+            + _direct_stats.seconds
+        )
+        logger.info(
+            "Ming text weight profile: total_s=%.2f accounted_load_s=%.2f "
+            "unaccounted_s=%.2f loaded=%d skipped=%d unmatched=%d "
+            "attn_qkv_count=%d attn_qkv_bytes=%s attn_qkv_s=%.2f "
+            "moe_count=%d moe_bytes=%s moe_s=%.2f "
+            "gate_up_count=%d gate_up_bytes=%s gate_up_s=%.2f "
+            "direct_count=%d direct_bytes=%s direct_s=%.2f "
+            "unmatched_bytes=%s",
+            text_loader_total_s,
+            accounted_load_s,
+            max(0.0, text_loader_total_s - accounted_load_s),
+            _loaded_weight_count,
+            _skipped_weight_count,
+            len(_unmatched_weight_names),
+            _attn_qkv_stats.count,
+            _format_gib(_attn_qkv_stats.num_bytes),
+            _attn_qkv_stats.seconds,
+            _moe_stats.count,
+            _format_gib(_moe_stats.num_bytes),
+            _moe_stats.seconds,
+            _gate_up_stats.count,
+            _format_gib(_gate_up_stats.num_bytes),
+            _gate_up_stats.seconds,
+            _direct_stats.count,
+            _format_gib(_direct_stats.num_bytes),
+            _direct_stats.seconds,
+            _format_gib(_unmatched_stats.num_bytes),
         )
 
 
@@ -904,11 +985,16 @@ class BailingMoeV2ForCausalLM(nn.Module):
         - audio.*, linear_proj_audio.* → skipped (audio handled by AUDIO_STAGE)
         - everything else → self.model (BailingMoeV2TextModel)
         """
+        top_level_start_s = time.perf_counter()
         model_weights = []
         _loaded_lm_head_count = 0
         _skipped_tower_count = 0
         lm_head_params = dict(self.lm_head.named_parameters())
+        _lm_head_stats = _WeightLoadCategoryStats()
+        _tower_skipped_stats = _WeightLoadCategoryStats()
+        _text_candidate_stats = _WeightLoadCategoryStats()
 
+        route_start_s = time.perf_counter()
         for name, tensor in weights:
             # Strip top-level "model." prefix from checkpoint names.
             # Checkpoint uses "model.vision.*", "model.linear_proj.*", etc.
@@ -926,17 +1012,21 @@ class BailingMoeV2ForCausalLM(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    load_start_s = time.perf_counter()
                     weight_loader(param, tensor)
+                    _lm_head_stats.add(tensor, time.perf_counter() - load_start_s)
                     _loaded_lm_head_count += 1
                 continue
 
             # Skip vision encoder + projector weights (handled by IMAGE_STAGE)
             if stripped.startswith("vision."):
+                _tower_skipped_stats.add(tensor)
                 _skipped_tower_count += 1
                 continue
             if stripped.startswith("linear_proj.") and not stripped.startswith(
                 "linear_proj_audio."
             ):
+                _tower_skipped_stats.add(tensor)
                 _skipped_tower_count += 1
                 continue
 
@@ -944,14 +1034,19 @@ class BailingMoeV2ForCausalLM(nn.Module):
             if stripped.startswith("audio.") or stripped.startswith(
                 "linear_proj_audio."
             ):
+                _tower_skipped_stats.add(tensor)
                 _skipped_tower_count += 1
                 continue
 
             # Pass original name to text model (it does its own prefix stripping)
+            _text_candidate_stats.add(tensor)
             model_weights.append((name, tensor))
+        route_and_collect_s = time.perf_counter() - route_start_s
 
         # Load text model weights
+        text_model_load_start_s = time.perf_counter()
         self.model.load_weights(iter(model_weights))
+        text_model_load_s = time.perf_counter() - text_model_load_start_s
         logger.info(
             "Ming top-level loader summary: lm_head_loaded=%d tower_skipped=%d "
             "text_weight_candidates=%d",
@@ -961,8 +1056,29 @@ class BailingMoeV2ForCausalLM(nn.Module):
         )
 
         # Handle weight tying
+        tie_word_embeddings_s = 0.0
         llm_cfg = getattr(self.config, "llm_config", self.config)
         if getattr(llm_cfg, "tie_word_embeddings", False):
+            tie_start_s = time.perf_counter()
             lm_weight = lm_head_params.get("weight")
             if lm_weight is not None:
                 lm_weight.data = self.model.embed_tokens.weight.data
+            tie_word_embeddings_s = time.perf_counter() - tie_start_s
+        logger.info(
+            "Ming top-level weight profile: total_s=%.2f route_and_collect_s=%.2f "
+            "text_model_load_s=%.2f tie_word_embeddings_s=%.2f "
+            "lm_head_count=%d lm_head_bytes=%s lm_head_load_s=%.2f "
+            "tower_skipped_count=%d tower_skipped_bytes=%s "
+            "text_candidate_count=%d text_candidate_bytes=%s",
+            time.perf_counter() - top_level_start_s,
+            route_and_collect_s,
+            text_model_load_s,
+            tie_word_embeddings_s,
+            _lm_head_stats.count,
+            _format_gib(_lm_head_stats.num_bytes),
+            _lm_head_stats.seconds,
+            _tower_skipped_stats.count,
+            _format_gib(_tower_skipped_stats.num_bytes),
+            _text_candidate_stats.count,
+            _format_gib(_text_candidate_stats.num_bytes),
+        )

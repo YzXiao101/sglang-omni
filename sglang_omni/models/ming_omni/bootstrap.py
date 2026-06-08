@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from sglang_omni.models.ming_omni.pipeline.sampling import build_ming_sampling_params
@@ -36,13 +37,19 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 
+    startup_start_s = time.perf_counter()
+    tokenizer_start_s = time.perf_counter()
     tokenizer = load_ming_tokenizer(model_path)
+    tokenizer_load_s = time.perf_counter() - tokenizer_start_s
+    config_start_s = time.perf_counter()
     config = load_ming_config(model_path)
+    config_load_s = time.perf_counter() - config_start_s
     llm_cfg = getattr(config, "llm_config", config)
     vocab_size = getattr(llm_cfg, "vocab_size", None) or getattr(
         tokenizer, "vocab_size", 32000
     )
 
+    infra_start_s = time.perf_counter()
     (
         model_worker,
         tree_cache,
@@ -58,7 +65,9 @@ def create_thinker_scheduler(
         nccl_port=nccl_port,
         model_arch_override="BailingMoeV2ForCausalLM",
     )
+    create_sglang_infrastructure_s = time.perf_counter() - infra_start_s
 
+    post_infra_start_s = time.perf_counter()
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
         capture_hidden_layers=None,
@@ -90,7 +99,7 @@ def create_thinker_scheduler(
             eos_token_id=eos_token_id,
         )
 
-    return OmniScheduler(
+    scheduler = OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
         req_to_token_pool=req_to_token_pool,
@@ -104,6 +113,24 @@ def create_thinker_scheduler(
         result_adapter=result_adapter,
         stream_output_builder=stream_output_builder,
     )
+    post_infra_setup_s = time.perf_counter() - post_infra_start_s
+    logger.info(
+        "Ming thinker startup profile: total_s=%.2f tokenizer_s=%.2f "
+        "config_s=%.2f create_sglang_infrastructure_s=%.2f "
+        "post_infra_setup_s=%.2f gpu_id=%s tp_rank=%s tp_size=%s "
+        "cpu_offload_gb=%s mem_fraction_static=%s",
+        time.perf_counter() - startup_start_s,
+        tokenizer_load_s,
+        config_load_s,
+        create_sglang_infrastructure_s,
+        post_infra_setup_s,
+        gpu_id,
+        tp_rank,
+        tp_size,
+        getattr(server_args, "cpu_offload_gb", None),
+        getattr(server_args, "mem_fraction_static", None),
+    )
+    return scheduler
 
 
 def make_thinker_scheduler_adapters(

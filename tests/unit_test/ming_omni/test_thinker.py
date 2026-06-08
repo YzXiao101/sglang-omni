@@ -36,6 +36,17 @@ def test_ming_bootstrap_wires_ming_thinker_model_runner() -> None:
     assert 'model_arch_override="BailingMoeV2ForCausalLM"' in source
 
 
+def test_ming_bootstrap_profiles_startup_phases() -> None:
+    source = _read(BOOTSTRAP_PATH)
+
+    assert "Ming thinker startup profile" in source
+    assert "tokenizer_s=" in source
+    assert "config_s=" in source
+    assert "create_sglang_infrastructure_s=" in source
+    assert "post_infra_setup_s=" in source
+    assert "cpu_offload_gb=%s" in source
+
+
 def test_ming_thinker_runner_source_injects_multimodal_embeds() -> None:
     source = _read(RUNNER_PATH)
 
@@ -76,6 +87,26 @@ def test_ming_thinker_weight_loader_uses_qwen3_helper_path() -> None:
     assert "sglang_omni.models.qwen3_omni.thinker" not in source
     assert "sglang_omni.models.qwen3_omni.components.thinker_model" in source
     assert "extract_fused_experts" in source
+
+
+def test_ming_thinker_weight_loader_profiles_key_categories() -> None:
+    source = _read(MING_THINKER_PATH)
+
+    assert "class _WeightLoadCategoryStats" in source
+    assert "def _tensor_nbytes" in source
+    assert "def _format_gib" in source
+    assert "Ming top-level weight profile" in source
+    assert "route_and_collect_s=%.2f" in source
+    assert "text_model_load_s=%.2f" in source
+    assert "text_candidate_bytes=%s" in source
+    assert "Ming text weight profile" in source
+    assert "accounted_load_s=%.2f" in source
+    assert "unaccounted_s=%.2f" in source
+    assert "attn_qkv_bytes=%s" in source
+    assert "moe_bytes=%s" in source
+    assert "gate_up_bytes=%s" in source
+    assert "direct_bytes=%s" in source
+    assert "unmatched_bytes=%s" in source
 
 
 def test_ming_image_encoder_keeps_its_tp_context_for_runtime_forward() -> None:
