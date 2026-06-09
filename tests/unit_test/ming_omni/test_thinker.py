@@ -119,9 +119,14 @@ def test_ming_thinker_weight_loader_profiles_moe_detail_under_env() -> None:
     assert "w3_count=%d" in source
     assert "top_layers=%s" in source
     assert "top_layer_shards=%s" in source
+    assert "Ming MoE device detail profile" in source
+    assert "device_buckets=%s" in source
+    assert "top_layer_device_shards=%s" in source
     assert "SGLANG_OMNI_MING_MOE_SYNC_AFTER_LOAD" in source
     assert "Ming top-level post-load sync profile" in source
     assert "torch.cuda.synchronize()" in source
+    assert "SGLANG_OMNI_MING_MODEL_WEIGHTS_RELEASE_PROFILE" in source
+    assert "Ming top-level model_weights release profile" in source
 
 
 def test_ming_image_encoder_keeps_its_tp_context_for_runtime_forward() -> None:

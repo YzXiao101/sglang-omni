@@ -122,6 +122,16 @@ def _format_moe_bucket_key(key: Any) -> str:
     return str(key)
 
 
+def _device_label(obj: Any) -> str:
+    try:
+        device = getattr(obj, "device", None)
+        if device is None and hasattr(obj, "data"):
+            device = getattr(obj.data, "device", None)
+        return str(device) if device is not None else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _format_top_weight_load_buckets(
     stats_by_key: dict[Any, _WeightLoadCategoryStats],
     *,
@@ -733,6 +743,10 @@ class BailingMoeV2TextModel(nn.Module):
         _moe_shard_stats: dict[str, _WeightLoadCategoryStats] = {}
         _moe_layer_stats: dict[int, _WeightLoadCategoryStats] = {}
         _moe_layer_shard_stats: dict[tuple[int, str], _WeightLoadCategoryStats] = {}
+        _moe_device_stats: dict[tuple[str, str], _WeightLoadCategoryStats] = {}
+        _moe_layer_device_shard_stats: dict[
+            tuple[int, str, str, str], _WeightLoadCategoryStats
+        ] = {}
 
         for name, loaded_weight in weights:
             # Strip common prefixes from Ming checkpoint
@@ -811,8 +825,14 @@ class BailingMoeV2TextModel(nn.Module):
                         _moe_stats.add(loaded_weight, elapsed_s)
                         if _moe_detail_enabled:
                             shard_key = str(shard_id)
+                            param_device = _device_label(param)
+                            loaded_device = _device_label(loaded_weight)
                             _moe_shard_stats.setdefault(
                                 shard_key, _WeightLoadCategoryStats()
+                            ).add(loaded_weight, elapsed_s)
+                            _moe_device_stats.setdefault(
+                                (param_device, loaded_device),
+                                _WeightLoadCategoryStats(),
                             ).add(loaded_weight, elapsed_s)
                             layer_id = _extract_moe_layer_id(name)
                             if layer_id is not None:
@@ -821,6 +841,15 @@ class BailingMoeV2TextModel(nn.Module):
                                 ).add(loaded_weight, elapsed_s)
                                 _moe_layer_shard_stats.setdefault(
                                     (layer_id, shard_key),
+                                    _WeightLoadCategoryStats(),
+                                ).add(loaded_weight, elapsed_s)
+                                _moe_layer_device_shard_stats.setdefault(
+                                    (
+                                        layer_id,
+                                        shard_key,
+                                        param_device,
+                                        loaded_device,
+                                    ),
                                     _WeightLoadCategoryStats(),
                                 ).add(loaded_weight, elapsed_s)
                         _loaded_weight_count += 1
@@ -956,6 +985,14 @@ class BailingMoeV2TextModel(nn.Module):
                 _gib_per_second(w3_stats),
                 _format_top_weight_load_buckets(_moe_layer_stats, limit=5),
                 _format_top_weight_load_buckets(_moe_layer_shard_stats, limit=10),
+            )
+            logger.info(
+                "Ming MoE device detail profile: device_buckets=%s "
+                "top_layer_device_shards=%s",
+                _format_top_weight_load_buckets(_moe_device_stats, limit=10),
+                _format_top_weight_load_buckets(
+                    _moe_layer_device_shard_stats, limit=10
+                ),
             )
 
 
@@ -1202,4 +1239,17 @@ class BailingMoeV2ForCausalLM(nn.Module):
                 "Ming top-level post-load sync profile: sync_s=%.2f status=%s",
                 time.perf_counter() - sync_start_s,
                 sync_status,
+            )
+        if _env_flag("SGLANG_OMNI_MING_MODEL_WEIGHTS_RELEASE_PROFILE"):
+            release_count = len(model_weights)
+            release_bytes = _text_candidate_stats.num_bytes
+            release_start_s = time.perf_counter()
+            model_weights.clear()
+            logger.info(
+                "Ming top-level model_weights release profile: clear_s=%.2f "
+                "count=%d bytes=%s remaining_count=%d",
+                time.perf_counter() - release_start_s,
+                release_count,
+                _format_gib(release_bytes),
+                len(model_weights),
             )
