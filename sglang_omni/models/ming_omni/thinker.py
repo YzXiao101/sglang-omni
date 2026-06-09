@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
@@ -87,6 +88,63 @@ def _tensor_nbytes(tensor: Any) -> int:
 
 def _format_gib(num_bytes: int) -> str:
     return f"{num_bytes / (1024 ** 3):.2f}GiB"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_moe_layer_id(name: str) -> int | None:
+    parts = name.split(".", 3)
+    if len(parts) >= 2 and parts[0] == "layers":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _gib_per_second(stats: _WeightLoadCategoryStats) -> float:
+    if stats.seconds <= 0.0:
+        return 0.0
+    return stats.num_bytes / (1024**3) / stats.seconds
+
+
+def _avg_ms_per_tensor(stats: _WeightLoadCategoryStats) -> float:
+    if stats.count <= 0:
+        return 0.0
+    return stats.seconds * 1000.0 / stats.count
+
+
+def _format_moe_bucket_key(key: Any) -> str:
+    if isinstance(key, tuple):
+        return "/".join(str(part) for part in key)
+    return str(key)
+
+
+def _format_top_weight_load_buckets(
+    stats_by_key: dict[Any, _WeightLoadCategoryStats],
+    *,
+    limit: int,
+) -> str:
+    top_items = sorted(
+        stats_by_key.items(),
+        key=lambda item: item[1].seconds,
+        reverse=True,
+    )[:limit]
+    return (
+        "["
+        + ", ".join(
+            (
+                f"{_format_moe_bucket_key(key)}:"
+                f"count={stats.count},bytes={_format_gib(stats.num_bytes)},"
+                f"s={stats.seconds:.2f},avg_ms={_avg_ms_per_tensor(stats):.2f},"
+                f"gib_s={_gib_per_second(stats):.2f}"
+            )
+            for key, stats in top_items
+        )
+        + "]"
+    )
 
 
 # ============================================================================
@@ -671,6 +729,10 @@ class BailingMoeV2TextModel(nn.Module):
         _gate_up_stats = _WeightLoadCategoryStats()
         _direct_stats = _WeightLoadCategoryStats()
         _unmatched_stats = _WeightLoadCategoryStats()
+        _moe_detail_enabled = _env_flag("SGLANG_OMNI_MING_MOE_PROFILE_DETAIL")
+        _moe_shard_stats: dict[str, _WeightLoadCategoryStats] = {}
+        _moe_layer_stats: dict[int, _WeightLoadCategoryStats] = {}
+        _moe_layer_shard_stats: dict[tuple[int, str], _WeightLoadCategoryStats] = {}
 
         for name, loaded_weight in weights:
             # Strip common prefixes from Ming checkpoint
@@ -745,9 +807,22 @@ class BailingMoeV2TextModel(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                        _moe_stats.add(
-                            loaded_weight, time.perf_counter() - load_start_s
-                        )
+                        elapsed_s = time.perf_counter() - load_start_s
+                        _moe_stats.add(loaded_weight, elapsed_s)
+                        if _moe_detail_enabled:
+                            shard_key = str(shard_id)
+                            _moe_shard_stats.setdefault(
+                                shard_key, _WeightLoadCategoryStats()
+                            ).add(loaded_weight, elapsed_s)
+                            layer_id = _extract_moe_layer_id(name)
+                            if layer_id is not None:
+                                _moe_layer_stats.setdefault(
+                                    layer_id, _WeightLoadCategoryStats()
+                                ).add(loaded_weight, elapsed_s)
+                                _moe_layer_shard_stats.setdefault(
+                                    (layer_id, shard_key),
+                                    _WeightLoadCategoryStats(),
+                                ).add(loaded_weight, elapsed_s)
                         _loaded_weight_count += 1
                         continue
 
@@ -847,6 +922,41 @@ class BailingMoeV2TextModel(nn.Module):
             _direct_stats.seconds,
             _format_gib(_unmatched_stats.num_bytes),
         )
+        if _moe_detail_enabled:
+            w1_stats = _moe_shard_stats.get("w1", _WeightLoadCategoryStats())
+            w2_stats = _moe_shard_stats.get("w2", _WeightLoadCategoryStats())
+            w3_stats = _moe_shard_stats.get("w3", _WeightLoadCategoryStats())
+            logger.info(
+                "Ming MoE detail profile: total_count=%d total_bytes=%s "
+                "total_s=%.2f avg_ms_per_tensor=%.2f throughput_gib_s=%.2f "
+                "w1_count=%d w1_bytes=%s w1_s=%.2f w1_avg_ms=%.2f "
+                "w1_gib_s=%.2f w2_count=%d w2_bytes=%s w2_s=%.2f "
+                "w2_avg_ms=%.2f w2_gib_s=%.2f w3_count=%d w3_bytes=%s "
+                "w3_s=%.2f w3_avg_ms=%.2f w3_gib_s=%.2f "
+                "top_layers=%s top_layer_shards=%s",
+                _moe_stats.count,
+                _format_gib(_moe_stats.num_bytes),
+                _moe_stats.seconds,
+                _avg_ms_per_tensor(_moe_stats),
+                _gib_per_second(_moe_stats),
+                w1_stats.count,
+                _format_gib(w1_stats.num_bytes),
+                w1_stats.seconds,
+                _avg_ms_per_tensor(w1_stats),
+                _gib_per_second(w1_stats),
+                w2_stats.count,
+                _format_gib(w2_stats.num_bytes),
+                w2_stats.seconds,
+                _avg_ms_per_tensor(w2_stats),
+                _gib_per_second(w2_stats),
+                w3_stats.count,
+                _format_gib(w3_stats.num_bytes),
+                w3_stats.seconds,
+                _avg_ms_per_tensor(w3_stats),
+                _gib_per_second(w3_stats),
+                _format_top_weight_load_buckets(_moe_layer_stats, limit=5),
+                _format_top_weight_load_buckets(_moe_layer_shard_stats, limit=10),
+            )
 
 
 # ============================================================================
@@ -1082,3 +1192,14 @@ class BailingMoeV2ForCausalLM(nn.Module):
             _text_candidate_stats.count,
             _format_gib(_text_candidate_stats.num_bytes),
         )
+        if _env_flag("SGLANG_OMNI_MING_MOE_SYNC_AFTER_LOAD"):
+            sync_start_s = time.perf_counter()
+            sync_status = "cuda_unavailable"
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                sync_status = "ok"
+            logger.info(
+                "Ming top-level post-load sync profile: sync_s=%.2f status=%s",
+                time.perf_counter() - sync_start_s,
+                sync_status,
+            )

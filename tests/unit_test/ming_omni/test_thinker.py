@@ -109,6 +109,21 @@ def test_ming_thinker_weight_loader_profiles_key_categories() -> None:
     assert "unmatched_bytes=%s" in source
 
 
+def test_ming_thinker_weight_loader_profiles_moe_detail_under_env() -> None:
+    source = _read(MING_THINKER_PATH)
+
+    assert "SGLANG_OMNI_MING_MOE_PROFILE_DETAIL" in source
+    assert "Ming MoE detail profile" in source
+    assert "w1_count=%d" in source
+    assert "w2_count=%d" in source
+    assert "w3_count=%d" in source
+    assert "top_layers=%s" in source
+    assert "top_layer_shards=%s" in source
+    assert "SGLANG_OMNI_MING_MOE_SYNC_AFTER_LOAD" in source
+    assert "Ming top-level post-load sync profile" in source
+    assert "torch.cuda.synchronize()" in source
+
+
 def test_ming_image_encoder_keeps_its_tp_context_for_runtime_forward() -> None:
     source = _read(MING_IMAGE_ENCODER_PATH)
     init_body = source.split("    @staticmethod", 1)[0]
