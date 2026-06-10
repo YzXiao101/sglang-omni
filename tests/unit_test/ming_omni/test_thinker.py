@@ -13,6 +13,7 @@ import pytest
 
 BOOTSTRAP_PATH = Path("sglang_omni/models/ming_omni/bootstrap.py")
 RUNNER_PATH = Path("sglang_omni/model_runner/ming_thinker_model_runner.py")
+SGLANG_MODEL_RUNNER_PATH = Path("sglang_omni/model_runner/sglang_model_runner.py")
 MING_THINKER_PATH = Path("sglang_omni/models/ming_omni/thinker.py")
 MING_IMAGE_ENCODER_PATH = Path(
     "sglang_omni/models/ming_omni/components/image_encoder.py"
@@ -122,11 +123,26 @@ def test_ming_thinker_weight_loader_profiles_moe_detail_under_env() -> None:
     assert "Ming MoE device detail profile" in source
     assert "device_buckets=%s" in source
     assert "top_layer_device_shards=%s" in source
+    assert "Ming MoE layer device placement profile" in source
+    assert "_format_moe_layer_device_placement" in source
     assert "SGLANG_OMNI_MING_MOE_SYNC_AFTER_LOAD" in source
     assert "Ming top-level post-load sync profile" in source
     assert "torch.cuda.synchronize()" in source
     assert "SGLANG_OMNI_MING_MODEL_WEIGHTS_RELEASE_PROFILE" in source
     assert "Ming top-level model_weights release profile" in source
+
+
+def test_sglang_model_runner_profiles_loader_postprocess_under_env() -> None:
+    source = _read(SGLANG_MODEL_RUNNER_PATH)
+
+    assert "SGLANG_OMNI_SGLANG_POSTPROCESS_PROFILE" in source
+    assert "_install_sglang_loader_postprocess_profiler()" in source
+    assert "DefaultModelLoader.load_weights_and_postprocess" in source
+    assert "profiled_load_weights_and_postprocess" in source
+    assert "device_loading_context(module, target_device)" in source
+    assert "quant_method.process_weights_after_loading(module)" in source
+    assert "SGLang loader postprocess profile" in source
+    assert "top_context_modules=%s" in source
 
 
 def test_ming_image_encoder_keeps_its_tp_context_for_runtime_forward() -> None:

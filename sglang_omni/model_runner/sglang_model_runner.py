@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -20,6 +22,176 @@ from sglang_omni.utils.gpu_memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SGLANG_LOADER_POSTPROCESS_PROFILE_PATCHED = False
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _param_nbytes(param: Any) -> int:
+    try:
+        return int(param.numel()) * int(param.element_size())
+    except Exception:
+        return 0
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1 << 30):.2f}GiB"
+
+
+def _module_param_bytes_by_device(module: Any) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    for param in module.parameters():
+        device = str(getattr(param, "device", "unknown"))
+        stats[device] = stats.get(device, 0) + _param_nbytes(param)
+    return stats
+
+
+def _format_postprocess_module_key(
+    name: str,
+    module: Any,
+    quant_method: Any,
+) -> str:
+    module_name = name or "<root>"
+    cls_name = type(module).__name__
+    method_name = type(quant_method).__name__
+    layer_id = getattr(module, "layer_id", None)
+    if layer_id is None:
+        return f"{module_name}|{cls_name}|{method_name}"
+    return f"{module_name}|{cls_name}|{method_name}|layer={layer_id}"
+
+
+def _format_postprocess_top_modules(
+    records: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> str:
+    if not records:
+        return "[]"
+    top_records = sorted(records, key=lambda item: item["context_s"], reverse=True)[
+        :limit
+    ]
+    parts = []
+    for item in top_records:
+        overhead_s = max(0.0, item["context_s"] - item["process_s"])
+        parts.append(
+            f"{item['key']}:context_s={item['context_s']:.2f},"
+            f"process_s={item['process_s']:.2f},overhead_s={overhead_s:.2f},"
+            f"cpu={_format_gib(item['cpu_bytes'])},"
+            f"cuda={_format_gib(item['cuda_bytes'])},"
+            f"other={_format_gib(item['other_bytes'])}"
+        )
+    return "[" + ", ".join(parts) + "]"
+
+
+def _install_sglang_loader_postprocess_profiler() -> None:
+    """Install an opt-in profiler around SGLang's post-load quant loop."""
+    global _SGLANG_LOADER_POSTPROCESS_PROFILE_PATCHED
+    if not _env_flag("SGLANG_OMNI_SGLANG_POSTPROCESS_PROFILE"):
+        return
+    if _SGLANG_LOADER_POSTPROCESS_PROFILE_PATCHED:
+        return
+
+    from sglang.srt.model_loader import loader as loader_module
+
+    current = loader_module.DefaultModelLoader.load_weights_and_postprocess
+    if getattr(current, "_sglang_omni_profile_wrapped", False):
+        _SGLANG_LOADER_POSTPROCESS_PROFILE_PATCHED = True
+        return
+
+    def profiled_load_weights_and_postprocess(model, weights, target_device):
+        load_start_s = time.perf_counter()
+        model.load_weights(weights)
+        load_weights_s = time.perf_counter() - load_start_s
+
+        postprocess_start_s = time.perf_counter()
+        records: list[dict[str, Any]] = []
+        total_cpu_bytes = 0
+        total_cuda_bytes = 0
+        total_other_bytes = 0
+        total_context_s = 0.0
+        total_process_s = 0.0
+        quant_module_count = 0
+
+        for name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+
+            quant_module_count += 1
+            device_bytes = _module_param_bytes_by_device(module)
+            cpu_bytes = sum(
+                num_bytes
+                for device, num_bytes in device_bytes.items()
+                if device.startswith("cpu")
+            )
+            cuda_bytes = sum(
+                num_bytes
+                for device, num_bytes in device_bytes.items()
+                if device.startswith("cuda")
+            )
+            other_bytes = sum(device_bytes.values()) - cpu_bytes - cuda_bytes
+
+            context_start_s = time.perf_counter()
+            with loader_module.device_loading_context(module, target_device):
+                process_start_s = time.perf_counter()
+                quant_method.process_weights_after_loading(module)
+                process_s = time.perf_counter() - process_start_s
+            context_s = time.perf_counter() - context_start_s
+
+            total_cpu_bytes += cpu_bytes
+            total_cuda_bytes += cuda_bytes
+            total_other_bytes += other_bytes
+            total_context_s += context_s
+            total_process_s += process_s
+            records.append(
+                {
+                    "key": _format_postprocess_module_key(
+                        name,
+                        module,
+                        quant_method,
+                    ),
+                    "context_s": context_s,
+                    "process_s": process_s,
+                    "cpu_bytes": cpu_bytes,
+                    "cuda_bytes": cuda_bytes,
+                    "other_bytes": other_bytes,
+                }
+            )
+
+        if getattr(loader_module, "_is_npu", False):
+            import torch
+
+            torch.npu.empty_cache()
+
+        postprocess_s = time.perf_counter() - postprocess_start_s
+        logger.info(
+            "SGLang loader postprocess profile: load_weights_s=%.2f "
+            "postprocess_s=%.2f total_s=%.2f quant_modules=%d "
+            "context_s=%.2f process_s=%.2f context_overhead_s=%.2f "
+            "cpu_param_bytes=%s cuda_param_bytes=%s other_param_bytes=%s "
+            "top_context_modules=%s",
+            load_weights_s,
+            postprocess_s,
+            load_weights_s + postprocess_s,
+            quant_module_count,
+            total_context_s,
+            total_process_s,
+            max(0.0, total_context_s - total_process_s),
+            _format_gib(total_cpu_bytes),
+            _format_gib(total_cuda_bytes),
+            _format_gib(total_other_bytes),
+            _format_postprocess_top_modules(records, limit=10),
+        )
+
+    profiled_load_weights_and_postprocess._sglang_omni_profile_wrapped = True
+    loader_module.DefaultModelLoader.load_weights_and_postprocess = staticmethod(
+        profiled_load_weights_and_postprocess
+    )
+    _SGLANG_LOADER_POSTPROCESS_PROFILE_PATCHED = True
 
 
 def filter_weights_by_prefix(
@@ -56,6 +228,7 @@ class SGLModelRunner(ModelRunner):
         self._weight_prefix = weight_prefix
         self._total_gpu_memory_fraction = total_gpu_memory_fraction
         self._register_omni_model()
+        _install_sglang_loader_postprocess_profiler()
 
         port_args = PortArgs.init_new(server_args)
         tp_size = server_args.tp_size

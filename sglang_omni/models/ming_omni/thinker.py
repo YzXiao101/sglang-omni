@@ -157,6 +157,32 @@ def _format_top_weight_load_buckets(
     )
 
 
+def _format_moe_layer_device_placement(
+    stats_by_key: dict[tuple[int, str, str], _WeightLoadCategoryStats],
+) -> str:
+    if not stats_by_key:
+        return "[]"
+
+    by_layer: dict[int, list[tuple[str, str, _WeightLoadCategoryStats]]] = {}
+    for (layer_id, param_device, loaded_device), stats in stats_by_key.items():
+        by_layer.setdefault(layer_id, []).append((param_device, loaded_device, stats))
+
+    parts = []
+    for layer_id in sorted(by_layer):
+        device_parts = []
+        for param_device, loaded_device, stats in sorted(
+            by_layer[layer_id],
+            key=lambda item: item[2].num_bytes,
+            reverse=True,
+        ):
+            device_parts.append(
+                f"{param_device}/{loaded_device}:count={stats.count},"
+                f"bytes={_format_gib(stats.num_bytes)},s={stats.seconds:.2f}"
+            )
+        parts.append(f"{layer_id}:" + "|".join(device_parts))
+    return "[" + ", ".join(parts) + "]"
+
+
 # ============================================================================
 # Attention Layer
 # ============================================================================
@@ -744,6 +770,9 @@ class BailingMoeV2TextModel(nn.Module):
         _moe_layer_stats: dict[int, _WeightLoadCategoryStats] = {}
         _moe_layer_shard_stats: dict[tuple[int, str], _WeightLoadCategoryStats] = {}
         _moe_device_stats: dict[tuple[str, str], _WeightLoadCategoryStats] = {}
+        _moe_layer_device_stats: dict[
+            tuple[int, str, str], _WeightLoadCategoryStats
+        ] = {}
         _moe_layer_device_shard_stats: dict[
             tuple[int, str, str, str], _WeightLoadCategoryStats
         ] = {}
@@ -841,6 +870,14 @@ class BailingMoeV2TextModel(nn.Module):
                                 ).add(loaded_weight, elapsed_s)
                                 _moe_layer_shard_stats.setdefault(
                                     (layer_id, shard_key),
+                                    _WeightLoadCategoryStats(),
+                                ).add(loaded_weight, elapsed_s)
+                                _moe_layer_device_stats.setdefault(
+                                    (
+                                        layer_id,
+                                        param_device,
+                                        loaded_device,
+                                    ),
                                     _WeightLoadCategoryStats(),
                                 ).add(loaded_weight, elapsed_s)
                                 _moe_layer_device_shard_stats.setdefault(
@@ -993,6 +1030,10 @@ class BailingMoeV2TextModel(nn.Module):
                 _format_top_weight_load_buckets(
                     _moe_layer_device_shard_stats, limit=10
                 ),
+            )
+            logger.info(
+                "Ming MoE layer device placement profile: layers=%s",
+                _format_moe_layer_device_placement(_moe_layer_device_stats),
             )
 
 
