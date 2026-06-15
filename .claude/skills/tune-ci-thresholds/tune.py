@@ -11,11 +11,13 @@ import argparse, ast, datetime as dt, hashlib, json, math, os, re, shutil, signa
 import subprocess, sys, time, tomllib
 from pathlib import Path
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 SKILL_DIR = Path(__file__).resolve().parent
 MODELS_DIR = SKILL_DIR / "models"
+HOSTS_DIR = SKILL_DIR / "hosts"
 DEFAULT_MODEL = "qwen3-omni-v1"
+_SPEAKER_SIM_MIN_BYTES = 100 * 1024 * 1024
 REPO_ROOT = Path("/sgl-workspace/sglang-omni")
 if not REPO_ROOT.exists():
     REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -187,6 +189,73 @@ def available_models():
                   if d.is_dir() and (d / "config.yaml").exists())
 
 
+def available_hosts():
+    if not HOSTS_DIR.exists():
+        return []
+    return sorted(p.stem for p in HOSTS_DIR.glob("*.yaml"))
+
+
+def load_host_profile(name: str | None = None) -> dict | None:
+    """Load hosts/<name>.yaml, or autodetect by socket.gethostname()."""
+    import socket
+
+    if name is None:
+        name = os.environ.get("TUNE_HOST")
+    if name:
+        path = HOSTS_DIR / f"{name}.yaml"
+        if not path.exists():
+            raise SystemExit(
+                f"host profile not found: {path} "
+                f"(known: {', '.join(available_hosts()) or 'none'})")
+        return _load_yaml(path, top_is_dict=True)
+    if not HOSTS_DIR.exists():
+        return None
+    hostname = socket.gethostname()
+    for path in HOSTS_DIR.glob("*.yaml"):
+        profile = _load_yaml(path, top_is_dict=True)
+        if profile.get("hostname") == hostname:
+            return profile
+    return None
+
+
+def resolve_repo_root(host: dict | None) -> Path:
+    if os.environ.get("TUNE_REPO_ROOT"):
+        return Path(os.environ["TUNE_REPO_ROOT"])
+    if host and host.get("repo_root"):
+        return Path(host["repo_root"])
+    default = Path("/sgl-workspace/sglang-omni")
+    if default.exists():
+        return default
+    return Path(__file__).resolve().parents[3]
+
+
+def apply_host_profile(cfg: dict, host: dict) -> None:
+    """Map host physical paths onto tune.py auto_env (no symlinks required)."""
+    physical = host.get("physical") or {}
+    auto = cfg.setdefault("auto_env", {})
+    if physical.get("hf_hub"):
+        auto["HF_HOME"] = str(physical["hf_hub"])
+    if physical.get("speaker_sim"):
+        auto["SEEDTTS_SIM_CACHE_DIR"] = str(physical["speaker_sim"])
+    if physical.get("omni_ci_home"):
+        cfg["omni_ci_home"] = str(physical["omni_ci_home"])
+    cfg["_host"] = host
+
+
+def _speaker_sim_assets_ok(cache_dir: Path) -> tuple[bool, str]:
+    marker = cache_dir / ".complete"
+    base = cache_dir / "wavlm_large.pt"
+    finetune = cache_dir / "wavlm_large_finetune.pth"
+    if not marker.is_file():
+        return False, "missing .complete — run speaker_similarity_assets --warm-cache"
+    for path in (base, finetune):
+        if not path.is_file():
+            return False, f"missing {path.name}"
+        if path.stat().st_size < _SPEAKER_SIM_MIN_BYTES:
+            return False, f"{path.name} too small (truncated?)"
+    return True, "wavlm_large.pt + wavlm_large_finetune.pth"
+
+
 def model_dir(name):  return MODELS_DIR / name
 def stages_path(name): return model_dir(name) / "stages.yaml"
 
@@ -207,7 +276,7 @@ def _apply_auto_env(cfg: dict) -> None:
         os.environ[key] = str(value)
 
 
-def load_model_config(name):
+def load_model_config(name, host: dict | None = None):
     p = model_dir(name) / "config.yaml"
     if not p.exists():
         raise SystemExit(f"model config not found: {p}. "
@@ -217,8 +286,10 @@ def load_model_config(name):
     cfg.setdefault("auto_env", {})
     cfg.setdefault("metric_sources", {})
     cfg.setdefault("hf_model_ids_by_test", {})
+    if host:
+        apply_host_profile(cfg, host)
     # Auto-apply env vars so the user doesn't need to export them
-    # manually. Overrides any pre-existing value to match CI.
+    # manually. Overrides any pre-existing value to match CI / host profile.
     _apply_auto_env(cfg)
     return cfg
 
@@ -738,6 +809,25 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
                 f"huggingface-cli download {repo_id}{flag}"
             )
         errs.append("\n".join(lines))
+    sim_dir = cfg["auto_env"].get("SEEDTTS_SIM_CACHE_DIR")
+    needs_speaker_sim = bool(cfg.get("_host")) or cfg["name"] in (
+        "tts", "qwen3-omni-v1")
+    if sim_dir and needs_speaker_sim:
+        sim_ok, sim_detail = _speaker_sim_assets_ok(Path(sim_dir))
+        mark = "✓" if sim_ok else "✗"
+        print(f"    {mark} speaker_sim: {sim_dir} ({sim_detail})")
+        if not sim_ok:
+            bootstrap = ((cfg.get("_host") or {}).get("speaker_similarity_bootstrap")
+                         or {})
+            cmd = (bootstrap.get("warm_cache") or {}).get("command", "").strip()
+            hint = (
+                f"speaker_sim incomplete at {sim_dir}: {sim_detail}. "
+                "Run benchmarks.metrics.speaker_similarity_assets --warm-cache "
+                f"with SEEDTTS_SIM_CACHE_DIR={sim_dir}."
+            )
+            if cmd:
+                hint += f" See hosts profile warm_cache.command."
+            errs.append(hint)
     smi = nvidia_smi_L()
     if not smi:
         errs.append("nvidia-smi -L returned no GPUs")
@@ -1217,7 +1307,7 @@ def stages_list(cfg):
 
 
 def run_cmd(args):
-    cfg = load_model_config(args.model)
+    cfg = load_model_config(args.model, host=getattr(args, "host_profile", None))
     py, src, _ = resolve_venv(args.venv_python, cfg)
     out = Path(args.output_dir) if args.output_dir \
         else DEFAULT_RUN_ROOT / f"{cfg['name']}-{ts_dir()}"
@@ -2134,14 +2224,30 @@ def apply_plan(run_dir):
     return 0
 
 
+def _bootstrap_from_host(host: dict | None) -> None:
+    global REPO_ROOT
+    if not host:
+        return
+    REPO_ROOT = resolve_repo_root(host)
+    venv = host.get("venv_python")
+    if venv and not os.environ.get("TUNE_VENV_PYTHON"):
+        os.environ.setdefault("TUNE_VENV_PYTHON", str(venv))
+
+
 def main(argv=None):
+    global REPO_ROOT
     p = argparse.ArgumentParser(prog="tune.py")
     p.add_argument("--venv-python")
     p.add_argument("--skip-version-check", action="store_true")
+    p.add_argument(
+        "--host",
+        help="host profile under hosts/ (default: $TUNE_HOST or autodetect by hostname)",
+    )
     p.add_argument("--model", default=DEFAULT_MODEL,
                    help=f"model config name under models/ (default: {DEFAULT_MODEL})")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("models-list")
+    sub.add_parser("hosts-list")
     sub.add_parser("stages-list")
     sa = sub.add_parser("precheck"); sa.add_argument("--output-dir")
     sb = sub.add_parser("discover"); sb.add_argument("--output")
@@ -2162,13 +2268,23 @@ def main(argv=None):
     if args.cmd == "models-list":
         for m in available_models(): print(m)
         return 0
+    if args.cmd == "hosts-list":
+        for h in available_hosts():
+            print(h)
+        return 0
+    host = load_host_profile(args.host)
+    _bootstrap_from_host(host)
+    args.host_profile = host
+    if host:
+        print(f"host: {host.get('name', args.host or 'autodetect')} "
+              f"(repo={REPO_ROOT})")
     if args.cmd == "report":
         return report(Path(args.run_dir))
     if args.cmd == "apply-plan":
         return apply_plan(Path(args.run_dir))
     if args.cmd == "status":
         return status_cmd(Path(args.run_dir))
-    cfg = load_model_config(args.model)
+    cfg = load_model_config(args.model, host=host)
     if args.cmd == "stages-list":
         return stages_list(cfg)
     py, src, tried = resolve_venv(args.venv_python, cfg)
