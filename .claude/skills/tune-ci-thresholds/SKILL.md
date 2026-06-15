@@ -7,7 +7,9 @@ description: Run CI tests N times per stage on the H20 CI-reproduction host, pro
 
 ## Scope
 This skill is for the H20 CI-reproduction host only (the same image
-CI uses, `frankleeeee/sglang-omni:dev`; the container name varies).
+CI uses,
+`crpi-n6adu6llixz83q37.cn-hangzhou.personal.cr.aliyuncs.com/hongccc/sglang-omni:dev`,
+a CUDA-13 image; the container name varies).
 Numbers from environments that differ meaningfully from CI (different
 GPU model, different image, different pinned sglang/torch) are not
 comparable and must not drive threshold changes. If you just want to
@@ -349,8 +351,7 @@ test) explicitly marks as missing or misaligned.
 
 | Action | Why forbidden by default |
 |--------|--------------------------|
-| `prepare_omni_venv.sh` | Fresh path does `rm -rf $OMNI_CI_HOME` — wipes slice caches and forces a full PyPI/CUDA re-download. |
-| `install_flashinfer_jit_cache.sh` | Only when precheck reports `flashinfer-jit-cache` missing from venv. Use host wheel cache first (seconds); network only on cache miss or corrupt wheel. **Every CI venv gets it via `omni-setup`**, including Qwen3-ASR / TTS slices — calibration must match. |
+| `prepare_omni_venv.sh` | Only rebuilds from scratch (`rm -rf $OMNI_CI_HOME`) when `pyproject.toml`'s deps-hash changed or the venv is missing/corrupt; otherwise it reuses the slice and only runs `uv pip install --upgrade -e .`. Still don't invoke it by hand when precheck is green — let omni-setup/precheck decide. |
 | `ensure_hf_models.sh` (bulk) | Download only the model id(s) precheck marks `✗`, not the whole CI model list. |
 | Ad-hoc `uv pip install torch` / wheel URLs | Pins must match CI; precheck reports pin drift. |
 
@@ -361,16 +362,17 @@ test) explicitly marks as missing or misaligned.
   Standalone `qwen3-asr-v1` calibration keeps ASR request concurrency **32**,
   and Higgs/TTS generation stages use **16**.
   Included in `--model tts --stages ALL`; calibrate alone with
-  `--stages qwen3_asr`. Venv must pass full precheck including
-  `flashinfer-jit-cache` (same as CI `omni-setup`). If missing, run
-  `install_flashinfer_jit_cache.sh omni` from host cache — do **not** use
-  `--skip-precheck`. Source `.github/scripts/ci_env.sh` before pytest/calibration.
+  `--stages qwen3_asr`. Venv only needs to pass precheck for torch/sglang pins
+  and cached assets. Do **not** use `--skip-precheck`. Source
+  `.github/scripts/ci_env.sh` before pytest/calibration.
 - **Qwen3-ASR (standalone `--model qwen3-asr-v1`)**: same runtime as above;
   use only for isolated ASR calibration — **TTS PRs should use `--model tts`**.
-- **Qwen3 MoE stages**: if smoke test shows
-  `gen_cutlass_fused_moe_sm90_module` + router timeout, **then** run
-  `install_flashinfer_jit_cache.sh` (host cache first; network only on cache miss).
-  All benchmark stages share the single **`omni`** venv — source
+- **Qwen3 MoE stages**: `flashinfer-python` (cu13) JIT-compiles its MoE/cutlass
+  kernels into `${OMNI_CI_HOME}/.cache/flashinfer` on each cold start. A healthy
+  cu13 env compiles fast — **router/worker up in < ~60s; > 60s means the JIT path
+  is broken**, not a missing wheel or a regression (see the "Server / router
+  startup > 60s" signal under Known failure signatures for the env fix). All
+  benchmark stages share the single **`omni`** venv — source
   `.github/scripts/ci_env.sh` before every pytest/calibration run.
 
 ### When a full venv rebuild is allowed
@@ -382,8 +384,9 @@ Prefer repairing the single reported gap over rebuilding.
 
 ## Prerequisites (I verify, I do not create)
 - Running inside the CI-reproduction container (image
-  `frankleeeee/sglang-omni:dev` or equivalent). The container name
-  is not checked — rely on the image being correct.
+  `crpi-n6adu6llixz83q37.cn-hangzhou.personal.cr.aliyuncs.com/hongccc/sglang-omni:dev`
+  or equivalent cu13 image). The container name is not checked — rely on the
+  image being correct.
 - Venv path from the selected model's `config.yaml` resolves; default
   overridable via `--venv-python` or `$TUNE_VENV_PYTHON`. **Existence ≠ run
   `prepare_omni_venv.sh`** — run precheck first (see policy above).
@@ -421,16 +424,27 @@ when precheck already shows `✓` for venv pins and assets.
 
 Common Qwen3-Omni V1 presets:
 ```
-# Full threshold stages, excluding docs smoke tests.
+# All Qwen3-Omni threshold stages (every base from stages-list).
 python .claude/skills/tune-ci-thresholds/tune.py --model qwen3-omni-v1 run \
   --stages mmmu,mmmu_talker,mmsu,mmsu_talker,tts,videoamme,videoamme_talker,videoamme_talker_tp2,videomme,videomme_talker \
-  --repeats 5 --output-dir .tune-runs/<timestamp>_qwen3-omni-v1_cuda-graph_no-docs_r5
+  --repeats 5 --output-dir .tune-runs/<timestamp>_qwen3-omni-v1_r5
 
 # FP8 CI stage 11.
 python .claude/skills/tune-ci-thresholds/tune.py --model qwen3-omni-v1 run \
   --stages videoamme_talker_tp2 \
   --repeats 5 --output-dir .tune-runs/<timestamp>_qwen3-omni-v1_fp8_stage_11_r5
 ```
+
+**FP8 Thinker TP=2 (stage 11) container requirements.** CI runs this stage
+(`test_qwen3_omni_videoamme_talker_tp2_ci.py`) with two extra container settings
+that the repro host must match, or every request 500s / the allocator
+fragments:
+- `--cap-add=SYS_PTRACE` — the TP=2 relay passes fds between stage processes
+  via `pidfd_getfd`, which needs `CAP_SYS_PTRACE`.
+- `PYTORCH_ALLOC_CONF=expandable_segments:True` — GPU 1 co-locates thinker
+  rank-1 + talker + code2wav under TP=2; expandable segments reduce allocator
+  fragmentation (issue #765). tune.py sets this from `extra_env`, but the
+  container must still have been **started** with `--cap-add=SYS_PTRACE`.
 
 Common TTS preset:
 ```
@@ -445,10 +459,12 @@ python .claude/skills/tune-ci-thresholds/tune.py --model tts run \
 
 ### TTS CI stage 1 — Qwen3-ASR (mandatory in full TTS calibration)
 
-TTS GitHub Actions runs **`test_qwen3_asr_ci.py` in parallel with Higgs stages**
-(CI stage 1 in the DAG; no longer blocks non-streaming/streaming). Full
-`--model tts --stages ALL` calibration **must** include these stages — never
-calibrate Higgs thresholds alone while leaving Qwen3-ASR on stale literals.
+`test-tts-ci.yaml` DAG: **`stage-1-qwen3-asr` is independent**; `stage-2-non-streaming`
+and `stage-3-streaming` run in parallel; `stage-4-consistency` `needs`
+[stage-2, stage-3]. So `test_qwen3_asr_ci.py` runs in parallel with the Higgs
+stages. Full `--model tts --stages ALL` calibration
+**must** include the Qwen3-ASR stages — never calibrate Higgs thresholds alone
+while leaving Qwen3-ASR on stale literals.
 
 | Stage key | Group | What gets written | Test constant(s) |
 |-----------|-------|-------------------|------------------|
@@ -500,8 +516,13 @@ Notes:
 - **Similarity** calibrates **`VC_SIMILARITY_MEAN_MIN`**, not `TTS_SIMILARITY_MAX_SAMPLES`.
 - **UTMOS** calibrates **`VC_UTMOS_MEAN_REFERENCE`**; CI derives the assertion
   threshold with `apply_mos_slack()`.
-- **Stage 3 (streaming consistency)** is pass/fail only (`max_failed_requests=0` in
-  test code today).
+- **Stage 4 (consistency)** is a separate CI job that runs
+  `tests/test_model/test_tts_consistency_artifacts.py` (not `test_tts_ci.py`),
+  comparing the stage-2/stage-3 speed artifacts with `TTS_CONSISTENCY_CONCURRENCY=16`.
+  It is pass/fail only — no numeric threshold tune.py calibrates, and it is not
+  one of the `test_tts_ci.py` variant stage keys. tune.py's TTS stages cover
+  stage 1 (Qwen3-ASR) and the stage-2/3 voice-clone metrics; the consistency job
+  is verified by re-running CI, not calibrated.
 
 Shortcuts: `@speed`, `@wer`, `@similarity`, `@utmos`, `ALL`, or `tts` /
 `tts_nonstream` / `tts_stream`.
@@ -542,11 +563,10 @@ not merely run the same pytest command.
 |-------|------|-------|
 | **Global (shared)** | `/github/home/.cache/huggingface` | `HF_HOME`; model weights |
 | | `/github/home/.cache/modelscope` | `MODELSCOPE_CACHE` |
-| | `/github/home/.cache/uv` | `UV_CACHE_DIR`; PyPI wheels |
-| | `/github/home/.cache/flashinfer-jit-cache/` | Host-resident flashinfer-jit-cache **wheel**; download only when pin changes |
-| **Per slice (`OMNI_CI_HOME`)** | `<OMNI_CI_HOME>/omni` | Python venv |
+| | `/github/home/.cache/uv` | `UV_CACHE_DIR`; PyPI wheels (mirror `https://mirrors.aliyun.com/pypi/simple`) |
+| **Per slice (`OMNI_CI_HOME`)** | `<OMNI_CI_HOME>/omni` | Python venv (`uv venv -p 3.11`) |
 | | `<OMNI_CI_HOME>/.cache` | `XDG_CACHE_HOME`; uv/torch compile artifacts |
-| | `<OMNI_CI_HOME>/.cache/flashinfer` | Runtime FlashInfer JIT dir — **safe to delete** between runs |
+| | `<OMNI_CI_HOME>/.cache/flashinfer` | Runtime FlashInfer JIT dir — `flashinfer-python` (cu13) compiles kernels here on each cold start. **CI wipes it before every pytest attempt** (omni-setup at job start + `run_flaky_pytest.sh` before each retry), and `tune.py` mirrors that per launch. A healthy cu13 compile is fast (startup < ~60s); a > 60s startup means the JIT path is broken, not slow. |
 | | `<OMNI_CI_HOME>/.torchinductor` | `TORCHINDUCTOR_CACHE_DIR` |
 
 - **CI Actions runners** use `OMNI_CI_HOME=/github/home/pr-<N>`.
@@ -559,7 +579,7 @@ not merely run the same pytest command.
 after precheck reports the venv path missing, imports fail, or sglang/torch
 pins cannot be fixed with `uv pip install -e .`.
 
-From repo root on the H20 repro host (`frankleeeee/sglang-omni:dev` semantics):
+From repo root on the H20 repro host (cu13 `hongccc/sglang-omni:dev` semantics):
 
 ```bash
 # Qwen3-Omni example (TTS: OMNI_CI_HOME=/github/home/calibration, venv omni)
@@ -567,31 +587,35 @@ export OMNI_CI_HOME=/github/home/calibration
 export HOME=/github/home
 export HF_HOME=/github/home/.cache/huggingface
 export MODELSCOPE_CACHE=/github/home/.cache/modelscope
-export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1
-export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
+export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 export UV_CACHE_DIR=/github/home/.cache/uv
 export XDG_CACHE_HOME=${OMNI_CI_HOME}/.cache
 export TORCHINDUCTOR_CACHE_DIR=${OMNI_CI_HOME}/.torchinductor
 
 bash .github/scripts/prepare_omni_venv.sh omni
 ln -sfn "${OMNI_CI_HOME}/omni" ./omni
-bash .github/scripts/install_flashinfer_jit_cache.sh omni
 bash .github/scripts/ensure_hf_models.sh omni \
   Qwen/Qwen3-Omni-30B-A3B-Instruct marksverdhei/Qwen3-Omni-30B-A3B-FP8
 ```
 
-Normal day-to-day calibration (venv already exists, pins ok): **only**
-`source <venv>/bin/activate && uv pip install -e .` — same as CI re-checkout
-on a new commit. Call `prepare_omni_venv.sh` only when precheck proves the
-venv path is missing or corrupt; its fresh path deletes `$OMNI_CI_HOME`.
+`prepare_omni_venv.sh` now keys on a `pyproject.toml` deps-hash: when the hash
+is unchanged and the venv imports cleanly it **reuses** the slice and only runs
+`uv pip install --upgrade -e .` (no wipe). It only does the fresh path
+(`rm -rf $OMNI_CI_HOME`, `uv venv -p 3.11`, full reinstall) when deps changed or
+the venv is missing/corrupt. Normal day-to-day calibration (venv exists, pins
+ok) still needs **only** `source <venv>/bin/activate && uv pip install -e .` —
+same as CI re-checkout on a new commit. Call `prepare_omni_venv.sh` only when
+precheck proves the venv path is missing or corrupt.
 
 ### Required env vars (auto-set from `config.yaml`)
 
 - `HOME=/github/home`
 - `OMNI_CI_HOME`, `XDG_CACHE_HOME`, `TORCHINDUCTOR_CACHE_DIR` — per-slice paths above
-- `HF_HOME`, `MODELSCOPE_CACHE`, `HF_ENDPOINT=https://hf-mirror.com`, `HF_HUB_DISABLE_XET=1`
-- `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`, `UV_CACHE_DIR=/github/home/.cache/uv`
+- `HF_HOME`, `MODELSCOPE_CACHE`, `HF_ENDPOINT=https://hf-mirror.com`, `HF_HUB_DISABLE_XET=1`, `HF_HUB_ENABLE_HF_TRANSFER=0`
+- `UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple`, `UV_CACHE_DIR=/github/home/.cache/uv`
 - `FLASHINFER_DISABLE_VERSION_CHECK=1`
+- `CUDA_VISIBLE_DEVICES` — `ci_env.sh` defaults to `0,1`; during `tune.py run` the tool overrides it per stage to the free GPUs it picks
 
 For missing model/dataset assets only, run the precheck-printed download
 command (often with `HF_ENDPOINT=https://hf-mirror.com`).
@@ -624,7 +648,7 @@ PY
 source /github/home/calibration/omni/bin/activate
 export GITHUB_ACTIONS=true RUNNER_TEMP=/tmp PYTHONPATH=$PWD
 export HOME=/github/home OMNI_CI_HOME=/github/home/calibration
-export HF_HOME=/github/home/.cache/huggingface HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1
+export HF_HOME=/github/home/.cache/huggingface HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
 export SEEDTTS_SIM_CACHE_DIR=/github/home/seedtts-wavlm-sim
 export XDG_CACHE_HOME=${OMNI_CI_HOME}/.cache
 export TORCHINDUCTOR_CACHE_DIR=${OMNI_CI_HOME}/.torchinductor
@@ -637,11 +661,31 @@ bash .github/scripts/run_flaky_pytest.sh \
 ### Known failure signatures
 
 - **Slow safetensors load / disk sleep**: IO pressure — check competing processes, not thresholds.
-- **`gen_cutlass_fused_moe_sm90_module` + router timeout**: missing flashinfer-jit-cache in venv.
-  Run `.github/scripts/install_flashinfer_jit_cache.sh` (uses host wheel cache).
-- **nvcc/ninja referencing wrong Python home**: stale `${OMNI_CI_HOME}/.cache/flashinfer` or
-  wrong `HOME`. Delete `${OMNI_CI_HOME}/.cache/flashinfer` only — **never** delete
-  `/github/home/.cache/flashinfer-jit-cache/`.
+- **🔑 Server / router startup > 60s ⇒ the FlashInfer JIT path is broken (not a
+  threshold/code/GPU problem).** This is the single most reliable startup signal.
+  A correctly-aligned cu13 env compiles FlashInfer's kernels into
+  `${OMNI_CI_HOME}/.cache/flashinfer` **fast** — healthy colocated-router + worker
+  startup is **under ~60s**, even though the cache starts cold every time (see
+  next bullet). If `/health` / router readiness has not gone green after ~60s
+  (you'll see `gen_cutlass_fused_moe_sm90_module` / long `nvcc`/`ninja` compile
+  lines stuck or looping in the pytest log), the FlashInfer JIT is **failing to
+  compile cleanly** — almost always because of a polluted environment: stale JIT
+  artifacts from a different flashinfer/cu/GPU build, `HOME` not `/github/home`,
+  `XDG_CACHE_HOME` not under `${OMNI_CI_HOME}`, or `nvcc`/`ninja` pointing at the
+  wrong Python home. **Fix the env, never the thresholds:** `rm -rf
+  ${OMNI_CI_HOME}/.cache/flashinfer`, re-`source .github/scripts/ci_env.sh`,
+  confirm `HOME=/github/home`, then relaunch. The harness will tolerate a slow
+  startup (`STARTUP_TIMEOUT=600`, router `QWEN3_OMNI_ROUTER_WAIT_TIMEOUT=180`,
+  talker `timeout_s=500`) but a >60s startup is your cue to stop and fix the env.
+- **Cold cache every attempt is intended — it matches CI.** CI wipes
+  `${OMNI_CI_HOME}/.cache/flashinfer` **before every pytest attempt**: `omni-setup`
+  wipes once at job start, and `run_flaky_pytest.sh` wipes again before each of its
+  ≤3 retries. So every CI attempt starts cold and recompiles, and CI still comes up
+  in time — which is exactly why a healthy compile is fast. `tune.py` mirrors this:
+  `_cleanup_flashinfer_cache()` runs before **every** pytest launch (each repeat and
+  each retry). **Do not "warm" or preserve the cache to speed up calibration** — that
+  would diverge from CI. Calibration is "run CI 5×", so each repeat must start cold
+  like a fresh CI job.
 - **GPU cleanup / `[Not Found]` PIDs**: kill container-visible pytest/server processes:
   `pgrep -af "multiprocessing.spawn|sglang_omni_router|sgl-omni serve|pytest|nvcc|ninja"`
 - **Between sequential pytest stages on the repro host**: `delete_gpu_process.sh`
@@ -665,13 +709,16 @@ All CI workflows, calibration models, and WER sweeps use the same venv name
 
 | Workload | CI workflow | venv | `OMNI_CI_HOME` (calibration host) | Source env script |
 |----------|-------------|------|-----------------------------------|-------------------|
-| All benchmarks (unit, Qwen3, TTS, Qwen3-ASR) | `omni-ci.yaml` (one shared setup) → sequential `test-tts-ci.yaml` → `test-qwen3-omni-ci.yaml` → `test.yaml` (later suites still run if an earlier one fails) | **`omni`** | `/github/home/calibration` | `source .github/scripts/ci_env.sh` |
+| All benchmarks (unit, Qwen3, TTS, Qwen3-ASR) | `omni-ci.yaml`: `preflight → setup → pr-test (test.yaml) → tts-ci (test-tts-ci.yaml) → qwen3-omni-ci (test-qwen3-omni-ci.yaml) → cleanup` | **`omni`** | `/github/home/calibration` | `source .github/scripts/ci_env.sh` |
 
-**Omni CI suite order:** after the shared `setup` job, GitHub Actions runs
-`test-tts-ci.yaml`, then `test-qwen3-omni-ci.yaml`, then `test.yaml` (unit /
-non-benchmark tests). Each suite waits for the previous one to finish; a failure
-in TTS or Qwen3-Omni does **not** skip the remaining suites. Only a failed
-`setup` job blocks the benchmark chain.
+**Omni CI suite order (DAG):** `preflight → setup → pr-test → tts-ci →
+qwen3-omni-ci → cleanup`. After the gated `preflight` and the shared `setup`
+job, **unit / non-benchmark tests (`test.yaml`, "PR Test") run FIRST**, then
+`test-tts-ci.yaml`, then `test-qwen3-omni-ci.yaml`. Each benchmark suite `needs`
+the previous (`tts-ci needs [setup, pr-test]`, `qwen3-omni-ci needs [setup,
+tts-ci]`) but is `if: always() && !cancelled() && setup == success`, so a failure
+in PR Test or TTS does **not** skip the later suites. Only a failed `setup` (or
+`preflight` gate) blocks the chain.
 
 **Forbidden shortcuts (observed 2026-05-30):**
 
@@ -685,7 +732,6 @@ in TTS or Qwen3-Omni does **not** skip the remaining suites. Only a failed
 | Wrong or unset `OMNI_CI_HOME` | Router worker unhealthy, stale torchinductor cache, HF cache miss | `source .github/scripts/ci_env.sh` |
 | `TORCHINDUCTOR_CACHE_DIR=/.torchinductor` or unset (inherits garbage) | **Every** server start re-captures CUDA graphs (~minutes); log shows long `Capturing batches` | Set via `ci_env.sh` → `${OMNI_CI_HOME}/.torchinductor` |
 | `HOME=/root` or datasets under `/root/.cache/huggingface` | HF cache miss, re-download, wrong normalizer paths | `HOME=/github/home`, `HF_HOME=/github/home/.cache/huggingface` |
-| Skipping `install_flashinfer_jit_cache.sh` when precheck fails | MoE JIT compile + router timeout on first launch | Install from host wheel cache into `omni` |
 | Killing calibration mid-run without cleaning orphans | `nvidia-smi` shows ~70–85 GiB used but “No running processes” | `pgrep -af multiprocessing.spawn` then `kill -9`; run `delete_gpu_process.sh` |
 
 **Before any pytest / calibration / WER sweep**, always:
@@ -810,8 +856,14 @@ Only the Qwen3-ASR router stage needs 2 free GPUs after `delete_gpu_process.sh`.
   immediately** with exit code 1. Agent must fix `metric_sources` or test
   JSON output, purge the bad repeat, then `--resume`. Do not start the
   next test file until HALT is resolved.
-- **Per-run retries:** up to 4 attempts for OOM / crash / GPU-not-clear
-  failures before marking a stage-run incomplete.
+- **Per-run infra retries:** within a single repeat, a stage-run that fails on
+  OOM / crash / GPU-not-clear is retried up to 4 times to obtain one clean
+  observation, before marking that repeat incomplete. A threshold-assertion
+  failure is **never** retried — it is a valid worst-of-N observation. This is a
+  calibration-specific mechanism for getting clean data; it is **not** CI's
+  per-test failure retry (CI's logic — "rerun a failing unit test up to 3 times
+  to make it pass" — is unrelated to and must not be conflated with worst-of-N
+  calibration).
 - **`status` subcommand:** machine-readable snapshot for agent polling.
 - **`report` gate:** refuses to write `report.md` unless **every**
   stage × repeat has complete metrics (`125/125` for full qwen3 ALL×5,
@@ -877,8 +929,8 @@ Two gates — **both** required before apply:
      videoamme                    tests/test_model/test_qwen3_omni_videoamme_ci.py — acc + speed
      videoamme_talker             tests/test_model/test_qwen3_omni_videoamme_talker_ci.py — acc + wer + speed
      videoamme_talker_tp2         tests/test_model/test_qwen3_omni_videoamme_talker_tp2_ci.py — acc + wer + speed
-     tts                          tests/test_model/test_qwen3_omni_tts_ci.py — speed + wer
-   Shortcuts: @accuracy, @speed, @wer (metric-group aliases).
+     tts                          tests/test_model/test_qwen3_omni_tts_ci.py — wer + utmos + speed
+   Shortcuts: @accuracy, @speed, @wer, @utmos (metric-group aliases).
    Combine with commas (e.g. "mmmu,mmsu" or "mmmu,@wer").
    ```
    Parse the user's free-text reply (trim whitespace, split on commas)
@@ -1128,16 +1180,14 @@ Two gates — **both** required before apply:
 - Include △ partial or ✗ failed repeats in worst-of-N calculations or
   apply decisions.
 - Download, rebuild, or bulk-install the calibration environment before
-  `precheck` proves a specific gap. No proactive `prepare_omni_venv.sh`,
-  `install_flashinfer_jit_cache.sh`, or `ensure_hf_models.sh`.
-- Run `prepare_omni_venv.sh` when precheck already shows a working venv
-  (its fresh path runs `rm -rf $OMNI_CI_HOME`).
+  `precheck` proves a specific gap. No proactive `prepare_omni_venv.sh` or
+  `ensure_hf_models.sh`.
+- Run `prepare_omni_venv.sh` when precheck already shows a working venv (its
+  fresh path runs `rm -rf $OMNI_CI_HOME`; it only takes that path when the
+  `pyproject.toml` deps-hash changed or the venv is missing/corrupt).
 - Check out branches unless the user asked or calibration requires it.
   Sync code with `uv pip install -e .` only unless precheck proves the
   venv is missing/corrupt — then follow **Environment policy — check first**.
-- Install flashinfer-jit-cache only when precheck reports it missing — use
-  host wheel cache first (`install_flashinfer_jit_cache.sh`; network only on
-  cache miss). Every CI venv slice gets it via `omni-setup`, including Qwen3-ASR.
 - Run `apply_slack` or generate patch files
 - Commit or push without explicit user authorization
 - Edit test files outside of the explicit apply prompt (step 9)

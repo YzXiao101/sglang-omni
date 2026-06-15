@@ -28,7 +28,7 @@ _GPU_LAUNCH_RECHECK_S = 3
 _GPU_WAIT_POLL_S = 5
 _GPU_WAIT_TIMEOUT_S = 600
 _PYTEST_POLL_S = 30
-_MAX_RUN_ATTEMPTS = 4
+_MAX_RUN_ATTEMPTS = 4  # infra-failure retries (OOM/crash/GPU-not-clear) to obtain one clean repeat; calibration-specific, unrelated to CI's per-test failure retry
 _DEFAULT_CALIBRATION_PASSES = 10
 _AGENT_POLL_INTERVAL_S = 120
 _CI_HOME = Path("/github/home")
@@ -71,24 +71,12 @@ def _flashinfer_cache_dirs(env: dict[str, str] | None = None) -> list[Path]:
 
 
 def _cleanup_flashinfer_cache(env: dict[str, str] | None = None) -> None:
-    # Runtime JIT dirs only — never remove the host wheel cache under
-    # /github/home/.cache/flashinfer-jit-cache/ (see install_flashinfer_jit_cache.sh).
+    # Wipe the runtime FlashInfer JIT dirs so kernels recompile cleanly on the
+    # next cold start. Matches CI, which wipes the same dir before every pytest
+    # attempt (omni-setup at job start + run_flaky_pytest.sh before each retry).
     for cache_dir in _flashinfer_cache_dirs(env):
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-
-def _venv_has_flashinfer_jit_cache(py: str) -> bool:
-    r = subprocess.run(
-        [
-            py,
-            "-c",
-            "import importlib.util, sys;"
-            "sys.exit(0 if importlib.util.find_spec('flashinfer_jit_cache') else 1)",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    return r.returncode == 0
 
 # Metric registry. Each entry encodes how a named metric should be
 # displayed in the report and which stage group it belongs to. Scales
@@ -632,9 +620,8 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
     print(f"venv_python: {py} ({src})")
     if src == "default" and tried and len(tried) > 1:
         print(f"  (tried in order: {', '.join(tried)})")
-    # Container-name / hostname checks removed deliberately — they were
-    # fragile heuristics. Equivalence with CI is established by: same
-    # image's venv + pinned sglang/torch + cached assets + clean GPUs.
+    # Equivalence with CI is established by: same image's venv + pinned
+    # sglang/torch + cached assets + clean GPUs.
     if not (REPO_ROOT / "pyproject.toml").exists():
         errs.append(f"repo not found at {REPO_ROOT}")
         return _summary(errs, warns)
@@ -668,19 +655,6 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
     # load_model_config; print them for visibility.
     for k, v in cfg["auto_env"].items():
         print(f"  auto env: {k}={v}")
-    if not _venv_has_flashinfer_jit_cache(py):
-        venv_root = Path(py).resolve().parent.parent
-        venv_name = venv_root.name
-        errs.append(
-            "flashinfer-jit-cache missing from venv (CI MoE graph capture needs it).\n"
-            f"  From repo root with OMNI_CI_HOME={cfg['auto_env'].get('OMNI_CI_HOME', '<set>')}:\n"
-            f"    ln -sfn {venv_root} ./{venv_name}\n"
-            f"    bash .github/scripts/install_flashinfer_jit_cache.sh {venv_name}\n"
-            "  Host wheel cache: /github/home/.cache/flashinfer-jit-cache/ (shared across PRs)."
-        )
-    # WER normalizer check removed — the user manages venv contents
-    # explicitly and the warning was producing noise without changing
-    # behavior. `expected_wer_normalizer` in config.yaml is now ignored.
     def _cached(repo_id, kind):
         if kind == "dataset":
             r = subprocess.run(
@@ -784,7 +758,7 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
             errs.append(f"need {gpu_required} free GPU(s); only {free_count} free "
                         f"(busy: {sorted(busy)}) — "
                         "free them yourself (e.g. stop your own jobs); "
-                        "this skill no longer kills GPU processes")
+                        "precheck does not kill GPU processes")
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
         (out / "precheck.json").write_text(json.dumps(dict(
@@ -1971,10 +1945,9 @@ def report(run_dir):
             v = min(vals[k]) if worst[k] == "min" else max(vals[k])
             wc.append(f"**{_fmt(v, disp[k])}**")
         L += [f"| **Worst-of-{N}** | " + " | ".join(wc) + " |", ""]
-        # `Threshold: ...` lines were removed — what actually got written
-        # into the test files (if anything) is recorded in the
-        # "Applied changes" table appended after mode-smart/mode-full
-        # apply (see SKILL.md step 9).
+        # What actually got written into the test files (if anything) is
+        # recorded in the "Applied changes" table appended after
+        # mode-smart/mode-full apply (see SKILL.md step 9).
         for k in nulls:
             L.append(f"> ⚠ {disp[k]['label']}: no `json_path` in stages.yaml "
                      "(config.yaml `metric_sources` missing this metric)")
