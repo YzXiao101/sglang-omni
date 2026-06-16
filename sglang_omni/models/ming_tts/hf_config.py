@@ -154,12 +154,29 @@ class BailingMMTTSConfig(PretrainedConfig):
         self.aggregator_config = (
             dict(aggregator_config) if aggregator_config is not None else None
         )
+        is_default_init = (
+            llm_config is None
+            and audio_tokenizer_config is None
+            and ditar_config is None
+            and aggregator_config is None
+            and model_type is None
+            and not kwargs
+        )
         super().__init__(**kwargs)
+        if is_default_init:
+            return
+
+        if self.raw_model_type != self.model_type:
+            raise ValueError(
+                "Ming-Omni-TTS config must use model_type "
+                f"{self.model_type!r}; got {self.raw_model_type!r}"
+            )
 
         architectures = getattr(self, "architectures", None) or []
-        if MING_TTS_ARCHITECTURE not in architectures:
+        if architectures and MING_TTS_ARCHITECTURE not in architectures:
             raise ValueError(
-                "Ming-Omni-TTS config must declare architecture "
+                "Ming-Omni-TTS config declares unsupported architecture; "
+                "expected "
                 f"{MING_TTS_ARCHITECTURE!r}; got {architectures!r}"
             )
 
@@ -172,9 +189,10 @@ class BailingMMTTSConfig(PretrainedConfig):
                 "branch is currently unsupported."
             )
         llm_architectures = getattr(self.llm_config, "architectures", None) or []
-        if MING_TTS_LLM_ARCHITECTURE not in llm_architectures:
+        if llm_architectures and MING_TTS_LLM_ARCHITECTURE not in llm_architectures:
             raise ValueError(
-                "Ming-Omni-TTS llm_config must declare architecture "
+                "Ming-Omni-TTS llm_config declares unsupported architecture; "
+                "expected "
                 f"{MING_TTS_LLM_ARCHITECTURE!r}; got {llm_architectures!r}"
             )
 
