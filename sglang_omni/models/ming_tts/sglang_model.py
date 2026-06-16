@@ -703,7 +703,9 @@ class MingTTSSGLangModel(nn.Module):
             if owner == OWNER_UNKNOWN:
                 report.leftovers.append(original_name)
                 continue
-            if "rotary_emb." in original_name:
+            if "rotary_emb." in original_name or original_name.endswith(
+                ".rotary_embed.inv_freq"
+            ):
                 report.skipped.setdefault(
                     MING_TTS_ROTARY_BUFFER_SKIP_REASON,
                     [],

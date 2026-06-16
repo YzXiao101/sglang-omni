@@ -92,6 +92,9 @@ class Encoder(nn.Module):
     ) -> None:
         super().__init__()
         config = Qwen2Config.from_dict(config_dict=encoder_args)
+        # Transformers 5.x flash attention can fail on this AudioVAE Qwen2 path
+        # with s_aux=None. Keep Phase I decode correctness-first.
+        config._attn_implementation = "eager"
         self.encoder = Qwen2Model(config)
         self.input_dim = input_dim
         self.hop_size = hop_size
@@ -156,6 +159,9 @@ class Decoder(nn.Module):
     ) -> None:
         super().__init__()
         config = Qwen2Config.from_dict(config_dict=decoder_args)
+        # Transformers 5.x flash attention can fail on this AudioVAE Qwen2 path
+        # with s_aux=None. Keep Phase I decode correctness-first.
+        config._attn_implementation = "eager"
         self.decoder = Qwen2Model(config)
         self.output_dim = output_dim
         self.latent_dim = latent_dim
