@@ -24,6 +24,7 @@ class ModelWorkerConfig:
 
 _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "BailingMoeV2ForCausalLM": ("llm_config", None),
+    "MingTTSSGLangModel": ("llm_config", None),
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
@@ -71,6 +72,12 @@ class ModelWorker:
             )
 
             register_ming_hf_config()
+        if self.model_arch_override == "MingTTSSGLangModel":
+            from sglang_omni.models.ming_tts.hf_config import (
+                register_ming_tts_hf_config,
+            )
+
+            register_ming_tts_hf_config()
 
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -114,6 +121,10 @@ class ModelWorker:
         model_config.num_key_value_heads = text_cfg.num_key_value_heads
         model_config.hidden_size = text_cfg.hidden_size
         model_config.num_hidden_layers = text_cfg.num_hidden_layers
+        if arch == "MingTTSSGLangModel":
+            model_config.head_dim = int(text_cfg.head_dim)
+            model_config.v_head_dim = model_config.head_dim
+            model_config.vocab_size = int(text_cfg.vocab_size)
 
     def _configure_backend_policy(self) -> None:
         effective_quantization = _apply_model_worker_backend_policy(
