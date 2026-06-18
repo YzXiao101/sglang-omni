@@ -152,8 +152,9 @@ class MingTTSReferenceEncoder:
                 dtype=torch.long,
                 device=self.device,
             )
+            prompt_waveform = self._prepare_audio_vae_waveform(prompt_waveform)
             prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
-                prompt_waveform.to(device=self.device),
+                prompt_waveform,
                 waveform_length,
             )
         if prompt_latent.ndim != 3 or int(prompt_latent.shape[0]) != 1:
@@ -260,6 +261,32 @@ class MingTTSReferenceEncoder:
         )
         padded[:, : int(waveform.shape[-1])] = waveform.clone()
         return padded
+
+    def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
+
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+        # Official generate() runs AudioVAE encode under bf16 autocast; this
+        # stage is isolated, so align the waveform to the loaded AudioVAE dtype.
+        return waveform.to(
+            device=self.device,
+            dtype=self._audio_vae_floating_dtype(),
+        )
+
+    def _audio_vae_floating_dtype(self) -> Any:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
+
+        for parameter in self.audio_vae.parameters():
+            if parameter.is_floating_point():
+                return parameter.dtype
+        return torch.float32
 
     @staticmethod
     def _speaker_fingerprint(path: str, ref_text: str | None) -> str:
