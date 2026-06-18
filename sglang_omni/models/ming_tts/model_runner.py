@@ -292,6 +292,34 @@ class MingTTSModelRunner(ModelRunner):
                 device=device,
                 dtype=torch.float32,
             )
+            prompt_latent = getattr(data, "prompt_latent_for_history", None)
+            if prompt_latent is not None:
+                if not isinstance(prompt_latent, torch.Tensor):
+                    prompt_latent = torch.as_tensor(prompt_latent)
+                if prompt_latent.ndim == 2:
+                    prompt_latent = prompt_latent.unsqueeze(0)
+                expected_tail = (1, int(self.model.latent_dim))
+                if (
+                    prompt_latent.ndim != 3
+                    or int(prompt_latent.shape[0]) != expected_tail[0]
+                    or int(prompt_latent.shape[2]) != expected_tail[1]
+                ):
+                    raise RuntimeError(
+                        "Ming TTS prompt latent history must have shape "
+                        f"[1, frames, {expected_tail[1]}], "
+                        f"got {tuple(prompt_latent.shape)}"
+                    )
+                prompt_latent = prompt_latent.to(device=device, dtype=torch.float32)
+                history_len = int(history.shape[1])
+                prompt_len = int(prompt_latent.shape[1])
+                if prompt_len <= 0:
+                    raise RuntimeError(
+                        "Ming TTS prompt latent history requires at least one frame"
+                    )
+                if prompt_len >= history_len:
+                    history.copy_(prompt_latent[:, -history_len:, :])
+                else:
+                    history[:, -prompt_len:, :].copy_(prompt_latent)
             data.latent_history = history
             return history
 

@@ -160,6 +160,50 @@ def create_tts_engine_executor(*args, **kwargs) -> Any:
     return create_sglang_tts_engine_executor(*args, **kwargs)
 
 
+def create_reference_encode_executor(
+    model_path: str,
+    *,
+    device: str = "cuda:0",
+    gpu_id: int | None = None,
+    dtype: str = "bfloat16",
+    context_length: int | None = None,
+    max_concurrency: int = 1,
+) -> SimpleScheduler:
+    from sglang_omni.models.ming_tts.reference_encode import MingTTSReferenceEncoder
+    from sglang_omni.models.ming_tts.weight_loading import (
+        load_ming_tts_audio_vae_weights,
+    )
+
+    checkpoint_dir = _resolve_checkpoint(model_path)
+    config = _load_ming_tts_config(checkpoint_dir)
+    context_length = int(context_length or _resolve_context_length(config))
+    tokenizer = load_ming_tts_tokenizer(
+        checkpoint_dir,
+        llm_config=config.llm_config,
+    )
+    if gpu_id is not None:
+        device = f"cuda:{gpu_id}"
+
+    encoder = MingTTSReferenceEncoder.from_config(
+        config.audio_tokenizer_config,
+        checkpoint_dir=checkpoint_dir,
+        device=device,
+        dtype=dtype,
+        patch_size=int(config.ditar_config["patch_size"]),
+    )
+    report = load_ming_tts_audio_vae_weights(checkpoint_dir, encoder.audio_vae)
+    logger.info("%s", report.summary())
+
+    def _encode(payload):
+        return encoder.encode_payload(
+            payload,
+            tokenizer=tokenizer,
+            context_length=context_length,
+        )
+
+    return SimpleScheduler(_encode, max_concurrency=max_concurrency)
+
+
 def create_audio_decode_executor(
     model_path: str,
     *,
@@ -243,6 +287,7 @@ def _resolve_context_length(config: Any) -> int:
 __all__ = [
     "create_audio_decode_executor",
     "create_preprocessing_executor",
+    "create_reference_encode_executor",
     "create_sglang_tts_engine_executor",
     "create_tts_engine_executor",
 ]
