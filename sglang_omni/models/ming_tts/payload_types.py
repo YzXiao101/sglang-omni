@@ -86,6 +86,139 @@ def decode_generated_latents(
     return tensor
 
 
+def encode_speaker_embedding(spk_emb: Any) -> dict[str, Any]:
+    """Encode raw CampPlus speaker embeddings for cross-stage transport."""
+
+    tensor = _encode_float_tensor(
+        spk_emb,
+        name="Ming-Omni-TTS speaker embedding",
+        ndim=2,
+    )
+    if int(tensor.shape[1]) != 192:
+        raise ValueError(
+            "Ming-Omni-TTS speaker embedding must have shape [num_speakers, 192], "
+            f"got {tuple(tensor.shape)}"
+        )
+    return {
+        "spk_emb_bytes": tensor.numpy().tobytes(),
+        "spk_emb_shape": list(tensor.shape),
+        "spk_emb_dtype": MING_TTS_LATENT_TRANSPORT_DTYPE,
+    }
+
+
+def decode_speaker_embedding(
+    data: "MingTTSState | dict[str, Any]",
+    *,
+    device: Any | None = None,
+    dtype: Any | None = None,
+) -> Any | None:
+    """Restore raw CampPlus speaker embeddings from the state payload."""
+
+    if isinstance(data, MingTTSState):
+        raw = data.spk_emb_bytes
+        shape = data.spk_emb_shape
+        tensor_dtype = data.spk_emb_dtype
+    else:
+        raw = data.get("spk_emb_bytes")
+        shape = data.get("spk_emb_shape")
+        tensor_dtype = data.get("spk_emb_dtype", MING_TTS_LATENT_TRANSPORT_DTYPE)
+    return _decode_float_tensor(
+        raw,
+        shape,
+        tensor_dtype,
+        name="Ming-Omni-TTS speaker embedding",
+        device=device,
+        dtype=dtype,
+    )
+
+
+def encode_prompt_latent(prompt_latent: Any) -> dict[str, Any]:
+    """Encode raw AudioVAE prompt latents for cross-stage transport."""
+
+    tensor = _encode_float_tensor(
+        prompt_latent,
+        name="Ming-Omni-TTS prompt latent",
+        ndim=3,
+    )
+    return {
+        "prompt_latent_bytes": tensor.numpy().tobytes(),
+        "prompt_latent_shape": list(tensor.shape),
+        "prompt_latent_dtype": MING_TTS_LATENT_TRANSPORT_DTYPE,
+    }
+
+
+def decode_prompt_latent(
+    data: "MingTTSState | dict[str, Any]",
+    *,
+    device: Any | None = None,
+    dtype: Any | None = None,
+) -> Any | None:
+    """Restore raw AudioVAE prompt latents from the state payload."""
+
+    if isinstance(data, MingTTSState):
+        raw = data.prompt_latent_bytes
+        shape = data.prompt_latent_shape
+        tensor_dtype = data.prompt_latent_dtype
+    else:
+        raw = data.get("prompt_latent_bytes")
+        shape = data.get("prompt_latent_shape")
+        tensor_dtype = data.get(
+            "prompt_latent_dtype",
+            MING_TTS_LATENT_TRANSPORT_DTYPE,
+        )
+    return _decode_float_tensor(
+        raw,
+        shape,
+        tensor_dtype,
+        name="Ming-Omni-TTS prompt latent",
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _encode_float_tensor(tensor: Any, *, name: str, ndim: int) -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(f"{name} transport requires torch") from exc
+
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    if tensor.ndim != int(ndim):
+        raise ValueError(
+            f"{name} must have {ndim} dimensions, got {tuple(tensor.shape)}"
+        )
+    return tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+
+def _decode_float_tensor(
+    raw: Any,
+    shape: Any,
+    tensor_dtype: Any,
+    *,
+    name: str,
+    device: Any | None,
+    dtype: Any | None,
+) -> Any | None:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(f"{name} transport requires torch") from exc
+
+    if raw is None or shape is None:
+        return None
+    if tensor_dtype != MING_TTS_LATENT_TRANSPORT_DTYPE:
+        raise ValueError(
+            f"Unsupported {name} transport dtype {tensor_dtype!r}; "
+            f"expected {MING_TTS_LATENT_TRANSPORT_DTYPE!r}"
+        )
+    tensor = torch.frombuffer(bytes(raw), dtype=torch.float32).clone()
+    tensor = tensor.reshape([int(dim) for dim in shape])
+    if device is not None or dtype is not None:
+        tensor = tensor.to(device=device, dtype=dtype)
+    return tensor
+
+
 @dataclass
 class MingTTSState:
     """Per-request state for Ming-Omni-TTS generation."""
@@ -103,7 +236,9 @@ class MingTTSState:
     input_ids: list[int] | None = None
     prompt_text: str | None = None
     spk_token_positions: list[int] | None = None
+    spk_injection_positions: list[int] | None = None
     audio_token_position: int | None = None
+    prompt_latent_start_position: int | None = None
     prompt_latent_token_count: int = 0
     prompt_cache_key: str | None = None
     embedding_cache_key: str | None = None
@@ -168,8 +303,14 @@ class MingTTSState:
             data["prompt_text"] = self.prompt_text
         if self.spk_token_positions is not None:
             data["spk_token_positions"] = list(self.spk_token_positions)
+        if self.spk_injection_positions is not None:
+            data["spk_injection_positions"] = list(self.spk_injection_positions)
         if self.audio_token_position is not None:
             data["audio_token_position"] = int(self.audio_token_position)
+        if self.prompt_latent_start_position is not None:
+            data["prompt_latent_start_position"] = int(
+                self.prompt_latent_start_position
+            )
         if self.prompt_latent_token_count:
             data["prompt_latent_token_count"] = int(self.prompt_latent_token_count)
         if self.prompt_cache_key is not None:
@@ -248,9 +389,17 @@ class MingTTSState:
             input_ids=int_list_or_none(data.get("input_ids")),
             prompt_text=data.get("prompt_text"),
             spk_token_positions=int_list_or_none(data.get("spk_token_positions")),
+            spk_injection_positions=int_list_or_none(
+                data.get("spk_injection_positions")
+            ),
             audio_token_position=(
                 int(data["audio_token_position"])
                 if data.get("audio_token_position") is not None
+                else None
+            ),
+            prompt_latent_start_position=(
+                int(data["prompt_latent_start_position"])
+                if data.get("prompt_latent_start_position") is not None
                 else None
             ),
             prompt_latent_token_count=int(
@@ -323,6 +472,10 @@ __all__ = [
     "MING_TTS_LATENT_TRANSPORT_VERSION",
     "MING_TTS_SAMPLE_RATE",
     "MingTTSState",
+    "decode_prompt_latent",
     "decode_generated_latents",
+    "decode_speaker_embedding",
+    "encode_prompt_latent",
     "encode_generated_latents",
+    "encode_speaker_embedding",
 ]

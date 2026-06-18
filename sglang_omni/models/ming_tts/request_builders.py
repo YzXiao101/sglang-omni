@@ -14,14 +14,15 @@ from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.proto import StagePayload
 
-_REFERENCE_UNSUPPORTED = (
-    "Ming-Omni-TTS reference audio / speaker cloning is currently unsupported"
+_REFERENCE_CONTRACT_ERROR = (
+    "Ming-Omni-TTS currently supports only one local reference audio path "
+    "with non-empty reference text"
 )
 _LOGITS_SAMPLING_FIELDS = ("do_sample", "top_p", "top_k", "repetition_penalty")
-_REFERENCE_FIELDS = (
-    "ref_audio",
-    "ref_text",
-    "prompt_wav_path",
+_REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio", "prompt_wav_path")
+_DIRECT_REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "prompt_wav_path")
+_REFERENCE_TEXT_FIELDS = ("ref_text", "prompt_text")
+_UNSUPPORTED_REFERENCE_FIELDS = (
     "prompt_waveform",
     "prompt_latents",
     "prompt_latent",
@@ -133,18 +134,58 @@ def preprocess_ming_tts_payload(
     if not text:
         raise ValueError("Ming-Omni-TTS requires non-empty input text")
 
-    if references:
-        raise ValueError(_REFERENCE_UNSUPPORTED)
+    if len(references) > 1:
+        raise ValueError("Ming-Omni-TTS currently supports only one reference")
+
+    input_dict = (
+        payload.request.inputs if isinstance(payload.request.inputs, dict) else {}
+    )
+    reference = references[0] if references else {}
+    ref_audio = first_present(
+        reference,
+        names=_REFERENCE_AUDIO_FIELDS,
+    )
+    if ref_audio is None:
+        ref_audio = first_present(
+            input_dict,
+            tts_params,
+            params,
+            names=_DIRECT_REFERENCE_AUDIO_FIELDS,
+        )
+    if isinstance(ref_audio, str):
+        ref_audio = ref_audio.strip() or None
+    elif ref_audio is not None:
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
+
+    ref_text_value = reference.get("text") if reference else None
+    if ref_text_value is None:
+        ref_text_value = first_present(
+            input_dict,
+            tts_params,
+            params,
+            names=_REFERENCE_TEXT_FIELDS,
+        )
+    ref_text = optional_text(ref_text_value)
+    if ref_audio is not None and ref_text is None:
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
+    if ref_audio is None and ref_text is not None:
+        raise ValueError("Ming-Omni-TTS reference text requires reference audio")
 
     if isinstance(payload.request.inputs, dict):
-        for field in _REFERENCE_FIELDS:
+        for field in _UNSUPPORTED_REFERENCE_FIELDS:
             if has_non_empty_value(payload.request.inputs, field):
-                raise ValueError(_REFERENCE_UNSUPPORTED)
+                raise ValueError(
+                    "Ming-Omni-TTS speaker embedding and prompt latent inputs "
+                    "must be produced by the reference_encode stage"
+                )
 
     for source in (tts_params, params):
-        for field in _REFERENCE_FIELDS:
+        for field in _UNSUPPORTED_REFERENCE_FIELDS:
             if has_non_empty_value(source, field):
-                raise ValueError(_REFERENCE_UNSUPPORTED)
+                raise ValueError(
+                    "Ming-Omni-TTS speaker embedding and prompt latent inputs "
+                    "must be produced by the reference_encode stage"
+                )
         for field in _DURATION_FIELDS:
             if source.get(field) is not None:
                 raise ValueError(
@@ -268,6 +309,8 @@ def preprocess_ming_tts_payload(
         prompt=prompt,
         voice=None,
         language=None,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
         max_decode_steps=max_decode_steps,
         cfg=resolve_float(
             "cfg",
@@ -294,21 +337,24 @@ def preprocess_ming_tts_payload(
             f"Ming-Omni-TTS temperature must be >= 0, got {state.temperature}"
         )
 
-    plan = build_ming_tts_prompt(state, tokenizer)
-    if plan.prompt_tokens + state.max_decode_steps > int(context_length):
-        raise ValueError(
-            "Ming-Omni-TTS request exceeds context length: "
-            f"prompt_tokens={plan.prompt_tokens}, "
-            f"max_decode_steps={state.max_decode_steps}, "
-            f"context_length={context_length}"
-        )
+    if state.ref_audio is None:
+        plan = build_ming_tts_prompt(state, tokenizer)
+        if plan.prompt_tokens + state.max_decode_steps > int(context_length):
+            raise ValueError(
+                "Ming-Omni-TTS request exceeds context length: "
+                f"prompt_tokens={plan.prompt_tokens}, "
+                f"max_decode_steps={state.max_decode_steps}, "
+                f"context_length={context_length}"
+            )
 
-    state.prompt = plan.effective_prompt
-    state.input_ids = plan.input_ids
-    state.prompt_tokens = plan.prompt_tokens
-    state.spk_token_positions = plan.spk_token_positions
-    state.audio_token_position = plan.audio_token_position
-    state.prompt_latent_token_count = plan.prompt_latent_token_count
+        state.prompt = plan.effective_prompt
+        state.input_ids = plan.input_ids
+        state.prompt_tokens = plan.prompt_tokens
+        state.spk_token_positions = plan.spk_token_positions
+        state.spk_injection_positions = plan.spk_injection_positions
+        state.audio_token_position = plan.audio_token_position
+        state.prompt_latent_start_position = plan.prompt_latent_start_position
+        state.prompt_latent_token_count = plan.prompt_latent_token_count
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
