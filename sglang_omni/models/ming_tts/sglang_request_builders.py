@@ -10,6 +10,8 @@ from typing import Any
 
 from sglang_omni.models.ming_tts.payload_types import (
     MingTTSState,
+    decode_prompt_latent,
+    decode_speaker_embedding,
     encode_generated_latents,
 )
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
@@ -42,6 +44,7 @@ class MingTTSSGLangRequestData(ARRequestData):
     audio_eos_token_id: int = 0
     audio_token_id: int = 0
     latent_history: Any = None
+    prompt_latent_for_history: Any = None
     generated_latents: list[Any] = field(default_factory=list)
     generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
@@ -125,6 +128,100 @@ def make_ming_tts_scheduler_adapters(
         sampling_params.normalize(None)
         sampling_params.verify(vocab_size)
 
+        embedding = model.get_input_embeddings()
+        weight = embedding.weight
+        prefill_input_embeds = None
+        prompt_latent_for_history = None
+        spk_emb = decode_speaker_embedding(
+            state,
+            device=weight.device,
+            dtype=weight.dtype,
+        )
+        prompt_latent = decode_prompt_latent(
+            state,
+            device=weight.device,
+            dtype=torch.float32,
+        )
+        if spk_emb is not None or prompt_latent is not None:
+            input_ids_for_embedding = torch.tensor(
+                input_ids_list,
+                dtype=torch.long,
+                device=weight.device,
+            )
+            with torch.no_grad():
+                prompt_embeds = embedding(input_ids_for_embedding).to(
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+                if spk_emb is not None:
+                    positions = state.spk_injection_positions
+                    if positions is None:
+                        positions = [
+                            int(position) + 1
+                            for position in (state.spk_token_positions or [])
+                        ]
+                    if len(positions) != int(spk_emb.shape[0]):
+                        raise ValueError(
+                            "Ming-Omni-TTS speaker embedding count does not match "
+                            "prompt injection positions: "
+                            f"{int(spk_emb.shape[0])} != {len(positions)}"
+                        )
+                    projected_spk = model.spk_head(spk_emb)
+                    for row, position in enumerate(positions):
+                        position = int(position)
+                        if position < 0 or position >= int(prompt_embeds.shape[0]):
+                            raise ValueError(
+                                "Ming-Omni-TTS speaker injection position is outside "
+                                f"prompt length: {position}"
+                            )
+                        prompt_embeds[position] = projected_spk[row].to(
+                            device=prompt_embeds.device,
+                            dtype=prompt_embeds.dtype,
+                        )
+
+                if prompt_latent is not None:
+                    token_count = int(state.prompt_latent_token_count)
+                    start = state.prompt_latent_start_position
+                    if start is None:
+                        start = int(state.audio_token_position) + 1
+                    if token_count <= 0:
+                        raise ValueError(
+                            "Ming-Omni-TTS prompt_latent_token_count must be > 0 "
+                            "when prompt_latent is present"
+                        )
+                    if int(prompt_latent.shape[1]) != token_count * int(
+                        model.patch_size
+                    ):
+                        raise ValueError(
+                            "Ming-Omni-TTS prompt latent frame count does not match "
+                            "prompt latent token count"
+                        )
+                    projected_prompt = model.linear_proj_audio(
+                        prompt_latent.to(dtype=weight.dtype).reshape(
+                            -1,
+                            int(model.patch_size),
+                            int(model.latent_dim),
+                        )
+                    )
+                    projected_prompt = projected_prompt.reshape(
+                        1,
+                        -1,
+                        int(projected_prompt.shape[-1]),
+                    )[0]
+                    end = int(start) + int(token_count)
+                    if end > int(prompt_embeds.shape[0]):
+                        raise ValueError(
+                            "Ming-Omni-TTS prompt latent injection range exceeds "
+                            f"prompt length: start={start}, count={token_count}"
+                        )
+                    prompt_embeds[int(start) : end] = projected_prompt.to(
+                        device=prompt_embeds.device,
+                        dtype=prompt_embeds.dtype,
+                    )
+                    prompt_latent_for_history = prompt_latent.detach()
+
+                prefill_input_embeds = prompt_embeds.detach()
+
         req = Req(
             rid=payload.request_id,
             origin_input_text="",
@@ -155,6 +252,8 @@ def make_ming_tts_scheduler_adapters(
             audio_patch_token_id=int(tokenizer.special.audio_patch),
             audio_eos_token_id=int(tokenizer.special.end_of_audio),
             audio_token_id=int(tokenizer.special.audio_start),
+            prefill_input_embeds=prefill_input_embeds,
+            prompt_latent_for_history=prompt_latent_for_history,
             engine_start_s=time.perf_counter(),
         )
         data.input_embeds_are_projected = True
