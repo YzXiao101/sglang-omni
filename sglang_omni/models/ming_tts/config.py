@@ -10,6 +10,7 @@ from sglang_omni.config import PipelineConfig, StageConfig
 _PKG = "sglang_omni.models.ming_tts"
 
 PREPROCESSING_STAGE = "preprocessing"
+REFERENCE_ENCODE_STAGE = "reference_encode"
 TTS_ENGINE_STAGE = "tts_engine"
 AUDIO_DECODE_STAGE = "audio_decode"
 
@@ -30,6 +31,14 @@ class MingTTSPipelineConfig(PipelineConfig):
             name=PREPROCESSING_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            next=REFERENCE_ENCODE_STAGE,
+        ),
+        StageConfig(
+            name=REFERENCE_ENCODE_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_reference_encode_executor",
+            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            gpu=0,
             next=TTS_ENGINE_STAGE,
         ),
         StageConfig(
