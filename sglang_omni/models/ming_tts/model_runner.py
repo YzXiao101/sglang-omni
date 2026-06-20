@@ -3,22 +3,30 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.ming_tts.profile_events import (
-    emit_ming_event,
-    ming_profile_event,
-    tensor_metadata,
+from sglang_omni.models.ming_tts.ar_state import (
+    get_ming_ar_device_state_pool,
+    get_ming_ar_state,
+    sync_ming_ar_state_to_legacy,
 )
+from sglang_omni.models.ming_tts.ar_state_machine import (
+    MingARStateMachine,
+    normalize_ming_ar_hidden_states,
+)
+from sglang_omni.models.ming_tts.profile_events import emit_ming_event, tensor_metadata
 
 
 class MingTTSModelRunner(ModelRunner):
     """Runs Ming-Omni-TTS AR steps and samples continuous acoustic latents."""
+
+    def __init__(self, tp_worker: Any, output_processor: Any):
+        super().__init__(tp_worker, output_processor)
+        self._ar_state_machine = MingARStateMachine(self.model)
 
     def before_prefill(
         self,
@@ -44,6 +52,15 @@ class MingTTSModelRunner(ModelRunner):
             getattr(sched_req.data, "prefill_input_embeds", None)
             for sched_req in requests
         ]
+        if any(
+            bool(getattr(sched_req.data, "row_prefill_radix_cache_enabled", False))
+            and getattr(sched_req.data, "prefill_input_embeds", None) is None
+            for sched_req in requests
+        ):
+            raise RuntimeError(
+                "Ming TTS row-prefill radix cache requires prefill_input_embeds; "
+                "synthetic row-hash ids must not be used for embedding lookup"
+            )
         if all(item is None for item in projected):
             return None
         if any(item is None for item in projected):
@@ -122,22 +139,18 @@ class MingTTSModelRunner(ModelRunner):
         if batch_size == 0:
             return
 
-        embedding = self.model._decode_input_embedding
-        weight = embedding.weight
+        state_pool = get_ming_ar_device_state_pool(self.model)
+        weight = state_pool.feedback_weight
         if forward_batch.input_ids.numel() < batch_size:
             raise RuntimeError(
                 "Ming TTS decode input_ids must contain one row id per request"
             )
-        if batch_size > int(weight.shape[0]):
-            raise RuntimeError(
-                "Ming TTS decode batch exceeds staged decode-embedding rows "
-                f"({batch_size} > {int(weight.shape[0])})"
-            )
+        state_pool.validate_batch_size(batch_size)
 
         rows = []
         for sched_req in requests:
-            data = sched_req.data
-            queue = data.pending_feedback_queue
+            ar_state = get_ming_ar_state(sched_req.data)
+            queue = ar_state.pending_feedback_queue
             if not queue:
                 raise RuntimeError(
                     f"Ming TTS request {sched_req.request_id} is missing "
@@ -156,12 +169,10 @@ class MingTTSModelRunner(ModelRunner):
             rows.append(feedback.to(device=weight.device, dtype=weight.dtype))
 
         stacked = torch.stack(rows, dim=0).to(device=weight.device, dtype=weight.dtype)
-        with torch.no_grad():
-            weight[:batch_size].copy_(stacked)
+        state_pool.stage_feedback(stacked)
 
-        row_ids = torch.arange(
+        row_ids = state_pool.row_ids(
             batch_size,
-            dtype=torch.long,
             device=forward_batch.input_ids.device,
         )
         forward_batch.input_ids[:batch_size].copy_(row_ids)
@@ -204,32 +215,10 @@ class MingTTSModelRunner(ModelRunner):
             return
 
         hidden = getattr(result.logits_output, "hidden_states", None)
-        if not isinstance(hidden, torch.Tensor):
-            raise RuntimeError("Ming TTS model output did not include hidden states")
-        if hidden.ndim == 2:
-            z_diff = hidden.unsqueeze(1)
-        elif hidden.ndim == 3 and int(hidden.shape[1]) == 1:
-            z_diff = hidden
-        else:
-            raise RuntimeError(
-                "Ming TTS hidden states must have shape [batch, hidden] or "
-                f"[batch, 1, hidden], got {tuple(hidden.shape)}"
-            )
-        if int(z_diff.shape[0]) != len(requests):
-            raise RuntimeError(
-                "Ming TTS hidden batch does not match request batch: "
-                f"{int(z_diff.shape[0])} != {len(requests)}"
-            )
-        device = z_diff.device
-        next_ids = []
-
-        if device.type == "cuda":
-            dtype = self.model._decode_input_embedding.weight.dtype
-            if dtype not in (torch.float16, torch.bfloat16):
-                dtype = torch.bfloat16
-            context = torch.autocast(device_type="cuda", dtype=dtype)
-        else:
-            context = nullcontext()
+        z_diff = normalize_ming_ar_hidden_states(
+            hidden,
+            request_count=len(requests),
+        )
 
         batch_metadata = {
             "batch_size": len(requests),
@@ -242,104 +231,11 @@ class MingTTSModelRunner(ModelRunner):
                 batch_metadata,
             )
         try:
-            with context:
-                for row_idx, sched_req in enumerate(requests):
-                    data = sched_req.data
-                    step = int(data.generation_steps)
-                    history = self._ensure_latent_history(data, device=device)
-                    row_hidden = z_diff[row_idx : row_idx + 1]
-                    row_metadata = {
-                        "batch_size": len(requests),
-                        "row_idx": int(row_idx),
-                        "generation_step": int(step),
-                    }
-
-                    with ming_profile_event(
-                        sched_req.request_id,
-                        "ming_flowloss_sample",
-                        row_metadata,
-                    ):
-                        sampled, _trajectory = self.model.flowloss.sample(
-                            row_hidden,
-                            history,
-                            cfg=float(data.cfg),
-                            patch_size=int(self.model.patch_size),
-                            sigma=float(data.sigma),
-                            temperature=float(data.flow_temperature),
-                        )
-                    if not isinstance(sampled, torch.Tensor):
-                        sampled = torch.as_tensor(sampled)
-                    if sampled.ndim == 2:
-                        sampled = sampled.unsqueeze(0)
-                    expected = (
-                        1,
-                        int(self.model.patch_size),
-                        int(self.model.latent_dim),
-                    )
-                    if tuple(sampled.shape) != expected:
-                        raise RuntimeError(
-                            f"Ming TTS sampled latent must have shape {expected}, "
-                            f"got {tuple(sampled.shape)}"
-                        )
-                    data.generated_latents.append(sampled.squeeze(0).detach())
-
-                    with ming_profile_event(
-                        sched_req.request_id,
-                        "ming_stop_head",
-                        row_metadata,
-                    ):
-                        stop_prob = self.model.stop_head(row_hidden).softmax(dim=-1)[
-                            0,
-                            0,
-                            1,
-                        ]
-                        stop = bool(stop_prob.item() > 0.5 and step > 3)
-                    data.generated_last_chunk.append(stop)
-                    if stop:
-                        data.stop_step = step
-                        next_ids.append(int(data.audio_eos_token_id))
-                        continue
-
-                    if data.latent_history is None:
-                        raise RuntimeError(
-                            "Ming TTS latent_history must be initialized"
-                        )
-                    patch = int(sampled.shape[1])
-                    history_len = int(data.latent_history.shape[1])
-                    if patch >= history_len:
-                        data.latent_history.copy_(
-                            sampled[:, -history_len:, :].to(
-                                device=data.latent_history.device,
-                                dtype=data.latent_history.dtype,
-                            )
-                        )
-                    else:
-                        data.latent_history[:, :-patch, :].copy_(
-                            data.latent_history[:, patch:, :].clone()
-                        )
-                        data.latent_history[:, -patch:, :].copy_(
-                            sampled.to(
-                                device=data.latent_history.device,
-                                dtype=data.latent_history.dtype,
-                            )
-                        )
-
-                    next_ids.append(int(data.audio_patch_token_id))
-                    will_finish_by_length = step + 1 >= int(data.max_decode_steps)
-                    if not will_finish_by_length:
-                        with ming_profile_event(
-                            sched_req.request_id,
-                            "ming_feedback_proj",
-                            row_metadata,
-                        ):
-                            feedback = self.model.linear_proj_audio(sampled)
-                        data.pending_feedback_queue.append(
-                            feedback.reshape(-1).detach()
-                        )
-
-            next_token_ids = torch.tensor(next_ids, dtype=torch.long, device=device)
+            next_token_ids = self._ar_state_machine.step_batch(z_diff, requests)
             result.next_token_ids = next_token_ids
-            result.can_run_cuda_graph = False
+            # Preserve SGLang's AR forward graph-hit flag. FlowLoss and feedback
+            # staging run eager after replay, but they do not invalidate whether
+            # the already-completed decode forward used CUDA graph.
             schedule_batch.output_ids = next_token_ids
         finally:
             for sched_req in requests:
@@ -352,60 +248,11 @@ class MingTTSModelRunner(ModelRunner):
     def _ensure_latent_history(
         self, data: Any, *, device: torch.device
     ) -> torch.Tensor:
-        history = getattr(data, "latent_history", None)
-        if history is None:
-            history = torch.zeros(
-                1,
-                int(self.model.history_patch_size),
-                int(self.model.latent_dim),
-                device=device,
-                dtype=torch.float32,
-            )
-            prompt_latent = getattr(data, "prompt_latent_for_history", None)
-            if prompt_latent is not None:
-                if not isinstance(prompt_latent, torch.Tensor):
-                    prompt_latent = torch.as_tensor(prompt_latent)
-                if prompt_latent.ndim == 2:
-                    prompt_latent = prompt_latent.unsqueeze(0)
-                expected_tail = (1, int(self.model.latent_dim))
-                if (
-                    prompt_latent.ndim != 3
-                    or int(prompt_latent.shape[0]) != expected_tail[0]
-                    or int(prompt_latent.shape[2]) != expected_tail[1]
-                ):
-                    raise RuntimeError(
-                        "Ming TTS prompt latent history must have shape "
-                        f"[1, frames, {expected_tail[1]}], "
-                        f"got {tuple(prompt_latent.shape)}"
-                    )
-                prompt_latent = prompt_latent.to(device=device, dtype=torch.float32)
-                history_len = int(history.shape[1])
-                prompt_len = int(prompt_latent.shape[1])
-                if prompt_len <= 0:
-                    raise RuntimeError(
-                        "Ming TTS prompt latent history requires at least one frame"
-                    )
-                if prompt_len >= history_len:
-                    history.copy_(prompt_latent[:, -history_len:, :])
-                else:
-                    history[:, -prompt_len:, :].copy_(prompt_latent)
-            data.latent_history = history
-            return history
-
-        if not isinstance(history, torch.Tensor):
-            history = torch.as_tensor(history)
-        if history.ndim == 2:
-            history = history.unsqueeze(0)
-        expected = (
-            1,
-            int(self.model.history_patch_size),
-            int(self.model.latent_dim),
+        ar_state = get_ming_ar_state(data)
+        history = ar_state.ensure_latent_history(
+            device=device,
+            history_patch_size=int(self.model.history_patch_size),
+            latent_dim=int(self.model.latent_dim),
         )
-        if tuple(history.shape) != expected:
-            raise RuntimeError(
-                f"Ming TTS latent_history must have shape {expected}, "
-                f"got {tuple(history.shape)}"
-            )
-        history = history.to(device=device, dtype=torch.float32)
-        data.latent_history = history
+        sync_ming_ar_state_to_legacy(data, ar_state)
         return history
