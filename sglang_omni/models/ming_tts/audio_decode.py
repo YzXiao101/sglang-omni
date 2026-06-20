@@ -16,6 +16,7 @@ from sglang_omni.models.ming_tts.payload_types import (
     MingTTSState,
     decode_generated_latents,
 )
+from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -106,6 +107,7 @@ class MingAudioDecoder(torch.nn.Module):
         last_chunks: list[bool],
         *,
         decode_mode: str = "chunked",
+        request_id: str | None = None,
     ) -> torch.Tensor:
         if decode_mode != "chunked":
             raise NotImplementedError(
@@ -146,13 +148,26 @@ class MingAudioDecoder(torch.nn.Module):
         with context:
             for step, last_chunk in enumerate(last_chunks):
                 chunk = latents[step : step + 1]
-                wav, stream_state, past_key_values = self.audio_vae.decode(
-                    chunk,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    stream_state=stream_state,
-                    last_chunk=last_chunk,
+                event_context = (
+                    ming_profile_event(
+                        request_id,
+                        "ming_audio_decode_chunk",
+                        metadata={
+                            "step": int(step),
+                            "last_chunk": bool(last_chunk),
+                        },
+                    )
+                    if request_id is not None
+                    else nullcontext()
                 )
+                with event_context:
+                    wav, stream_state, past_key_values = self.audio_vae.decode(
+                        chunk,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        stream_state=stream_state,
+                        last_chunk=last_chunk,
+                    )
                 wav = self._normalize_waveform_chunk(wav)
                 if wav.numel():
                     waveform_chunks.append(wav)
@@ -215,11 +230,17 @@ def decode_ming_tts_audio_payload(
     if latents is None:
         raise RuntimeError("Ming-Omni-TTS audio decode requires generated latents")
 
-    waveform = decoder.decode_chunks(
-        latents,
-        state.generated_last_chunk,
-        decode_mode=decode_mode,
-    )
+    with ming_profile_event(
+        payload.request_id,
+        "ming_audio_decode",
+        metadata={"latent_chunks": int(latents.shape[0])},
+    ):
+        waveform = decoder.decode_chunks(
+            latents,
+            state.generated_last_chunk,
+            decode_mode=decode_mode,
+            request_id=payload.request_id,
+        )
     state.audio_decode_time_s = time.perf_counter() - started
     sample_rate = decoder.sample_rate
     if int(sample_rate) != MING_TTS_SAMPLE_RATE:

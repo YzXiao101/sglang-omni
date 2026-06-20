@@ -14,6 +14,7 @@ from sglang_omni.models.ming_tts.payload_types import (
     decode_speaker_embedding,
     encode_generated_latents,
 )
+from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.types import ARRequestData
@@ -59,6 +60,10 @@ def make_ming_tts_scheduler_adapters(
     """Build StagePayload <-> SGLang request adapters for Ming-Omni-TTS."""
 
     def request_builder(payload: StagePayload) -> MingTTSSGLangRequestData:
+        with ming_profile_event(payload.request_id, "ming_ar_request_build"):
+            return _request_builder_impl(payload)
+
+    def _request_builder_impl(payload: StagePayload) -> MingTTSSGLangRequestData:
         import torch
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
@@ -261,6 +266,11 @@ def make_ming_tts_scheduler_adapters(
         return data
 
     def result_adapter(data: MingTTSSGLangRequestData) -> StagePayload:
+        request_id = data.stage_payload.request_id
+        with ming_profile_event(request_id, "ming_response_serialize"):
+            return _result_adapter_impl(data)
+
+    def _result_adapter_impl(data: MingTTSSGLangRequestData) -> StagePayload:
         import torch
 
         payload = data.stage_payload
