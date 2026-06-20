@@ -10,6 +10,11 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.ming_tts.profile_events import (
+    emit_ming_event,
+    ming_profile_event,
+    tensor_metadata,
+)
 
 
 class MingTTSModelRunner(ModelRunner):
@@ -72,13 +77,31 @@ class MingTTSModelRunner(ModelRunner):
         positions = forward_batch.positions
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
-        logits_output = self.model(
-            input_ids=forward_batch.input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_embeds_are_projected=True,
-        )
+        metadata = {
+            "batch_size": len(requests),
+            "input_embeds": tensor_metadata(input_embeds),
+        }
+        for sched_req in requests:
+            emit_ming_event(
+                sched_req.request_id,
+                "ming_custom_prefill_start",
+                metadata,
+            )
+        try:
+            logits_output = self.model(
+                input_ids=forward_batch.input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_embeds_are_projected=True,
+            )
+        finally:
+            for sched_req in requests:
+                emit_ming_event(
+                    sched_req.request_id,
+                    "ming_custom_prefill_end",
+                    metadata,
+                )
         return GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=False,
@@ -208,77 +231,123 @@ class MingTTSModelRunner(ModelRunner):
         else:
             context = nullcontext()
 
-        with context:
-            for row_idx, sched_req in enumerate(requests):
-                data = sched_req.data
-                step = int(data.generation_steps)
-                history = self._ensure_latent_history(data, device=device)
-                row_hidden = z_diff[row_idx : row_idx + 1]
+        batch_metadata = {
+            "batch_size": len(requests),
+            "hidden": tensor_metadata(z_diff),
+        }
+        for sched_req in requests:
+            emit_ming_event(
+                sched_req.request_id,
+                "ming_tts_step_start",
+                batch_metadata,
+            )
+        try:
+            with context:
+                for row_idx, sched_req in enumerate(requests):
+                    data = sched_req.data
+                    step = int(data.generation_steps)
+                    history = self._ensure_latent_history(data, device=device)
+                    row_hidden = z_diff[row_idx : row_idx + 1]
+                    row_metadata = {
+                        "batch_size": len(requests),
+                        "row_idx": int(row_idx),
+                        "generation_step": int(step),
+                    }
 
-                sampled, _trajectory = self.model.flowloss.sample(
-                    row_hidden,
-                    history,
-                    cfg=float(data.cfg),
-                    patch_size=int(self.model.patch_size),
-                    sigma=float(data.sigma),
-                    temperature=float(data.flow_temperature),
-                )
-                if not isinstance(sampled, torch.Tensor):
-                    sampled = torch.as_tensor(sampled)
-                if sampled.ndim == 2:
-                    sampled = sampled.unsqueeze(0)
-                expected = (
-                    1,
-                    int(self.model.patch_size),
-                    int(self.model.latent_dim),
-                )
-                if tuple(sampled.shape) != expected:
-                    raise RuntimeError(
-                        f"Ming TTS sampled latent must have shape {expected}, "
-                        f"got {tuple(sampled.shape)}"
-                    )
-                data.generated_latents.append(sampled.squeeze(0).detach())
-
-                stop_prob = self.model.stop_head(row_hidden).softmax(dim=-1)[0, 0, 1]
-                stop = bool(stop_prob.item() > 0.5 and step > 3)
-                data.generated_last_chunk.append(stop)
-                if stop:
-                    data.stop_step = step
-                    next_ids.append(int(data.audio_eos_token_id))
-                    continue
-
-                if data.latent_history is None:
-                    raise RuntimeError("Ming TTS latent_history must be initialized")
-                patch = int(sampled.shape[1])
-                history_len = int(data.latent_history.shape[1])
-                if patch >= history_len:
-                    data.latent_history.copy_(
-                        sampled[:, -history_len:, :].to(
-                            device=data.latent_history.device,
-                            dtype=data.latent_history.dtype,
+                    with ming_profile_event(
+                        sched_req.request_id,
+                        "ming_flowloss_sample",
+                        row_metadata,
+                    ):
+                        sampled, _trajectory = self.model.flowloss.sample(
+                            row_hidden,
+                            history,
+                            cfg=float(data.cfg),
+                            patch_size=int(self.model.patch_size),
+                            sigma=float(data.sigma),
+                            temperature=float(data.flow_temperature),
                         )
+                    if not isinstance(sampled, torch.Tensor):
+                        sampled = torch.as_tensor(sampled)
+                    if sampled.ndim == 2:
+                        sampled = sampled.unsqueeze(0)
+                    expected = (
+                        1,
+                        int(self.model.patch_size),
+                        int(self.model.latent_dim),
                     )
-                else:
-                    data.latent_history[:, :-patch, :].copy_(
-                        data.latent_history[:, patch:, :].clone()
-                    )
-                    data.latent_history[:, -patch:, :].copy_(
-                        sampled.to(
-                            device=data.latent_history.device,
-                            dtype=data.latent_history.dtype,
+                    if tuple(sampled.shape) != expected:
+                        raise RuntimeError(
+                            f"Ming TTS sampled latent must have shape {expected}, "
+                            f"got {tuple(sampled.shape)}"
                         )
-                    )
+                    data.generated_latents.append(sampled.squeeze(0).detach())
 
-                next_ids.append(int(data.audio_patch_token_id))
-                will_finish_by_length = step + 1 >= int(data.max_decode_steps)
-                if not will_finish_by_length:
-                    feedback = self.model.linear_proj_audio(sampled)
-                    data.pending_feedback_queue.append(feedback.reshape(-1).detach())
+                    with ming_profile_event(
+                        sched_req.request_id,
+                        "ming_stop_head",
+                        row_metadata,
+                    ):
+                        stop_prob = self.model.stop_head(row_hidden).softmax(dim=-1)[
+                            0,
+                            0,
+                            1,
+                        ]
+                        stop = bool(stop_prob.item() > 0.5 and step > 3)
+                    data.generated_last_chunk.append(stop)
+                    if stop:
+                        data.stop_step = step
+                        next_ids.append(int(data.audio_eos_token_id))
+                        continue
 
-        next_token_ids = torch.tensor(next_ids, dtype=torch.long, device=device)
-        result.next_token_ids = next_token_ids
-        result.can_run_cuda_graph = False
-        schedule_batch.output_ids = next_token_ids
+                    if data.latent_history is None:
+                        raise RuntimeError(
+                            "Ming TTS latent_history must be initialized"
+                        )
+                    patch = int(sampled.shape[1])
+                    history_len = int(data.latent_history.shape[1])
+                    if patch >= history_len:
+                        data.latent_history.copy_(
+                            sampled[:, -history_len:, :].to(
+                                device=data.latent_history.device,
+                                dtype=data.latent_history.dtype,
+                            )
+                        )
+                    else:
+                        data.latent_history[:, :-patch, :].copy_(
+                            data.latent_history[:, patch:, :].clone()
+                        )
+                        data.latent_history[:, -patch:, :].copy_(
+                            sampled.to(
+                                device=data.latent_history.device,
+                                dtype=data.latent_history.dtype,
+                            )
+                        )
+
+                    next_ids.append(int(data.audio_patch_token_id))
+                    will_finish_by_length = step + 1 >= int(data.max_decode_steps)
+                    if not will_finish_by_length:
+                        with ming_profile_event(
+                            sched_req.request_id,
+                            "ming_feedback_proj",
+                            row_metadata,
+                        ):
+                            feedback = self.model.linear_proj_audio(sampled)
+                        data.pending_feedback_queue.append(
+                            feedback.reshape(-1).detach()
+                        )
+
+            next_token_ids = torch.tensor(next_ids, dtype=torch.long, device=device)
+            result.next_token_ids = next_token_ids
+            result.can_run_cuda_graph = False
+            schedule_batch.output_ids = next_token_ids
+        finally:
+            for sched_req in requests:
+                emit_ming_event(
+                    sched_req.request_id,
+                    "ming_tts_step_end",
+                    batch_metadata,
+                )
 
     def _ensure_latent_history(
         self, data: Any, *, device: torch.device
