@@ -15,6 +15,10 @@ from sglang_omni.models.ming_tts.payload_types import (
     encode_prompt_latent,
     encode_speaker_embedding,
 )
+from sglang_omni.models.ming_tts.profile_events import (
+    ming_profile_event,
+    tensor_metadata,
+)
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
@@ -136,9 +140,14 @@ class MingTTSReferenceEncoder:
                 "Ming-Omni-TTS reference audio must be a local audio path string"
             )
 
-        prompt_waveform, speaker_waveform = self._load_reference_waveform(
-            state.ref_audio
-        )
+        with ming_profile_event(
+            payload.request_id,
+            "ming_reference_audio_load",
+            metadata={"has_reference": True},
+        ):
+            prompt_waveform, speaker_waveform = self._load_reference_waveform(
+                state.ref_audio
+            )
         prompt_waveform = self._pad_waveform(prompt_waveform)
 
         try:
@@ -153,10 +162,18 @@ class MingTTSReferenceEncoder:
                 device=self.device,
             )
             prompt_waveform = self._prepare_audio_vae_waveform(prompt_waveform)
-            prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
-                prompt_waveform,
-                waveform_length,
-            )
+            with ming_profile_event(
+                payload.request_id,
+                "ming_audio_vae_encode",
+                metadata={
+                    "waveform": tensor_metadata(prompt_waveform),
+                    "sample_rate": int(self.sample_rate),
+                },
+            ):
+                prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
+                    prompt_waveform,
+                    waveform_length,
+                )
         if prompt_latent.ndim != 3 or int(prompt_latent.shape[0]) != 1:
             raise RuntimeError(
                 "Ming-Omni-TTS prompt latent must have shape [1, frames, latent_dim], "
@@ -169,7 +186,15 @@ class MingTTSReferenceEncoder:
                 f"frames={frames}, patch_size={self.patch_size}"
             )
         prompt_latent_token_count = frames // self.patch_size
-        speaker_embedding = self.speaker_encoder(speaker_waveform)
+        with ming_profile_event(
+            payload.request_id,
+            "ming_campplus",
+            metadata={
+                "waveform": tensor_metadata(speaker_waveform),
+                "sample_rate": int(self.speaker_encoder.target_sr),
+            },
+        ):
+            speaker_embedding = self.speaker_encoder(speaker_waveform)
 
         for field_name, value in encode_speaker_embedding(speaker_embedding).items():
             setattr(state, field_name, value)
