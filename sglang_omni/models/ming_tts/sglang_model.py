@@ -41,12 +41,17 @@ from sglang_omni.vendor.sglang.layers import (
     RowParallelLinear,
     SiluAndMul,
     StandardTopKOutput,
+    TopK,
     VocabParallelEmbedding,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_moe_impl_class,
     get_rope,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang_omni.vendor.sglang.models import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
 )
 from sglang_omni.vendor.sglang.server_args import get_global_server_args
 from sglang_omni.vendor.sglang.utils import add_prefix
@@ -155,10 +160,39 @@ class MingBailingMoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(self._prepare_positions(positions), q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        positions = self._prepare_positions(positions)
+        rotary_dim = int(getattr(self.rotary_emb, "rotary_dim", self.head_dim))
+        can_fuse_set_kv = (
+            not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.head_dim == rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if can_fuse_set_kv
+                else None
+            ),
+        )
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not can_fuse_set_kv,
+        )
         output, _ = self.dense(attn_output)
         return output
 
@@ -230,6 +264,9 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         self.num_experts = int(config.num_experts)
         self.num_experts_per_tok = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(getattr(config, "norm_topk_prob", True))
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0)
+        )
         self.multi_gate = bool(getattr(config, "multi_gate", False))
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -237,6 +274,11 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         if self.multi_gate:
             self.image_gate = MingBailingMoeGate(config)
             self.audio_gate = MingBailingMoeGate(config)
+        self.topk = TopK(
+            top_k=self.num_experts_per_tok,
+            renormalize=self.norm_topk_prob,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
         FusedMoE = get_moe_impl_class(quant_config)
         self.experts = FusedMoE(
@@ -247,6 +289,7 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             reduce_results=False,
+            routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -278,7 +321,11 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         return topk_ids, topk_weights, router_logits
 
-    def _route(
+    def _route_primary(self, hidden_states: torch.Tensor) -> Any:
+        router_logits = self.gate(hidden_states).float()
+        return self.topk(hidden_states, router_logits)
+
+    def _route_masked_eager(
         self,
         hidden_states: torch.Tensor,
         image_mask: Optional[torch.Tensor] = None,
@@ -309,6 +356,16 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
             topk_ids=topk_ids,
             router_logits=router_logits,
         )
+
+    def _route(
+        self,
+        hidden_states: torch.Tensor,
+        image_mask: Optional[torch.Tensor] = None,
+        audio_mask: Optional[torch.Tensor] = None,
+    ) -> Any:
+        if image_mask is None and audio_mask is None:
+            return self._route_primary(hidden_states)
+        return self._route_masked_eager(hidden_states, image_mask, audio_mask)
 
     def forward(
         self,
@@ -441,8 +498,9 @@ class MingBailingMoeTextModel(nn.Module):
             hidden_states = input_embeds
 
         residual = None
+        layers = self.layers
         for layer_id in range(self.start_layer, self.end_layer):
-            hidden_states, residual = self.layers[layer_id](
+            hidden_states, residual = layers[layer_id](
                 positions,
                 hidden_states,
                 forward_batch,
