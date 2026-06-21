@@ -776,3 +776,39 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise() -> No
     assert scheduler._prefill_start_done == set()
     assert request_data.prefill_input_embeds is None
     assert request_data.decode_input_embeds is None
+
+
+def test_omni_scheduler_follower_stream_output_bypasses_result_adapter() -> None:
+    """TP followers emit only an internal completion marker for cleanup."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.is_entry_rank = False
+    scheduler._first_emit_done = {"req-follower"}
+    scheduler._prefill_start_done = {"req-follower"}
+
+    def fail_adapter(_data):
+        raise AssertionError("follower must not serialize final payload")
+
+    scheduler._result_adapter = fail_adapter
+    request_data = SimpleNamespace(
+        prefill_input_embeds=torch.ones(1),
+        decode_input_embeds=[torch.ones(1)],
+    )
+    req = SimpleNamespace(
+        rid="req-follower",
+        _omni_data=request_data,
+        output_ids=[1, 2],
+        finished=lambda: True,
+        finished_reason=None,
+    )
+
+    scheduler.stream_output([req])
+
+    output = scheduler.outbox.get_nowait()
+    assert output.request_id == "req-follower"
+    assert output.type == "result"
+    assert output.data is None
+    assert scheduler._first_emit_done == set()
+    assert scheduler._prefill_start_done == set()
+    assert request_data.prefill_input_embeds is None
+    assert request_data.decode_input_embeds is None
