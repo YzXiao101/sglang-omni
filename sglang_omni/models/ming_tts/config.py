@@ -66,11 +66,36 @@ class MingTTSPipelineConfig(PipelineConfig):
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
         for stage in self.stages:
-            if stage.tp_size != 1:
+            if stage.name != TTS_ENGINE_STAGE:
+                if stage.tp_size != 1:
+                    raise ValueError(
+                        "Ming-Omni-TTS supports tensor parallelism only on "
+                        f"{TTS_ENGINE_STAGE!r}; stage {stage.name!r} has "
+                        f"tp_size={stage.tp_size}."
+                    )
+                continue
+
+            if stage.tp_size not in (1, 2):
                 raise ValueError(
-                    "Ming-Omni-TTS currently supports only tp_size=1; "
-                    "AR TP/EP is currently unsupported. "
-                    f"Stage {stage.name!r} has tp_size={stage.tp_size}."
+                    "Ming-Omni-TTS tts_engine currently supports only "
+                    f"tp_size=1 or tp_size=2; got tp_size={stage.tp_size}."
+                )
+            if stage.tp_size == 1:
+                continue
+            if not isinstance(stage.gpu, list):
+                raise ValueError(
+                    "Ming-Omni-TTS tts_engine tp_size=2 requires "
+                    "gpu=[rank0_gpu, rank1_gpu]."
+                )
+            if len(stage.gpu) != stage.tp_size:
+                raise ValueError(
+                    "Ming-Omni-TTS tts_engine TP GPU list length must match "
+                    f"tp_size; got gpu={stage.gpu!r}, tp_size={stage.tp_size}."
+                )
+            if len(set(stage.gpu)) != len(stage.gpu):
+                raise ValueError(
+                    "Ming-Omni-TTS tts_engine TP GPU ids must be distinct; "
+                    f"got gpu={stage.gpu!r}."
                 )
 
 

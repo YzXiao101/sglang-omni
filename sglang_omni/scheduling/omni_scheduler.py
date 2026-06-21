@@ -966,8 +966,6 @@ class OmniScheduler:
                 continue
 
             rid = req.rid
-
-            # Build result payload from the Req
             data = req._omni_data
             data.output_ids = list(req.output_ids)
             data.weight_version = self.server_args.weight_version
@@ -977,6 +975,21 @@ class OmniScheduler:
                 if finished_reason is not None
                 else None
             )
+            if not getattr(self, "is_entry_rank", True):
+                data.prefill_input_embeds = None
+                data.decode_input_embeds = None
+                self._first_emit_done.discard(rid)
+                self._prefill_start_done.discard(rid)
+                self.outbox.put(
+                    OutgoingMessage(
+                        request_id=rid,
+                        type="result",
+                        data=None,
+                    )
+                )
+                continue
+
+            # Build result payload from the Req on the external-I/O owner.
             try:
                 result = self._result_adapter(data)
             except Exception as exc:
