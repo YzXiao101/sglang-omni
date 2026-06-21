@@ -541,9 +541,11 @@ class MingTTSSGLangModel(nn.Module):
 
         max_batch_size = 1
         try:
-            max_batch_size = int(get_global_server_args().max_running_requests)
-        except Exception:
-            logger.debug("Falling back to one Ming TTS decode row")
+            server_args = get_global_server_args()
+        except (AssertionError, RuntimeError):
+            server_args = None
+        if server_args is not None:
+            max_batch_size = int(server_args.max_running_requests)
 
         weight = self.model.word_embeddings.weight
         self._decode_input_embedding = nn.Embedding(

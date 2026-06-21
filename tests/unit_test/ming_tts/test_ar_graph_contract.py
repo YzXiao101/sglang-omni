@@ -59,6 +59,9 @@ def _install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
         "sglang": types.ModuleType("sglang"),
         "sglang.srt": types.ModuleType("sglang.srt"),
         "sglang.srt.managers": types.ModuleType("sglang.srt.managers"),
+        "sglang.srt.managers.scheduler": types.ModuleType(
+            "sglang.srt.managers.scheduler"
+        ),
         "sglang.srt.managers.schedule_batch": types.ModuleType(
             "sglang.srt.managers.schedule_batch"
         ),
@@ -72,12 +75,14 @@ def _install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
     modules["sglang"].srt = modules["sglang.srt"]
     modules["sglang.srt"].managers = modules["sglang.srt.managers"]
     modules["sglang.srt"].sampling = modules["sglang.srt.sampling"]
+    modules["sglang.srt.managers"].scheduler = modules["sglang.srt.managers.scheduler"]
     modules["sglang.srt.managers"].schedule_batch = modules[
         "sglang.srt.managers.schedule_batch"
     ]
     modules["sglang.srt.sampling"].sampling_params = modules[
         "sglang.srt.sampling.sampling_params"
     ]
+    modules["sglang.srt.managers.scheduler"].GenerationBatchResult = SimpleNamespace
     modules["sglang.srt.managers.schedule_batch"].Req = FakeReq
     modules["sglang.srt.sampling.sampling_params"].SamplingParams = FakeSamplingParams
     for name, module in modules.items():
@@ -457,12 +462,22 @@ def test_ming_ar_state_machine_appends_feedback_for_non_final_step() -> None:
     request = _fake_ar_request(step=0, max_decode_steps=5)
     machine = MingARStateMachine(_fake_ar_model(torch, stop=False))
 
-    next_ids = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
 
-    assert torch.equal(next_ids.cpu(), torch.tensor([4]))
+    assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([4]))
+    assert torch.equal(step_result.generation_steps.cpu(), torch.tensor([0]))
+    assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([1]))
+    assert torch.equal(step_result.stop_flags.cpu(), torch.tensor([0]))
+    assert torch.equal(step_result.length_finish_flags.cpu(), torch.tensor([0]))
+    assert torch.allclose(
+        step_result.feedback_embeddings.cpu(),
+        torch.full((1, 4), 7.0),
+    )
+    assert len(step_result.generated_latents) == 1
     assert len(request.data.generated_latents) == 1
     assert request.data.generated_last_chunk == [False]
     assert len(request.data.pending_feedback_queue) == 1
+    assert request.data.generation_steps == 1
     assert request.data.latent_history is not None
 
 
@@ -473,11 +488,14 @@ def test_ming_ar_state_machine_does_not_append_feedback_on_length_end() -> None:
     request = _fake_ar_request(step=0, max_decode_steps=1)
     machine = MingARStateMachine(_fake_ar_model(torch, stop=False))
 
-    next_ids = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
 
-    assert torch.equal(next_ids.cpu(), torch.tensor([4]))
+    assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([4]))
+    assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([0]))
+    assert torch.equal(step_result.length_finish_flags.cpu(), torch.tensor([1]))
     assert request.data.generated_last_chunk == [False]
     assert len(request.data.pending_feedback_queue) == 0
+    assert request.data.generation_steps == 1
 
 
 def test_ming_ar_state_machine_stop_path_uses_eos_without_feedback() -> None:
@@ -487,12 +505,142 @@ def test_ming_ar_state_machine_stop_path_uses_eos_without_feedback() -> None:
     request = _fake_ar_request(step=4, max_decode_steps=8)
     machine = MingARStateMachine(_fake_ar_model(torch, stop=True))
 
-    next_ids = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
 
-    assert torch.equal(next_ids.cpu(), torch.tensor([6]))
+    assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([6]))
+    assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([0]))
+    assert torch.equal(step_result.stop_flags.cpu(), torch.tensor([1]))
     assert request.data.generated_last_chunk == [True]
     assert request.data.stop_step == 4
     assert len(request.data.pending_feedback_queue) == 0
+    assert request.data.generation_steps == 5
+
+
+def test_ming_ar_follower_applies_feedback_without_latent_collection() -> None:
+    torch = pytest.importorskip("torch")
+    from sglang_omni.models.ming_tts.ar_state_machine import (
+        MingARStepResult,
+        apply_follower_ming_ar_step_result,
+    )
+
+    request = _fake_ar_request(step=0, max_decode_steps=5)
+    feedback = torch.full((1, 4), 9.0)
+    step_result = MingARStepResult(
+        next_token_ids=torch.tensor([4]),
+        feedback_embeddings=feedback,
+        feedback_mask=torch.tensor([1]),
+        stop_flags=torch.tensor([0]),
+        length_finish_flags=torch.tensor([0]),
+        generation_steps=torch.tensor([0]),
+        request_ids=["req-1"],
+    )
+
+    apply_follower_ming_ar_step_result(step_result, [request])
+
+    assert request.data.generation_steps == 1
+    assert len(request.data.pending_feedback_queue) == 1
+    assert torch.equal(request.data.pending_feedback_queue[0], feedback[0])
+    assert request.data.generated_latents == []
+    assert request.data.generated_last_chunk == []
+
+
+def test_ming_tts_runner_broadcasts_step_result_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.ar_state_machine import MingARStepResult
+    from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
+
+    calls: list[tuple[tuple[int, ...], torch.dtype, int, object]] = []
+
+    def fake_broadcast(tensor, *, src, group):
+        calls.append((tuple(tensor.shape), tensor.dtype, int(src), group))
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+    group = SimpleNamespace(ranks=[10, 11], device_group=object())
+    runner = object.__new__(MingTTSModelRunner)
+    runner._tp_size = 2
+    runner.tp_worker = SimpleNamespace(get_tp_group=lambda: group)
+    step_result = MingARStepResult(
+        next_token_ids=torch.tensor([4]),
+        feedback_embeddings=torch.ones(1, 4),
+        feedback_mask=torch.tensor([1]),
+        stop_flags=torch.tensor([0]),
+        length_finish_flags=torch.tensor([0]),
+        generation_steps=torch.tensor([0]),
+        request_ids=["req-1"],
+    )
+
+    runner._broadcast_step_result(step_result)
+
+    assert calls == [
+        ((1,), torch.long, 10, group.device_group),
+        ((1, 4), torch.float32, 10, group.device_group),
+        ((1,), torch.long, 10, group.device_group),
+        ((1,), torch.long, 10, group.device_group),
+        ((1,), torch.long, 10, group.device_group),
+        ((1,), torch.long, 10, group.device_group),
+    ]
+
+
+def test_ming_tts_runner_rejects_sharded_hidden_for_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
+
+    runner = object.__new__(MingTTSModelRunner)
+    runner.model = _fake_ar_model(torch)
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=torch.ones(1, 1, 3))
+    )
+
+    with pytest.raises(RuntimeError, match="full hidden states"):
+        runner._run_tts_step(
+            result,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            [_fake_ar_request()],
+        )
+
+
+def test_ming_tts_runner_rejects_feedback_buffer_reallocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.ar_state import get_ming_ar_device_state_pool
+    from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
+
+    runner = object.__new__(MingTTSModelRunner)
+    runner.model = _fake_ar_model(torch)
+    pool = get_ming_ar_device_state_pool(runner.model)
+    runner._feedback_buffer_contract = runner._capture_feedback_buffer_contract(pool)
+
+    runner.model._decode_input_embedding = SimpleNamespace(
+        weight=torch.empty(1, 4, dtype=torch.float32)
+    )
+    delattr(runner.model, "_ming_ar_device_state_pool")
+    changed_pool = get_ming_ar_device_state_pool(runner.model)
+
+    with pytest.raises(RuntimeError, match="feedback buffer changed"):
+        runner._validate_feedback_buffer_contract(changed_pool)
+
+
+def test_ming_tts_runner_rejects_projected_prefill_hidden_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
+
+    runner = object.__new__(MingTTSModelRunner)
+    runner.model = _fake_ar_model(torch)
+
+    with pytest.raises(RuntimeError, match="projected prefill hidden size"):
+        runner._validate_projected_prefill_embeds(torch.ones(1, 3))
 
 
 def test_ming_ar_result_adapter_serializes_then_releases_runtime_state(
@@ -526,23 +674,37 @@ def test_ming_ar_result_adapter_serializes_then_releases_runtime_state(
 def _run_fake_ming_ar_compile_executor(
     monkeypatch: pytest.MonkeyPatch,
     *,
+    gpu_id: int | None = None,
     enable_ming_ar_cuda_graph: bool = False,
     enable_ming_ar_sglang_compile: bool | None = True,
+    enable_ming_ar_projected_prefill_radix_cache: bool = False,
+    llm_config: SimpleNamespace | None = None,
     server_args_overrides: dict[str, object] | None = None,
+    total_gpu_memory_fraction: float | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
 ) -> SimpleNamespace:
     from sglang_omni.models.ming_tts import stages
 
     build_kwargs: dict[str, object] = {}
     infrastructure_saw_graph_disabled: list[bool] = []
     graph_init_saw_graph_enabled: list[bool] = []
+    infrastructure_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(stages, "_resolve_checkpoint", lambda path: path)
+    if llm_config is None:
+        llm_config = SimpleNamespace(
+            max_position_embeddings=4096,
+            hidden_size=8,
+            head_dim=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
     monkeypatch.setattr(
         stages,
         "_load_ming_tts_config",
-        lambda path: SimpleNamespace(
-            llm_config=SimpleNamespace(max_position_embeddings=4096),
-        ),
+        lambda path: SimpleNamespace(llm_config=llm_config),
     )
     monkeypatch.setattr(
         stages,
@@ -585,7 +747,7 @@ def _run_fake_ming_ar_compile_executor(
             self.model_runner = FakeRunner(server_args)
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
-        del gpu_id, kwargs
+        infrastructure_calls.append({"gpu_id": gpu_id, **kwargs})
         infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
         return (
             FakeWorker(server_args),
@@ -640,16 +802,25 @@ def _run_fake_ming_ar_compile_executor(
 
     scheduler = stages.create_sglang_tts_engine_executor(
         "model",
+        gpu_id=gpu_id,
         server_args_overrides=server_args_overrides,
         enable_ming_ar_cuda_graph=enable_ming_ar_cuda_graph,
         enable_ming_ar_sglang_compile=enable_ming_ar_sglang_compile,
+        enable_ming_ar_projected_prefill_radix_cache=(
+            enable_ming_ar_projected_prefill_radix_cache
+        ),
         ming_ar_compile_mode="max-autotune-no-cudagraphs",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        nccl_port=nccl_port,
     )
 
     return SimpleNamespace(
         adapter_kwargs=adapter_kwargs,
         build_kwargs=build_kwargs,
         graph_init_saw_graph_enabled=graph_init_saw_graph_enabled,
+        infrastructure_calls=infrastructure_calls,
         infrastructure_saw_graph_disabled=infrastructure_saw_graph_disabled,
         scheduler=scheduler,
     )
@@ -661,6 +832,7 @@ def test_ming_ar_compile_profile_disables_radix_and_chunked_prefill(
     result = _run_fake_ming_ar_compile_executor(monkeypatch)
     build_kwargs = result.build_kwargs
 
+    assert build_kwargs["tp_size"] == 1
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["torch_compile_max_bs"] == 1
@@ -671,6 +843,158 @@ def test_ming_ar_compile_profile_disables_radix_and_chunked_prefill(
     assert result.adapter_kwargs["projected_prefill_requires_radix_disabled"] is True
     assert result.adapter_kwargs["radix_cache_disabled"] is True
     assert result.scheduler.server_args.disable_radix_cache is True
+
+
+def test_ming_tts_tp2_bootstrap_passes_tp_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_fake_ming_ar_compile_executor(
+        monkeypatch,
+        gpu_id=1,
+        enable_ming_ar_cuda_graph=True,
+        enable_ming_ar_sglang_compile=None,
+        total_gpu_memory_fraction=0.72,
+        tp_rank=1,
+        tp_size=2,
+        nccl_port=29501,
+    )
+
+    assert result.build_kwargs["tp_size"] == 2
+    assert result.infrastructure_calls == [
+        {
+            "gpu_id": 1,
+            "model_arch_override": "MingTTSSGLangModel",
+            "tp_rank": 1,
+            "nccl_port": 29501,
+            "total_gpu_memory_fraction": 0.72,
+        }
+    ]
+
+
+def test_ming_tts_tp2_requires_cuda_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="requires enable_ming_ar_cuda_graph"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_sglang_compile=None,
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_rejects_torch_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="graph-only execution"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_cuda_graph=True,
+            enable_ming_ar_sglang_compile=None,
+            server_args_overrides={"torch_compile_max_bs": 1},
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_rejects_legacy_compile_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="legacy compile aliases"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_sglang_compile=True,
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_rejects_projected_prefill_radix_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="radix cache disabled"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_cuda_graph=True,
+            enable_ming_ar_sglang_compile=None,
+            enable_ming_ar_projected_prefill_radix_cache=True,
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_requires_captured_graph_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="graph-only requires max_running_requests"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_cuda_graph=True,
+            enable_ming_ar_sglang_compile=None,
+            server_args_overrides={
+                "cuda_graph_bs": [1, 2],
+                "cuda_graph_max_bs": 2,
+                "max_running_requests": 3,
+            },
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_rejects_non_divisible_attention_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="attention heads divisible"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_cuda_graph=True,
+            enable_ming_ar_sglang_compile=None,
+            llm_config=SimpleNamespace(
+                max_position_embeddings=4096,
+                hidden_size=6,
+                head_dim=2,
+                num_attention_heads=3,
+                num_key_value_heads=2,
+            ),
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp2_requires_nccl_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="TP requires nccl_port"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            tp_size=2,
+        )
+
+
+def test_ming_tts_tp_rank_must_be_in_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="tp_rank=2 is out of range"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            tp_rank=2,
+            tp_size=2,
+            nccl_port=29501,
+        )
+
+
+def test_ming_tts_tp_size_override_must_match_stage_tp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="server_args_overrides.tp_size"):
+        _run_fake_ming_ar_compile_executor(
+            monkeypatch,
+            enable_ming_ar_cuda_graph=True,
+            enable_ming_ar_sglang_compile=None,
+            server_args_overrides={"tp_size": 1},
+            tp_size=2,
+            nccl_port=29501,
+        )
 
 
 def test_ming_ar_cuda_graph_profile_defaults_to_graph_only(

@@ -21,6 +21,61 @@ MING_AR_CUDA_GRAPH_TARGET = "MingTTSSGLangModel.forward via SGLang cuda graph"
 MING_AR_COMPILE_TARGET = MING_AR_CUDA_GRAPH_TARGET
 
 
+def _require_int_config_field(config: Any, field: str) -> int:
+    value = getattr(config, field, None)
+    if value is None:
+        raise ValueError(f"Ming-Omni-TTS llm_config is missing {field}")
+    return int(value)
+
+
+def _validate_ming_tts_tp_backbone_invariants(config: Any, tp_size: int) -> None:
+    tp_size = int(tp_size)
+    if tp_size <= 1:
+        return
+
+    llm_config = getattr(config, "llm_config", None)
+    if llm_config is None:
+        raise ValueError("Ming-Omni-TTS TP requires llm_config")
+
+    hidden_size = _require_int_config_field(llm_config, "hidden_size")
+    head_dim = _require_int_config_field(llm_config, "head_dim")
+    num_heads = _require_int_config_field(llm_config, "num_attention_heads")
+    num_kv_heads = _require_int_config_field(llm_config, "num_key_value_heads")
+    if min(hidden_size, head_dim, num_heads, num_kv_heads) <= 0:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires positive hidden/head dimensions: "
+            f"hidden_size={hidden_size}, head_dim={head_dim}, "
+            f"num_attention_heads={num_heads}, "
+            f"num_key_value_heads={num_kv_heads}"
+        )
+    if head_dim * num_heads != hidden_size:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires head_dim * num_attention_heads "
+            f"to equal hidden_size ({head_dim} * {num_heads} != {hidden_size})"
+        )
+    if hidden_size % tp_size != 0:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires hidden_size divisible by tp_size: "
+            f"hidden_size={hidden_size}, tp_size={tp_size}"
+        )
+    if num_heads % tp_size != 0:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires attention heads divisible by tp_size: "
+            f"num_attention_heads={num_heads}, tp_size={tp_size}"
+        )
+    if num_kv_heads >= tp_size and num_kv_heads % tp_size != 0:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires KV heads divisible by tp_size: "
+            f"num_key_value_heads={num_kv_heads}, tp_size={tp_size}"
+        )
+    if num_kv_heads < tp_size and tp_size % num_kv_heads != 0:
+        raise ValueError(
+            "Ming-Omni-TTS TP requires KV heads to divide or be divisible "
+            f"by tp_size: num_key_value_heads={num_kv_heads}, "
+            f"tp_size={tp_size}"
+        )
+
+
 def _coerce_bool(value: Any, *, name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -79,8 +134,20 @@ def create_sglang_tts_engine_executor(
     tp_size: int = 1,
     nccl_port: int | None = None,
 ) -> Any:
-    if int(tp_size) != 1 or int(tp_rank) != 0:
-        raise ValueError("Ming-Omni-TTS currently supports only tp_size=1")
+    tp_rank = int(tp_rank)
+    tp_size = int(tp_size)
+    if tp_size not in (1, 2):
+        raise ValueError(
+            "Ming-Omni-TTS tts_engine currently supports only tp_size=1 or "
+            f"tp_size=2; got tp_size={tp_size}"
+        )
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(
+            f"Ming-Omni-TTS tts_engine tp_rank={tp_rank} is out of range "
+            f"for tp_size={tp_size}"
+        )
+    if tp_size > 1 and nccl_port is None:
+        raise ValueError("Ming-Omni-TTS tts_engine TP requires nccl_port")
 
     from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
     from sglang_omni.models.ming_tts.sglang_request_builders import (
@@ -95,6 +162,7 @@ def create_sglang_tts_engine_executor(
 
     checkpoint_dir = _resolve_checkpoint(model_path)
     config = _load_ming_tts_config(checkpoint_dir)
+    _validate_ming_tts_tp_backbone_invariants(config, tp_size)
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
@@ -149,10 +217,31 @@ def create_sglang_tts_engine_executor(
         detail = ", ".join(f"{name}={value}" for name, value in cuda_graph_settings)
         raise ValueError(f"Conflicting Ming AR CUDA graph settings: {detail}")
     enable_ming_ar_cuda_graph = any(value for _, value in cuda_graph_settings)
+    if tp_size > 1:
+        if not enable_ming_ar_cuda_graph:
+            raise ValueError(
+                "Ming-Omni-TTS TP2 currently requires " "enable_ming_ar_cuda_graph=True"
+            )
+        if legacy_compile_alias_enabled:
+            raise ValueError(
+                "Ming-Omni-TTS TP2 currently supports graph-only execution; "
+                "use enable_ming_ar_cuda_graph=True instead of legacy "
+                "compile aliases"
+            )
+        if projected_prefill_radix_cache_enabled:
+            raise ValueError(
+                "Ming-Omni-TTS TP2 currently requires projected-prefill "
+                "radix cache disabled"
+            )
     if "ming_ar_compile_mode" in user_overrides:
         ming_ar_compile_mode = user_overrides.pop("ming_ar_compile_mode")
     if ming_ar_compile_mode is not None:
         ming_ar_compile_mode = str(ming_ar_compile_mode).strip()
+    if "tp_size" in user_overrides and int(user_overrides["tp_size"]) != tp_size:
+        raise ValueError(
+            "Ming-Omni-TTS tts_engine tp_size conflicts with "
+            f"server_args_overrides.tp_size={user_overrides['tp_size']!r}"
+        )
 
     overrides: dict[str, Any] = {
         "dtype": dtype,
@@ -165,6 +254,7 @@ def create_sglang_tts_engine_executor(
         "trust_remote_code": False,
     }
     overrides.update(user_overrides)
+    overrides["tp_size"] = tp_size
 
     context_length = int(overrides.pop("context_length", context_length or 0) or 0)
     if context_length <= 0:
@@ -264,6 +354,11 @@ def create_sglang_tts_engine_executor(
                 "use 0 only for CUDA graph-only isolation"
             )
         torch_compile_enabled = torch_compile_max_bs > 0
+        if tp_size > 1 and torch_compile_enabled:
+            raise ValueError(
+                "Ming-Omni-TTS TP2 currently supports graph-only execution; "
+                "set torch_compile_max_bs=0"
+            )
         overrides["enable_torch_compile"] = torch_compile_enabled
         if torch_compile_enabled:
             if not ming_ar_compile_mode:
@@ -276,6 +371,13 @@ def create_sglang_tts_engine_executor(
             raise ValueError(
                 "Ming AR CUDA graph is incompatible with "
                 "disable_cuda_graph_padding=True"
+            )
+        if tp_size > 1 and max_running_requests != cuda_graph_max_bs:
+            raise ValueError(
+                "Ming-Omni-TTS TP2 graph-only requires max_running_requests "
+                "to equal cuda_graph_max_bs so every runnable batch is covered "
+                f"by a captured graph bucket ({max_running_requests} != "
+                f"{cuda_graph_max_bs})"
             )
     else:
         if not bool(overrides.get("disable_cuda_graph", True)):
@@ -299,6 +401,25 @@ def create_sglang_tts_engine_executor(
     if want_cuda_graph:
         server_args.disable_cuda_graph = True
 
+    logger.info(
+        "Ming AR SGLang startup: gpu_id=%s tp_rank=%s/%s pid=%s "
+        "total_gpu_memory_fraction=%s disable_cuda_graph=%s "
+        "cuda_graph_bs=%s cuda_graph_max_bs=%s enable_torch_compile=%s "
+        "torch_compile_max_bs=%s projected_prefill_radix_cache=%s "
+        "nccl_port=%s",
+        gpu_id,
+        tp_rank,
+        tp_size,
+        os.getpid(),
+        total_gpu_memory_fraction,
+        getattr(server_args, "disable_cuda_graph", None),
+        getattr(server_args, "cuda_graph_bs", None),
+        getattr(server_args, "cuda_graph_max_bs", None),
+        getattr(server_args, "enable_torch_compile", None),
+        getattr(server_args, "torch_compile_max_bs", None),
+        projected_prefill_radix_cache_enabled,
+        nccl_port,
+    )
     (
         model_worker,
         tree_cache,
@@ -311,6 +432,7 @@ def create_sglang_tts_engine_executor(
         server_args,
         gpu_id,
         model_arch_override=MING_TTS_MODEL_ARCH_OVERRIDE,
+        tp_rank=tp_rank,
         nccl_port=nccl_port,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
@@ -337,6 +459,7 @@ def create_sglang_tts_engine_executor(
     logger.info(
         "Ming AR CUDA graph startup: enabled=%s target=%s layer_count=%s "
         "mode=%s compile_setup_time_s=%s cache_dir=%s legacy_compile_alias=%s "
+        "gpu_id=%s tp_rank=%s/%s pid=%s total_gpu_memory_fraction=%s "
         "max_running_requests=%s cuda_graph_bs=%s "
         "enable_torch_compile=%s torch_compile_max_bs=%s "
         "disable_radix_cache=%s chunked_prefill_size=%s "
@@ -348,6 +471,11 @@ def create_sglang_tts_engine_executor(
         ming_ar_cuda_graph_info["compile_setup_time_s"],
         ming_ar_cuda_graph_info["cache_dir"],
         ming_ar_cuda_graph_info["legacy_compile_alias"],
+        gpu_id,
+        tp_rank,
+        tp_size,
+        os.getpid(),
+        total_gpu_memory_fraction,
         getattr(server_args, "max_running_requests", None),
         getattr(server_args, "cuda_graph_bs", None),
         getattr(server_args, "enable_torch_compile", None),
