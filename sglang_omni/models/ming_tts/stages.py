@@ -18,7 +18,6 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 logger = logging.getLogger(__name__)
 
 MING_AR_CUDA_GRAPH_TARGET = "MingTTSSGLangModel.forward via SGLang cuda graph"
-MING_AR_COMPILE_TARGET = MING_AR_CUDA_GRAPH_TARGET
 
 
 def _require_int_config_field(config: Any, field: str) -> int:
@@ -125,10 +124,7 @@ def create_sglang_tts_engine_executor(
     context_length: int | None = None,
     server_args_overrides: dict[str, Any] | None = None,
     enable_ming_ar_cuda_graph: bool = False,
-    enable_ming_ar_backbone_compile: bool = False,
-    enable_ming_ar_sglang_compile: bool | None = None,
     enable_ming_ar_projected_prefill_radix_cache: bool = False,
-    ming_ar_compile_mode: str | None = "max-autotune-no-cudagraphs",
     total_gpu_memory_fraction: float | None = None,
     tp_rank: int = 0,
     tp_size: int = 1,
@@ -167,42 +163,21 @@ def create_sglang_tts_engine_executor(
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
+    # FIXME: Keep this mode-matrix validation explicit while Ming AR graph,
+    # radix, and TP support is still being proven. Once temporary benchmark
+    # wrappers are removed, collapse this block into a smaller config validator.
     user_overrides = dict(server_args_overrides or {})
     cuda_graph_settings: list[tuple[str, bool]] = []
-    legacy_compile_alias_enabled = False
     explicit_cuda_graph_arg = _coerce_bool(
         enable_ming_ar_cuda_graph,
         name="enable_ming_ar_cuda_graph",
     )
     if explicit_cuda_graph_arg:
         cuda_graph_settings.append(("enable_ming_ar_cuda_graph", True))
-    legacy_compile_arg = _coerce_bool(
-        enable_ming_ar_backbone_compile,
-        name="enable_ming_ar_backbone_compile",
-    )
-    if legacy_compile_arg:
-        legacy_compile_alias_enabled = True
-        cuda_graph_settings.append(("enable_ming_ar_backbone_compile", True))
-    if enable_ming_ar_sglang_compile is not None:
-        sglang_compile_arg = _coerce_bool(
-            enable_ming_ar_sglang_compile,
-            name="enable_ming_ar_sglang_compile",
-        )
-        if sglang_compile_arg:
-            legacy_compile_alias_enabled = True
-            cuda_graph_settings.append(("enable_ming_ar_sglang_compile", True))
-    for key in (
-        "enable_ming_ar_cuda_graph",
-        "enable_ming_ar_backbone_compile",
-        "enable_ming_ar_sglang_compile",
-    ):
+    for key in ("enable_ming_ar_cuda_graph",):
         if key in user_overrides:
             value = _coerce_bool(user_overrides.pop(key), name=key)
-            if key == "enable_ming_ar_cuda_graph":
-                cuda_graph_settings.append((f"server_args_overrides.{key}", value))
-            elif value:
-                legacy_compile_alias_enabled = True
-                cuda_graph_settings.append((f"server_args_overrides.{key}", True))
+            cuda_graph_settings.append((f"server_args_overrides.{key}", value))
     projected_prefill_radix_cache_enabled = _coerce_bool(
         enable_ming_ar_projected_prefill_radix_cache,
         name="enable_ming_ar_projected_prefill_radix_cache",
@@ -222,21 +197,11 @@ def create_sglang_tts_engine_executor(
             raise ValueError(
                 "Ming-Omni-TTS TP2 currently requires " "enable_ming_ar_cuda_graph=True"
             )
-        if legacy_compile_alias_enabled:
-            raise ValueError(
-                "Ming-Omni-TTS TP2 currently supports graph-only execution; "
-                "use enable_ming_ar_cuda_graph=True instead of legacy "
-                "compile aliases"
-            )
         if projected_prefill_radix_cache_enabled:
             raise ValueError(
                 "Ming-Omni-TTS TP2 currently requires projected-prefill "
                 "radix cache disabled"
             )
-    if "ming_ar_compile_mode" in user_overrides:
-        ming_ar_compile_mode = user_overrides.pop("ming_ar_compile_mode")
-    if ming_ar_compile_mode is not None:
-        ming_ar_compile_mode = str(ming_ar_compile_mode).strip()
     if "tp_size" in user_overrides and int(user_overrides["tp_size"]) != tp_size:
         raise ValueError(
             "Ming-Omni-TTS tts_engine tp_size conflicts with "
@@ -346,27 +311,19 @@ def create_sglang_tts_engine_executor(
                 "request slot"
             )
         if "torch_compile_max_bs" not in user_overrides:
-            overrides["torch_compile_max_bs"] = 1 if legacy_compile_alias_enabled else 0
+            overrides["torch_compile_max_bs"] = 0
         torch_compile_max_bs = int(overrides.get("torch_compile_max_bs") or 0)
         if torch_compile_max_bs < 0:
             raise ValueError(
                 "Ming AR CUDA graph requires torch_compile_max_bs >= 0; "
-                "use 0 only for CUDA graph-only isolation"
+                "only 0 is currently supported"
             )
-        torch_compile_enabled = torch_compile_max_bs > 0
-        if tp_size > 1 and torch_compile_enabled:
+        if torch_compile_max_bs != 0:
             raise ValueError(
-                "Ming-Omni-TTS TP2 currently supports graph-only execution; "
+                "Ming-Omni-TTS torch.compile is not currently supported; "
                 "set torch_compile_max_bs=0"
             )
-        overrides["enable_torch_compile"] = torch_compile_enabled
-        if torch_compile_enabled:
-            if not ming_ar_compile_mode:
-                raise ValueError(
-                    "ming_ar_compile_mode must be non-empty when "
-                    "Ming AR torch.compile is enabled"
-                )
-            os.environ["SGLANG_TORCH_COMPILE_MODE"] = ming_ar_compile_mode
+        overrides["enable_torch_compile"] = False
         if bool(overrides.get("disable_cuda_graph_padding", False)):
             raise ValueError(
                 "Ming AR CUDA graph is incompatible with "
@@ -386,10 +343,11 @@ def create_sglang_tts_engine_executor(
                 "Ming AR CUDA graph is enabled"
             )
         if bool(overrides.get("enable_torch_compile", False)):
+            raise ValueError("Ming-Omni-TTS torch.compile is not currently supported")
+        if int(overrides.get("torch_compile_max_bs") or 0) != 0:
             raise ValueError(
-                "Use enable_ming_ar_cuda_graph=True with torch_compile_max_bs > 0 "
-                "instead of setting enable_torch_compile directly for "
-                "Ming-Omni-TTS"
+                "Ming-Omni-TTS torch_compile_max_bs must be 0 because "
+                "torch.compile is not currently supported"
             )
 
     server_args = build_sglang_server_args(
@@ -399,6 +357,8 @@ def create_sglang_tts_engine_executor(
     )
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
     if want_cuda_graph:
+        # Bootstrap SGLang allocators with graph capture disabled, then capture
+        # explicitly after Ming's fixed feedback buffers and server args are ready.
         server_args.disable_cuda_graph = True
 
     logger.info(
@@ -448,17 +408,12 @@ def create_sglang_tts_engine_executor(
         "enabled": bool(enable_ming_ar_cuda_graph),
         "target": MING_AR_CUDA_GRAPH_TARGET,
         "layer_count": len(ming_ar_layers) if ming_ar_layers is not None else None,
-        "compile_mode": ming_ar_compile_mode,
-        "compile_setup_time_s": 0.0,
-        "cache_dir": os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
-        "legacy_compile_alias": bool(legacy_compile_alias_enabled),
         "projected_prefill_radix_cache_enabled": bool(
             projected_prefill_radix_cache_enabled
         ),
     }
     logger.info(
         "Ming AR CUDA graph startup: enabled=%s target=%s layer_count=%s "
-        "mode=%s compile_setup_time_s=%s cache_dir=%s legacy_compile_alias=%s "
         "gpu_id=%s tp_rank=%s/%s pid=%s total_gpu_memory_fraction=%s "
         "max_running_requests=%s cuda_graph_bs=%s "
         "enable_torch_compile=%s torch_compile_max_bs=%s "
@@ -467,10 +422,6 @@ def create_sglang_tts_engine_executor(
         ming_ar_cuda_graph_info["enabled"],
         ming_ar_cuda_graph_info["target"],
         ming_ar_cuda_graph_info["layer_count"],
-        ming_ar_cuda_graph_info["compile_mode"],
-        ming_ar_cuda_graph_info["compile_setup_time_s"],
-        ming_ar_cuda_graph_info["cache_dir"],
-        ming_ar_cuda_graph_info["legacy_compile_alias"],
         gpu_id,
         tp_rank,
         tp_size,
