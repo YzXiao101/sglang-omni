@@ -810,6 +810,12 @@ class OmniScheduler:
             )
         )
 
+    def _release_finished_request_tensors(self, data: Any) -> None:
+        if hasattr(data, "prefill_input_embeds"):
+            data.prefill_input_embeds = None
+        if hasattr(data, "decode_input_embeds"):
+            data.decode_input_embeds = None
+
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
             return self._run_batch(batch, pp_proxy_tensors)
@@ -976,17 +982,11 @@ class OmniScheduler:
                 else None
             )
             if not getattr(self, "is_entry_rank", True):
-                data.prefill_input_embeds = None
-                data.decode_input_embeds = None
+                # TP followers mirror scheduler state but do not own external
+                # stage results. They only release rank-local request tensors.
+                self._release_finished_request_tensors(data)
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
-                self.outbox.put(
-                    OutgoingMessage(
-                        request_id=rid,
-                        type="result",
-                        data=None,
-                    )
-                )
                 continue
 
             # Build result payload from the Req on the external-I/O owner.
@@ -1001,8 +1001,7 @@ class OmniScheduler:
                 self._emit_request_error(rid, exc)
                 continue
             finally:
-                data.prefill_input_embeds = None
-                data.decode_input_embeds = None
+                self._release_finished_request_tensors(data)
 
             self._first_emit_done.discard(rid)
             self._prefill_start_done.discard(rid)
