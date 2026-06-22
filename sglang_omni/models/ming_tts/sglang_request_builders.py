@@ -3,16 +3,14 @@
 
 from __future__ import annotations
 
-import collections
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang_omni.models.ming_tts.ar_state import (
+from sglang_omni.models.ming_tts.ar_runtime import (
     MingARRequestState,
     get_ming_ar_state,
     release_ming_ar_runtime_tensors,
-    sync_ming_ar_state_to_legacy,
 )
 from sglang_omni.models.ming_tts.payload_types import (
     MingTTSState,
@@ -37,33 +35,15 @@ class MingTTSSGLangRequestData(ARRequestData):
     enforce_request_limits: bool = True
     req: Any = None
     synced: bool = False
-    generation_steps: int = 0
     suppress_tokens: list[int] | None = None
-    input_embeds_are_projected: bool = False
     prefill_input_embeds: Any = None
     row_prefill_radix_cache_enabled: bool = False
     row_prefill_extra_key: str | None = None
     row_prefill_input_ids: Any = None
-    decode_input_embeds: list[Any] = field(default_factory=list)
     stage_payload: Any = None
-    pending_feedback_queue: Any = field(default_factory=collections.deque)
     ar_state: MingARRequestState | None = None
     state: MingTTSState = field(default_factory=MingTTSState)
     prompt_input_ids: Any = None
-    max_decode_steps: int = 0
-    cfg: float = 2.0
-    sigma: float = 0.25
-    flow_temperature: float = 0.0
-    seed: int | None = None
-    audio_patch_token_id: int = 0
-    audio_eos_token_id: int = 0
-    audio_token_id: int = 0
-    latent_history: Any = None
-    prompt_latent_for_history: Any = None
-    generated_latents: list[Any] = field(default_factory=list)
-    generated_last_chunk: list[bool] = field(default_factory=list)
-    stop_step: int | None = None
-    engine_start_s: float = field(default_factory=time.perf_counter)
 
 
 def _build_prefill_input_embeds(
@@ -78,6 +58,8 @@ def _build_prefill_input_embeds(
 ) -> tuple[Any, Any]:
     import torch
 
+    # Ming projected prefill is model-weight dependent: speaker embeddings and
+    # prompt latents must be projected before SGLang sees the prefill rows.
     embedding = model.get_input_embeddings()
     input_ids_for_embedding = torch.tensor(
         input_ids_list,
@@ -309,6 +291,8 @@ def make_ming_tts_scheduler_adapters(
             )
 
         req_input_ids_list = row_prefill_input_ids_list or input_ids_list
+        # Default to a request-local radix namespace; only row-prefill synthetic
+        # ids opt into cross-request sharing.
         req_extra_key = row_prefill_extra_key or f"ming_tts:{payload.request_id}"
 
         req = Req(
@@ -321,7 +305,7 @@ def make_ming_tts_scheduler_adapters(
             extra_key=req_extra_key,
         )
         req.tokenizer = None
-        req._input_embeds_are_projected = True
+        req._input_embeds_are_projected = prefill_input_embeds is not None
         req._codec_suppress_tokens = None
 
         input_ids = torch.tensor(req_input_ids_list, dtype=torch.long)
@@ -337,7 +321,6 @@ def make_ming_tts_scheduler_adapters(
             cfg=float(state.cfg),
             sigma=float(state.sigma),
             flow_temperature=float(state.temperature),
-            seed=state.seed,
             audio_patch_token_id=int(tokenizer.special.audio_patch),
             audio_eos_token_id=int(tokenizer.special.end_of_audio),
             audio_token_id=int(tokenizer.special.audio_start),
@@ -348,28 +331,16 @@ def make_ming_tts_scheduler_adapters(
             input_ids=input_ids,
             prompt_input_ids=prompt_input_ids,
             max_new_tokens=int(state.max_decode_steps),
-            max_decode_steps=int(state.max_decode_steps),
             temperature=0.0,
             output_ids=req.output_ids,
             req=req,
             state=state,
-            cfg=float(state.cfg),
-            sigma=float(state.sigma),
-            flow_temperature=float(state.temperature),
-            seed=state.seed,
-            audio_patch_token_id=int(tokenizer.special.audio_patch),
-            audio_eos_token_id=int(tokenizer.special.end_of_audio),
-            audio_token_id=int(tokenizer.special.audio_start),
             prefill_input_embeds=prefill_input_embeds,
             row_prefill_radix_cache_enabled=bool(projected_prefill_radix_cache_enabled),
             row_prefill_extra_key=row_prefill_extra_key,
             row_prefill_input_ids=row_prefill_input_ids,
-            prompt_latent_for_history=prompt_latent_for_history,
             ar_state=ar_state,
-            engine_start_s=ar_state.engine_start_s,
         )
-        sync_ming_ar_state_to_legacy(data, ar_state)
-        data.input_embeds_are_projected = True
         data.stage_payload = payload
         return data
 

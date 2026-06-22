@@ -16,7 +16,12 @@ AUDIO_DECODE_STAGE = "audio_decode"
 
 
 class MingTTSPipelineConfig(PipelineConfig):
-    """Ming-Omni-TTS pipeline: preprocessing -> TTS engine -> audio decode."""
+    """Ming-Omni-TTS pipeline.
+
+    preprocessing -> reference_encode -> tts_engine -> audio_decode.
+    The reference stage is kept as a fixed cheap/no-op boundary for text-only
+    requests so reference-conditioned requests use the same serving graph.
+    """
 
     architecture: ClassVar[str] = "BailingMMNativeForConditionalGeneration"
 

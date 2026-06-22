@@ -258,12 +258,33 @@ def test_projected_reference_prefill_allowed_when_radix_cache_disabled(
 
     assert data.prefill_input_embeds is not None
     assert data.req._input_embeds_are_projected is True
-    assert data.input_embeds_are_projected is True
     assert data.ar_state is not None
-    assert data.pending_feedback_queue is data.ar_state.pending_feedback_queue
-    assert data.generated_latents is data.ar_state.generated_latents
-    assert data.generated_last_chunk is data.ar_state.generated_last_chunk
-    assert data.max_decode_steps == data.ar_state.max_decode_steps
+    assert not hasattr(data, "input_embeds_are_projected")
+    assert not hasattr(data, "pending_feedback_queue")
+    assert not hasattr(data, "generated_latents")
+    assert not hasattr(data, "generated_last_chunk")
+    assert int(data.state.max_decode_steps) == int(data.ar_state.max_decode_steps)
+
+
+def test_text_only_prefill_is_not_marked_projected_without_row_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.sglang_request_builders import (
+        make_ming_tts_scheduler_adapters,
+    )
+
+    request_builder, _ = make_ming_tts_scheduler_adapters(
+        model=_fake_ming_tts_model(),
+        tokenizer=_fake_tokenizer_bundle(),
+        projected_prefill_requires_radix_disabled=True,
+        radix_cache_disabled=True,
+    )
+
+    data = request_builder(_text_only_payload())
+
+    assert data.prefill_input_embeds is None
+    assert data.req._input_embeds_are_projected is False
 
 
 def test_row_prefill_radix_cache_uses_content_ids_for_text_only(
@@ -289,6 +310,8 @@ def test_row_prefill_radix_cache_uses_content_ids_for_text_only(
 
     assert first.prefill_input_embeds is not None
     assert second.prefill_input_embeds is not None
+    assert first.req._input_embeds_are_projected is True
+    assert second.req._input_embeds_are_projected is True
     assert first.row_prefill_radix_cache_enabled is True
     assert first.req.origin_input_ids == second.req.origin_input_ids
     assert first.req.origin_input_ids != [0, 5, 6]
@@ -334,19 +357,28 @@ def test_row_prefill_radix_cache_hashes_projected_speaker_rows(
     assert first.req.extra_key == second.req.extra_key
 
 
-def test_ming_ar_device_state_pool_stages_feedback_in_place() -> None:
+def test_ming_ar_feedback_state_pool_stages_active_rows_in_place() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state import MingARDeviceStatePool
+    from sglang_omni.models.ming_tts.ar_runtime import MingARFeedbackStatePool
 
     embedding = torch.nn.Embedding(3, 2)
-    pool = MingARDeviceStatePool(embedding)
+    with torch.no_grad():
+        embedding.weight.copy_(
+            torch.tensor(
+                [[-1.0, -2.0], [-3.0, -4.0], [-5.0, -6.0]],
+                dtype=torch.float32,
+            )
+        )
+    pool = MingARFeedbackStatePool(embedding)
     rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    padding_row_before = embedding.weight[2].detach().clone()
 
     before_ptr = embedding.weight.data_ptr()
     pool.stage_feedback(rows)
 
     assert embedding.weight.data_ptr() == before_ptr
     assert torch.allclose(embedding.weight[:2], rows)
+    assert torch.equal(embedding.weight[2], padding_row_before)
     assert torch.equal(pool.row_ids(2), torch.tensor([0, 1]))
     with pytest.raises(RuntimeError, match="decode batch exceeds"):
         pool.validate_batch_size(4)
@@ -356,7 +388,7 @@ def test_ming_ar_device_state_pool_stages_feedback_in_place() -> None:
 
 def test_ming_ar_latent_history_update_matches_shift_contract() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state import update_ming_ar_latent_history_
+    from sglang_omni.models.ming_tts.ar_runtime import update_ming_ar_latent_history_
 
     history = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
     sampled = torch.tensor(
@@ -435,10 +467,7 @@ def _fake_ar_model(torch_module, *, stop: bool = False):
 
 
 def _fake_ar_request(*, step: int = 0, max_decode_steps: int = 5):
-    from sglang_omni.models.ming_tts.ar_state import (
-        MingARRequestState,
-        sync_ming_ar_state_to_legacy,
-    )
+    from sglang_omni.models.ming_tts.ar_runtime import MingARRequestState
 
     ar_state = MingARRequestState(
         generation_steps=step,
@@ -451,74 +480,71 @@ def _fake_ar_request(*, step: int = 0, max_decode_steps: int = 5):
         audio_token_id=5,
     )
     data = SimpleNamespace(ar_state=ar_state, generation_steps=step)
-    sync_ming_ar_state_to_legacy(data, ar_state)
     return SimpleNamespace(request_id="req-1", data=data)
 
 
-def test_ming_ar_state_machine_appends_feedback_for_non_final_step() -> None:
+def test_ming_ar_tail_appends_feedback_for_non_final_step() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state_machine import MingARStateMachine
+    from sglang_omni.models.ming_tts.model_runner import MingARTailExecutor
 
     request = _fake_ar_request(step=0, max_decode_steps=5)
-    machine = MingARStateMachine(_fake_ar_model(torch, stop=False))
+    ar_tail = MingARTailExecutor(_fake_ar_model(torch, stop=False))
 
-    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = ar_tail.step_batch(torch.ones(1, 1, 4), [request])
 
     assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([4]))
     assert torch.equal(step_result.generation_steps.cpu(), torch.tensor([0]))
     assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([1]))
     assert torch.equal(step_result.stop_flags.cpu(), torch.tensor([0]))
-    assert torch.equal(step_result.length_finish_flags.cpu(), torch.tensor([0]))
     assert torch.allclose(
         step_result.feedback_embeddings.cpu(),
         torch.full((1, 4), 7.0),
     )
     assert len(step_result.generated_latents) == 1
-    assert len(request.data.generated_latents) == 1
-    assert request.data.generated_last_chunk == [False]
-    assert len(request.data.pending_feedback_queue) == 1
-    assert request.data.generation_steps == 1
-    assert request.data.latent_history is not None
+    assert len(request.data.ar_state.generated_latents) == 1
+    assert request.data.ar_state.generated_last_chunk == [False]
+    assert len(request.data.ar_state.pending_feedback_queue) == 1
+    assert request.data.ar_state.generation_steps == 1
+    assert request.data.ar_state.latent_history is not None
 
 
-def test_ming_ar_state_machine_does_not_append_feedback_on_length_end() -> None:
+def test_ming_ar_tail_does_not_append_feedback_on_length_end() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state_machine import MingARStateMachine
+    from sglang_omni.models.ming_tts.model_runner import MingARTailExecutor
 
     request = _fake_ar_request(step=0, max_decode_steps=1)
-    machine = MingARStateMachine(_fake_ar_model(torch, stop=False))
+    ar_tail = MingARTailExecutor(_fake_ar_model(torch, stop=False))
 
-    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = ar_tail.step_batch(torch.ones(1, 1, 4), [request])
 
     assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([4]))
     assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([0]))
-    assert torch.equal(step_result.length_finish_flags.cpu(), torch.tensor([1]))
-    assert request.data.generated_last_chunk == [False]
-    assert len(request.data.pending_feedback_queue) == 0
-    assert request.data.generation_steps == 1
+    assert request.data.ar_state.generated_last_chunk == [False]
+    assert len(request.data.ar_state.pending_feedback_queue) == 0
+    assert request.data.ar_state.generation_steps == 1
 
 
-def test_ming_ar_state_machine_stop_path_uses_eos_without_feedback() -> None:
+def test_ming_ar_tail_stop_path_uses_eos_without_feedback() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state_machine import MingARStateMachine
+    from sglang_omni.models.ming_tts.model_runner import MingARTailExecutor
 
     request = _fake_ar_request(step=4, max_decode_steps=8)
-    machine = MingARStateMachine(_fake_ar_model(torch, stop=True))
+    ar_tail = MingARTailExecutor(_fake_ar_model(torch, stop=True))
 
-    step_result = machine.step_batch(torch.ones(1, 1, 4), [request])
+    step_result = ar_tail.step_batch(torch.ones(1, 1, 4), [request])
 
     assert torch.equal(step_result.next_token_ids.cpu(), torch.tensor([6]))
     assert torch.equal(step_result.feedback_mask.cpu(), torch.tensor([0]))
     assert torch.equal(step_result.stop_flags.cpu(), torch.tensor([1]))
-    assert request.data.generated_last_chunk == [True]
-    assert request.data.stop_step == 4
-    assert len(request.data.pending_feedback_queue) == 0
-    assert request.data.generation_steps == 5
+    assert request.data.ar_state.generated_last_chunk == [True]
+    assert request.data.ar_state.stop_step == 4
+    assert len(request.data.ar_state.pending_feedback_queue) == 0
+    assert request.data.ar_state.generation_steps == 5
 
 
 def test_ming_ar_follower_applies_feedback_without_latent_collection() -> None:
     torch = pytest.importorskip("torch")
-    from sglang_omni.models.ming_tts.ar_state_machine import (
+    from sglang_omni.models.ming_tts.model_runner import (
         MingARStepResult,
         apply_follower_ming_ar_step_result,
     )
@@ -530,18 +556,17 @@ def test_ming_ar_follower_applies_feedback_without_latent_collection() -> None:
         feedback_embeddings=feedback,
         feedback_mask=torch.tensor([1]),
         stop_flags=torch.tensor([0]),
-        length_finish_flags=torch.tensor([0]),
         generation_steps=torch.tensor([0]),
         request_ids=["req-1"],
     )
 
     apply_follower_ming_ar_step_result(step_result, [request])
 
-    assert request.data.generation_steps == 1
-    assert len(request.data.pending_feedback_queue) == 1
-    assert torch.equal(request.data.pending_feedback_queue[0], feedback[0])
-    assert request.data.generated_latents == []
-    assert request.data.generated_last_chunk == []
+    assert request.data.ar_state.generation_steps == 1
+    assert len(request.data.ar_state.pending_feedback_queue) == 1
+    assert torch.equal(request.data.ar_state.pending_feedback_queue[0], feedback[0])
+    assert request.data.ar_state.generated_latents == []
+    assert request.data.ar_state.generated_last_chunk == []
 
 
 def test_ming_tts_runner_broadcasts_step_result_tensors(
@@ -549,8 +574,10 @@ def test_ming_tts_runner_broadcasts_step_result_tensors(
 ) -> None:
     torch = pytest.importorskip("torch")
     _install_fake_sglang(monkeypatch)
-    from sglang_omni.models.ming_tts.ar_state_machine import MingARStepResult
-    from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
+    from sglang_omni.models.ming_tts.model_runner import (
+        MingARStepResult,
+        MingTTSModelRunner,
+    )
 
     calls: list[tuple[tuple[int, ...], torch.dtype, int, object]] = []
 
@@ -567,7 +594,6 @@ def test_ming_tts_runner_broadcasts_step_result_tensors(
         feedback_embeddings=torch.ones(1, 4),
         feedback_mask=torch.tensor([1]),
         stop_flags=torch.tensor([0]),
-        length_finish_flags=torch.tensor([0]),
         generation_steps=torch.tensor([0]),
         request_ids=["req-1"],
     )
@@ -577,7 +603,6 @@ def test_ming_tts_runner_broadcasts_step_result_tensors(
     assert calls == [
         ((1,), torch.long, 10, group.device_group),
         ((1, 4), torch.float32, 10, group.device_group),
-        ((1,), torch.long, 10, group.device_group),
         ((1,), torch.long, 10, group.device_group),
         ((1,), torch.long, 10, group.device_group),
         ((1,), torch.long, 10, group.device_group),
@@ -611,19 +636,19 @@ def test_ming_tts_runner_rejects_feedback_buffer_reallocation(
 ) -> None:
     torch = pytest.importorskip("torch")
     _install_fake_sglang(monkeypatch)
-    from sglang_omni.models.ming_tts.ar_state import get_ming_ar_device_state_pool
+    from sglang_omni.models.ming_tts.ar_runtime import get_ming_ar_feedback_state_pool
     from sglang_omni.models.ming_tts.model_runner import MingTTSModelRunner
 
     runner = object.__new__(MingTTSModelRunner)
     runner.model = _fake_ar_model(torch)
-    pool = get_ming_ar_device_state_pool(runner.model)
+    pool = get_ming_ar_feedback_state_pool(runner.model)
     runner._feedback_buffer_contract = runner._capture_feedback_buffer_contract(pool)
 
     runner.model._decode_input_embedding = SimpleNamespace(
         weight=torch.empty(1, 4, dtype=torch.float32)
     )
-    delattr(runner.model, "_ming_ar_device_state_pool")
-    changed_pool = get_ming_ar_device_state_pool(runner.model)
+    delattr(runner.model, "_ming_ar_feedback_state_pool")
+    changed_pool = get_ming_ar_feedback_state_pool(runner.model)
 
     with pytest.raises(RuntimeError, match="feedback buffer changed"):
         runner._validate_feedback_buffer_contract(changed_pool)
@@ -666,17 +691,16 @@ def test_ming_ar_result_adapter_serializes_then_releases_runtime_state(
     result = result_adapter(data)
 
     assert result.data["generated_latents_shape"] == [1, 2, 3]
-    assert data.generated_latents == []
-    assert data.latent_history is None
-    assert len(data.pending_feedback_queue) == 0
+    assert data.ar_state.generated_latents == []
+    assert data.ar_state.latent_history is None
+    assert len(data.ar_state.pending_feedback_queue) == 0
 
 
-def _run_fake_ming_ar_compile_executor(
+def _run_fake_ming_ar_graph_executor(
     monkeypatch: pytest.MonkeyPatch,
     *,
     gpu_id: int | None = None,
     enable_ming_ar_cuda_graph: bool = False,
-    enable_ming_ar_sglang_compile: bool | None = True,
     enable_ming_ar_projected_prefill_radix_cache: bool = False,
     llm_config: SimpleNamespace | None = None,
     server_args_overrides: dict[str, object] | None = None,
@@ -805,11 +829,9 @@ def _run_fake_ming_ar_compile_executor(
         gpu_id=gpu_id,
         server_args_overrides=server_args_overrides,
         enable_ming_ar_cuda_graph=enable_ming_ar_cuda_graph,
-        enable_ming_ar_sglang_compile=enable_ming_ar_sglang_compile,
         enable_ming_ar_projected_prefill_radix_cache=(
             enable_ming_ar_projected_prefill_radix_cache
         ),
-        ming_ar_compile_mode="max-autotune-no-cudagraphs",
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         tp_rank=tp_rank,
         tp_size=tp_size,
@@ -826,16 +848,19 @@ def _run_fake_ming_ar_compile_executor(
     )
 
 
-def test_ming_ar_compile_profile_disables_radix_and_chunked_prefill(
+def test_ming_ar_cuda_graph_disables_radix_and_chunked_prefill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(monkeypatch)
+    result = _run_fake_ming_ar_graph_executor(
+        monkeypatch,
+        enable_ming_ar_cuda_graph=True,
+    )
     build_kwargs = result.build_kwargs
 
     assert build_kwargs["tp_size"] == 1
     assert build_kwargs["disable_cuda_graph"] is False
-    assert build_kwargs["enable_torch_compile"] is True
-    assert build_kwargs["torch_compile_max_bs"] == 1
+    assert build_kwargs["enable_torch_compile"] is False
+    assert build_kwargs["torch_compile_max_bs"] == 0
     assert build_kwargs["disable_radix_cache"] is True
     assert build_kwargs["chunked_prefill_size"] == 0
     assert result.infrastructure_saw_graph_disabled == [True]
@@ -848,11 +873,10 @@ def test_ming_ar_compile_profile_disables_radix_and_chunked_prefill(
 def test_ming_tts_tp2_bootstrap_passes_tp_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(
+    result = _run_fake_ming_ar_graph_executor(
         monkeypatch,
         gpu_id=1,
         enable_ming_ar_cuda_graph=True,
-        enable_ming_ar_sglang_compile=None,
         total_gpu_memory_fraction=0.72,
         tp_rank=1,
         tp_size=2,
@@ -875,9 +899,8 @@ def test_ming_tts_tp2_requires_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="requires enable_ming_ar_cuda_graph"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
-            enable_ming_ar_sglang_compile=None,
             tp_size=2,
             nccl_port=29501,
         )
@@ -886,24 +909,11 @@ def test_ming_tts_tp2_requires_cuda_graph(
 def test_ming_tts_tp2_rejects_torch_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValueError, match="graph-only execution"):
-        _run_fake_ming_ar_compile_executor(
+    with pytest.raises(ValueError, match="torch.compile is not currently supported"):
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             server_args_overrides={"torch_compile_max_bs": 1},
-            tp_size=2,
-            nccl_port=29501,
-        )
-
-
-def test_ming_tts_tp2_rejects_legacy_compile_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with pytest.raises(ValueError, match="legacy compile aliases"):
-        _run_fake_ming_ar_compile_executor(
-            monkeypatch,
-            enable_ming_ar_sglang_compile=True,
             tp_size=2,
             nccl_port=29501,
         )
@@ -913,10 +923,9 @@ def test_ming_tts_tp2_rejects_projected_prefill_radix_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="radix cache disabled"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             enable_ming_ar_projected_prefill_radix_cache=True,
             tp_size=2,
             nccl_port=29501,
@@ -927,10 +936,9 @@ def test_ming_tts_tp2_requires_captured_graph_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="graph-only requires max_running_requests"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             server_args_overrides={
                 "cuda_graph_bs": [1, 2],
                 "cuda_graph_max_bs": 2,
@@ -945,10 +953,9 @@ def test_ming_tts_tp2_rejects_non_divisible_attention_heads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="attention heads divisible"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             llm_config=SimpleNamespace(
                 max_position_embeddings=4096,
                 hidden_size=6,
@@ -965,7 +972,7 @@ def test_ming_tts_tp2_requires_nccl_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="TP requires nccl_port"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             tp_size=2,
         )
@@ -975,7 +982,7 @@ def test_ming_tts_tp_rank_must_be_in_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="tp_rank=2 is out of range"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             tp_rank=2,
             tp_size=2,
@@ -987,10 +994,9 @@ def test_ming_tts_tp_size_override_must_match_stage_tp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="server_args_overrides.tp_size"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             server_args_overrides={"tp_size": 1},
             tp_size=2,
             nccl_port=29501,
@@ -1000,10 +1006,9 @@ def test_ming_tts_tp_size_override_must_match_stage_tp(
 def test_ming_ar_cuda_graph_profile_defaults_to_graph_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(
+    result = _run_fake_ming_ar_graph_executor(
         monkeypatch,
         enable_ming_ar_cuda_graph=True,
-        enable_ming_ar_sglang_compile=None,
     )
     build_kwargs = result.build_kwargs
 
@@ -1018,30 +1023,12 @@ def test_ming_ar_cuda_graph_profile_defaults_to_graph_only(
     assert result.adapter_kwargs["radix_cache_disabled"] is True
 
 
-def test_ming_ar_cuda_graph_ignores_disabled_legacy_compile_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result = _run_fake_ming_ar_compile_executor(
-        monkeypatch,
-        enable_ming_ar_cuda_graph=True,
-        enable_ming_ar_sglang_compile=False,
-    )
-    build_kwargs = result.build_kwargs
-
-    assert build_kwargs["disable_cuda_graph"] is False
-    assert build_kwargs["enable_torch_compile"] is False
-    assert build_kwargs["torch_compile_max_bs"] == 0
-    assert result.infrastructure_saw_graph_disabled == [True]
-    assert result.graph_init_saw_graph_enabled == [True]
-
-
 def test_ming_ar_cuda_graph_defaults_capacity_to_graph_max_bs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(
+    result = _run_fake_ming_ar_graph_executor(
         monkeypatch,
         enable_ming_ar_cuda_graph=True,
-        enable_ming_ar_sglang_compile=None,
         server_args_overrides={"cuda_graph_bs": [1, 2, 4]},
     )
     build_kwargs = result.build_kwargs
@@ -1054,10 +1041,9 @@ def test_ming_ar_cuda_graph_defaults_capacity_to_graph_max_bs(
 def test_ming_ar_cuda_graph_row_prefill_radix_keeps_cache_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(
+    result = _run_fake_ming_ar_graph_executor(
         monkeypatch,
         enable_ming_ar_cuda_graph=True,
-        enable_ming_ar_sglang_compile=None,
         server_args_overrides={
             "enable_ming_ar_projected_prefill_radix_cache": True,
             "cuda_graph_bs": [1],
@@ -1082,10 +1068,9 @@ def test_ming_ar_cuda_graph_rejects_capacity_smaller_than_graph_max_bs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValueError, match="max_running_requests >= cuda_graph_max_bs"):
-        _run_fake_ming_ar_compile_executor(
+        _run_fake_ming_ar_graph_executor(
             monkeypatch,
             enable_ming_ar_cuda_graph=True,
-            enable_ming_ar_sglang_compile=None,
             server_args_overrides={
                 "cuda_graph_bs": [1, 2],
                 "max_running_requests": 1,
@@ -1093,11 +1078,12 @@ def test_ming_ar_cuda_graph_rejects_capacity_smaller_than_graph_max_bs(
         )
 
 
-def test_ming_ar_compile_allows_cuda_graph_without_torch_compile(
+def test_ming_ar_cuda_graph_allows_without_torch_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _run_fake_ming_ar_compile_executor(
+    result = _run_fake_ming_ar_graph_executor(
         monkeypatch,
+        enable_ming_ar_cuda_graph=True,
         server_args_overrides={
             "cuda_graph_bs": [1],
             "cuda_graph_max_bs": 1,
