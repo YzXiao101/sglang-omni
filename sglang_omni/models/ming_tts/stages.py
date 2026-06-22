@@ -355,15 +355,22 @@ def create_sglang_tts_engine_executor(
         context_length=int(context_length),
         **overrides,
     )
-    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    requested_disable_cuda_graph = bool(
+        getattr(server_args, "disable_cuda_graph", False)
+    )
+    want_cuda_graph = not requested_disable_cuda_graph
     if want_cuda_graph:
         # Bootstrap SGLang allocators with graph capture disabled, then capture
         # explicitly after Ming's fixed feedback buffers and server args are ready.
         server_args.disable_cuda_graph = True
+    bootstrap_disable_cuda_graph = bool(
+        getattr(server_args, "disable_cuda_graph", False)
+    )
 
     logger.info(
         "Ming AR SGLang startup: gpu_id=%s tp_rank=%s/%s pid=%s "
-        "total_gpu_memory_fraction=%s disable_cuda_graph=%s "
+        "total_gpu_memory_fraction=%s requested_disable_cuda_graph=%s "
+        "bootstrap_disable_cuda_graph=%s "
         "cuda_graph_bs=%s cuda_graph_max_bs=%s enable_torch_compile=%s "
         "torch_compile_max_bs=%s projected_prefill_radix_cache=%s "
         "nccl_port=%s",
@@ -372,7 +379,8 @@ def create_sglang_tts_engine_executor(
         tp_size,
         os.getpid(),
         total_gpu_memory_fraction,
-        getattr(server_args, "disable_cuda_graph", None),
+        requested_disable_cuda_graph,
+        bootstrap_disable_cuda_graph,
         getattr(server_args, "cuda_graph_bs", None),
         getattr(server_args, "cuda_graph_max_bs", None),
         getattr(server_args, "enable_torch_compile", None),
