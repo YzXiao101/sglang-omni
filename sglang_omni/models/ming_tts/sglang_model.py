@@ -42,7 +42,6 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
-    StandardTopKOutput,
     TopK,
     VocabParallelEmbedding,
     get_attention_tp_rank,
@@ -287,6 +286,8 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
 
         self.gate = MingBailingMoeGate(config)
         if self.multi_gate:
+            # Register modality gates for checkpoint coverage; the TTS serving
+            # path follows official generation and does not pass modality masks.
             self.image_gate = MingBailingMoeGate(config)
             self.audio_gate = MingBailingMoeGate(config)
         self.topk = TopK(
@@ -320,60 +321,9 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-    def _topk(
-        self,
-        hidden_states: torch.Tensor,
-        gate: MingBailingMoeGate,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        router_logits = gate(hidden_states).float()
-        scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(
-            scores,
-            k=self.num_experts_per_tok,
-            dim=-1,
-        )
-        if self.num_experts_per_tok > 1 and self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        return topk_ids, topk_weights, router_logits
-
     def _route_primary(self, hidden_states: torch.Tensor) -> Any:
         router_logits = self.gate(hidden_states).float()
         return self.topk(hidden_states, router_logits)
-
-    def _route_masked_eager(
-        self,
-        hidden_states: torch.Tensor,
-        image_mask: Optional[torch.Tensor] = None,
-        audio_mask: Optional[torch.Tensor] = None,
-    ) -> StandardTopKOutput:
-        topk_ids, topk_weights, router_logits = self._topk(hidden_states, self.gate)
-        if not self.multi_gate:
-            return StandardTopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=router_logits,
-            )
-
-        for mask, gate in (
-            (image_mask, getattr(self, "image_gate", None)),
-            (audio_mask, getattr(self, "audio_gate", None)),
-        ):
-            if mask is None or gate is None:
-                continue
-            flat_mask = mask.reshape(-1, 1).to(
-                device=topk_ids.device,
-                dtype=torch.bool,
-            )
-            alt_ids, alt_weights, alt_logits = self._topk(hidden_states, gate)
-            topk_ids = torch.where(flat_mask, alt_ids, topk_ids)
-            topk_weights = torch.where(flat_mask, alt_weights, topk_weights)
-            router_logits = torch.where(flat_mask, alt_logits, router_logits)
-
-        return StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=router_logits,
-        )
 
     def _route(
         self,
@@ -381,9 +331,11 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         image_mask: Optional[torch.Tensor] = None,
         audio_mask: Optional[torch.Tensor] = None,
     ) -> Any:
-        if image_mask is None and audio_mask is None:
-            return self._route_primary(hidden_states)
-        return self._route_masked_eager(hidden_states, image_mask, audio_mask)
+        if image_mask is not None or audio_mask is not None:
+            raise ValueError(
+                "Ming-Omni-TTS serving does not support modality-mask MoE routing"
+            )
+        return self._route_primary(hidden_states)
 
     def forward(
         self,
@@ -644,7 +596,12 @@ class MingBailingMoeTextModel(nn.Module):
 
 
 class MingTTSSGLangModel(nn.Module):
-    """Ming-Omni-TTS AR backbone plus weighted TTS heads."""
+    """SGLang wrapper for Ming-TTS AR backbone and weighted TTS heads.
+
+    ``forward`` covers the hidden-state backbone path used by SGLang scheduling,
+    CUDA graph, and TP.  FlowLoss sampling and latent feedback transitions run
+    in the model runner's AR tail after this forward returns.
+    """
 
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -737,9 +694,8 @@ class MingTTSSGLangModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Any = None,
-        input_embeds_are_projected: bool = False,
     ) -> LogitsProcessorOutput:
-        del pp_proxy_tensors, input_embeds_are_projected
+        del pp_proxy_tensors
 
         if input_embeds is None:
             input_embeds = getattr(forward_batch, "input_embeds", None)
