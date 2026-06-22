@@ -35,8 +35,12 @@ class MingTTSSGLangRequestData(ARRequestData):
     enforce_request_limits: bool = True
     req: Any = None
     synced: bool = False
+    # Generic ModelRunner bookkeeping. Ming AR step state lives in
+    # ``ar_state.generation_steps`` and must remain the model source of truth.
+    generation_steps: int = 0
     suppress_tokens: list[int] | None = None
     prefill_input_embeds: Any = None
+    decode_input_embeds: Any = None
     row_prefill_radix_cache_enabled: bool = False
     row_prefill_extra_key: str | None = None
     row_prefill_input_ids: Any = None
