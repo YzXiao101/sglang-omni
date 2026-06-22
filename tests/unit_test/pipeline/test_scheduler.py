@@ -1078,7 +1078,7 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise() -> No
 
 
 def test_omni_scheduler_follower_stream_output_bypasses_result_adapter() -> None:
-    """TP followers emit only an internal completion marker for cleanup."""
+    """TP followers clean local tensors without emitting external results."""
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.is_entry_rank = False
@@ -1103,10 +1103,7 @@ def test_omni_scheduler_follower_stream_output_bypasses_result_adapter() -> None
 
     scheduler.stream_output([req])
 
-    output = scheduler.outbox.get_nowait()
-    assert output.request_id == "req-follower"
-    assert output.type == "result"
-    assert output.data is None
+    assert scheduler.outbox.empty()
     assert scheduler._first_emit_done == set()
     assert scheduler._prefill_start_done == set()
     assert request_data.prefill_input_embeds is None
