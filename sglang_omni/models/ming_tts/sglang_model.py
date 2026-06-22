@@ -32,6 +32,8 @@ from sglang_omni.vendor.sglang.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang_omni.vendor.sglang.layers import (
+    LayerCommunicator,
+    LayerScatterModes,
     MergedColumnParallelLinear,
     MRotaryEmbedding,
     QKVParallelLinear,
@@ -47,7 +49,7 @@ from sglang_omni.vendor.sglang.layers import (
     get_attention_tp_size,
     get_moe_impl_class,
     get_rope,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang_omni.vendor.sglang.models import (
     create_fused_set_kv_buffer_arg,
@@ -209,6 +211,7 @@ class MingBailingMoeMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
             [int(intermediate_size), int(intermediate_size)],
@@ -226,10 +229,22 @@ class MingBailingMoeMLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        if self.tp_size == 1 and hidden_states.shape[0] == 0:
+            return hidden_states
+
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(hidden_states)
+        hidden_states, _ = self.down_proj(
+            hidden_states,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+        )
         return hidden_states
 
 
@@ -345,7 +360,10 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         ):
             if mask is None or gate is None:
                 continue
-            flat_mask = mask.reshape(-1, 1).to(device=topk_ids.device, dtype=torch.bool)
+            flat_mask = mask.reshape(-1, 1).to(
+                device=topk_ids.device,
+                dtype=torch.bool,
+            )
             alt_ids, alt_weights, alt_logits = self._topk(hidden_states, gate)
             topk_ids = torch.where(flat_mask, alt_ids, topk_ids)
             topk_weights = torch.where(flat_mask, alt_weights, topk_weights)
@@ -370,6 +388,9 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         audio_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -384,7 +405,11 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         if self.shared_experts is not None:
             hidden_states = hidden_states + self.shared_experts(shared_input)
 
-        if self.tp_size > 1 and not should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states.view(original_shape)
 
@@ -398,15 +423,16 @@ class MingBailingMoeDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
+        self.layer_id = layer_id
         self.attention = MingBailingMoeAttention(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attention", prefix),
         )
-        if getattr(config, "num_experts", None) is not None and layer_id >= int(
-            getattr(config, "first_k_dense_replace", 0) or 0
-        ):
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
+        if self.is_layer_sparse:
             self.mlp = MingBailingMoeSparseMoeBlock(
                 config=config,
                 layer_id=layer_id,
@@ -428,6 +454,26 @@ class MingBailingMoeDecoderLayer(nn.Module):
             int(config.hidden_size),
             eps=float(config.rms_norm_eps),
         )
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=int(config.num_hidden_layers),
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=self._is_layer_sparse(config, layer_id - 1),
+            is_next_layer_sparse=self._is_layer_sparse(config, layer_id + 1),
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=layer_id == int(config.num_hidden_layers) - 1,
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: Any, layer_id: int) -> bool:
+        return getattr(config, "num_experts", None) is not None and layer_id >= int(
+            getattr(config, "first_k_dense_replace", 0) or 0
+        )
 
     def forward(
         self,
@@ -436,15 +482,43 @@ class MingBailingMoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.attention(positions, hidden_states, forward_batch)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
 
-        hidden_states = self.attention(positions, hidden_states, forward_batch)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
         return hidden_states, residual
 
 
@@ -459,6 +533,7 @@ class MingBailingMoeTextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._validate_supported_config(config)
         self.vocab_size = int(config.vocab_size)
         self.hidden_size = int(config.hidden_size)
         self.word_embeddings = VocabParallelEmbedding(
@@ -481,6 +556,64 @@ class MingBailingMoeTextModel(nn.Module):
         self.start_layer = 0
         self.end_layer = int(config.num_hidden_layers)
         self.norm = RMSNorm(self.hidden_size, eps=float(config.rms_norm_eps))
+
+    @staticmethod
+    def _validate_supported_config(config: Any) -> None:
+        hidden_act = getattr(config, "hidden_act", "silu")
+        if hidden_act != "silu":
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE currently supports only "
+                f"hidden_act='silu'; got {hidden_act!r}"
+            )
+        if getattr(config, "use_qk_norm", False):
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE does not yet support use_qk_norm=True"
+            )
+        if getattr(config, "use_sliding_window", False):
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE does not yet support sliding-window "
+                "attention"
+            )
+        if getattr(config, "moe_router_enable_expert_bias", False):
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE does not yet support router expert bias"
+            )
+
+        score_function = getattr(config, "score_function", None)
+        if score_function not in (None, "softmax"):
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE currently supports only softmax "
+                f"routing; got score_function={score_function!r}"
+            )
+        router_dtype = getattr(config, "router_dtype", None)
+        if router_dtype is not None:
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE does not yet support router_dtype; "
+                f"got {router_dtype!r}"
+            )
+
+        for field in ("n_group", "num_expert_group", "topk_group"):
+            value = getattr(config, field, None)
+            if value not in (None, 0):
+                raise ValueError(
+                    "Ming-Omni-TTS BailingMoE does not yet support grouped "
+                    f"top-k routing; got {field}={value!r}"
+                )
+
+        shared_intermediate = getattr(
+            config,
+            "moe_shared_expert_intermediate_size",
+            None,
+        )
+        if shared_intermediate is not None and int(shared_intermediate) != int(
+            config.moe_intermediate_size
+        ):
+            raise ValueError(
+                "Ming-Omni-TTS BailingMoE currently expects shared expert "
+                "intermediate size to match moe_intermediate_size; got "
+                f"moe_shared_expert_intermediate_size={shared_intermediate!r}, "
+                f"moe_intermediate_size={config.moe_intermediate_size!r}"
+            )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.word_embeddings
