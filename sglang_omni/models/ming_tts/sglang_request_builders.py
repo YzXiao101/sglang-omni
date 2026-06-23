@@ -397,10 +397,19 @@ def make_ming_tts_scheduler_adapters(
                     "Ming-Omni-TTS stop_step was recorded but the final latent "
                     "chunk is not marked as last_chunk"
                 )
+            stop_at_budget_boundary = int(ar_state.stop_step) + 1 >= int(
+                ar_state.max_decode_steps
+            ) and len(ar_state.generated_latents) >= int(ar_state.max_decode_steps)
+            length_at_budget_boundary = (
+                normalized is not None
+                and "length" in normalized
+                and stop_at_budget_boundary
+            )
             if normalized is not None and not (
                 normalized in ("stop", "matched", "eos", "finish_matched_token")
                 or "matched" in normalized
                 or "eos" in normalized
+                or length_at_budget_boundary
             ):
                 raise RuntimeError(
                     "Ming-Omni-TTS stop-head recorded stop_step="
