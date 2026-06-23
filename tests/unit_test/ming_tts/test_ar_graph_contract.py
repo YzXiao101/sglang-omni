@@ -696,6 +696,61 @@ def test_ming_ar_result_adapter_serializes_then_releases_runtime_state(
     assert len(data.ar_state.pending_feedback_queue) == 0
 
 
+def test_ming_ar_result_adapter_accepts_stop_with_length_at_decode_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.sglang_request_builders import (
+        make_ming_tts_scheduler_adapters,
+    )
+
+    request_builder, result_adapter = make_ming_tts_scheduler_adapters(
+        model=_fake_ming_tts_model(),
+        tokenizer=_fake_tokenizer_bundle(),
+        projected_prefill_requires_radix_disabled=True,
+        radix_cache_disabled=True,
+    )
+    data = request_builder(_reference_payload())
+    data.ar_state.max_decode_steps = 2
+    data.ar_state.stop_step = 1
+    data.ar_state.generated_latents.extend([torch.ones(2, 3), torch.ones(2, 3)])
+    data.ar_state.generated_last_chunk.extend([False, True])
+    data.finish_reason = "length"
+
+    result = result_adapter(data)
+
+    assert result.data["finish_reason"] == "stop"
+    assert result.data["stop_step"] == 1
+    assert result.data["generated_latents_shape"] == [2, 2, 3]
+
+
+def test_ming_ar_result_adapter_rejects_early_stop_with_length_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _install_fake_sglang(monkeypatch)
+    from sglang_omni.models.ming_tts.sglang_request_builders import (
+        make_ming_tts_scheduler_adapters,
+    )
+
+    request_builder, result_adapter = make_ming_tts_scheduler_adapters(
+        model=_fake_ming_tts_model(),
+        tokenizer=_fake_tokenizer_bundle(),
+        projected_prefill_requires_radix_disabled=True,
+        radix_cache_disabled=True,
+    )
+    data = request_builder(_reference_payload())
+    data.ar_state.max_decode_steps = 3
+    data.ar_state.stop_step = 0
+    data.ar_state.generated_latents.append(torch.ones(2, 3))
+    data.ar_state.generated_last_chunk.append(True)
+    data.finish_reason = "length"
+
+    with pytest.raises(RuntimeError, match="finished_reason"):
+        result_adapter(data)
+
+
 def _run_fake_ming_ar_graph_executor(
     monkeypatch: pytest.MonkeyPatch,
     *,
