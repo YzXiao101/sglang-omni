@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 import math
 import re
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +15,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from torch import nn
 
+from sglang_omni.models.ming_tts.fm.cfm import build_cfm_sampling_schedule
 from sglang_omni.models.ming_tts.weight_loading import (
     MING_TTS_LM_HEAD_SKIP_REASON,
     MING_TTS_ROTARY_BUFFER_SKIP_REASON,
@@ -58,6 +61,179 @@ from sglang_omni.vendor.sglang.server_args import get_global_server_args
 from sglang_omni.vendor.sglang.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+_MING_TTS_CFM_STEPS = 10
+
+
+@dataclass
+class MingARTailInputs:
+    hidden_states: torch.Tensor
+    latent_history: torch.Tensor
+    cfg: torch.Tensor
+    sigma: torch.Tensor
+    temperature: torch.Tensor
+
+
+@dataclass
+class MingARTailOutputs:
+    sampled: torch.Tensor
+    feedback_embeddings: torch.Tensor
+    stop_prob: torch.Tensor
+
+
+class _MingARTailGraph:
+    def __init__(self, model: Any, batch_size: int) -> None:
+        self.model = model
+        self.batch_size = int(batch_size)
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.inputs: MingARTailInputs | None = None
+        self.noise: torch.Tensor | None = None
+        self.timesteps: torch.Tensor | None = None
+        self.sde_random: torch.Tensor | None = None
+        self.outputs: MingARTailOutputs | None = None
+
+    def capture(self) -> None:
+        weight = self.model._decode_input_embedding.weight
+        device = weight.device
+        hidden_dtype = weight.dtype
+        float_dtype = torch.float32
+        batch_size = self.batch_size
+        self.inputs = MingARTailInputs(
+            hidden_states=torch.zeros(
+                batch_size,
+                1,
+                int(self.model.hidden_size),
+                device=device,
+                dtype=hidden_dtype,
+            ),
+            latent_history=torch.zeros(
+                batch_size,
+                int(self.model.history_patch_size),
+                int(self.model.latent_dim),
+                device=device,
+                dtype=float_dtype,
+            ),
+            cfg=torch.full((batch_size,), 2.0, device=device, dtype=float_dtype),
+            sigma=torch.full((batch_size,), 0.25, device=device, dtype=float_dtype),
+            temperature=torch.zeros(batch_size, device=device, dtype=float_dtype),
+        )
+        self.noise, self.timesteps, self.sde_random = (
+            self.model._make_ar_tail_sampling_inputs(
+                batch_size=batch_size,
+                device=device,
+            )
+        )
+
+        context = (
+            torch.autocast(device_type="cuda", dtype=hidden_dtype)
+            if device.type == "cuda" and hidden_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with context:
+            warmup_stream = torch.cuda.Stream(device=device)
+            warmup_stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    self.model._compute_ar_tail_tensor(
+                        self.inputs,
+                        noise=self.noise,
+                        timesteps=self.timesteps,
+                        sde_random=self.sde_random,
+                    )
+            torch.cuda.current_stream(device).wait_stream(warmup_stream)
+            torch.cuda.synchronize(device=device)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self.outputs = self.model._compute_ar_tail_tensor(
+                    self.inputs,
+                    noise=self.noise,
+                    timesteps=self.timesteps,
+                    sde_random=self.sde_random,
+                )
+        self.graph = graph
+
+    def replay(
+        self,
+        inputs: MingARTailInputs,
+        *,
+        noise: torch.Tensor,
+        sde_random: torch.Tensor,
+    ) -> MingARTailOutputs:
+        if int(inputs.hidden_states.shape[0]) != self.batch_size:
+            raise RuntimeError(
+                "Ming TTS tail graph batch mismatch: "
+                f"{int(inputs.hidden_states.shape[0])} != {self.batch_size}"
+            )
+        if self.graph is None or self.inputs is None or self.outputs is None:
+            raise RuntimeError("Ming TTS tail graph is not captured")
+
+        self.inputs.hidden_states.copy_(inputs.hidden_states)
+        self.inputs.latent_history.copy_(inputs.latent_history)
+        self.inputs.cfg.copy_(inputs.cfg)
+        self.inputs.sigma.copy_(inputs.sigma)
+        self.inputs.temperature.copy_(inputs.temperature)
+        self.noise.copy_(noise)
+        self.sde_random.copy_(sde_random)
+        self.graph.replay()
+        return MingARTailOutputs(
+            sampled=self.outputs.sampled.clone(),
+            feedback_embeddings=self.outputs.feedback_embeddings.clone(),
+            stop_prob=self.outputs.stop_prob.clone(),
+        )
+
+
+class _MingARTailGraphs:
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self.graphs: dict[int, _MingARTailGraph] = {}
+
+    def capture(self, batch_sizes: list[int]) -> None:
+        buckets = sorted({int(batch_size) for batch_size in batch_sizes})
+        for batch_size in buckets:
+            graph = _MingARTailGraph(self.model, batch_size)
+            graph.capture()
+            self.graphs[batch_size] = graph
+
+    def replay(
+        self,
+        inputs: MingARTailInputs,
+        *,
+        noise: torch.Tensor,
+        sde_random: torch.Tensor,
+    ) -> MingARTailOutputs:
+        batch_size = int(inputs.hidden_states.shape[0])
+        graph = self.graphs.get(batch_size)
+        if graph is None:
+            raise RuntimeError(
+                "Ming TTS tail graph has no exact batch capture for "
+                f"batch_size={batch_size}"
+            )
+        return graph.replay(inputs, noise=noise, sde_random=sde_random)
+
+
+def normalize_ming_ar_hidden_states(
+    hidden: Any,
+    *,
+    request_count: int,
+) -> torch.Tensor:
+    if not isinstance(hidden, torch.Tensor):
+        raise RuntimeError("Ming TTS model output did not include hidden states")
+    if hidden.ndim == 2:
+        z_diff = hidden.unsqueeze(1)
+    elif hidden.ndim == 3 and int(hidden.shape[1]) == 1:
+        z_diff = hidden
+    else:
+        raise RuntimeError(
+            "Ming TTS hidden states must have shape [batch, hidden] or "
+            f"[batch, 1, hidden], got {tuple(hidden.shape)}"
+        )
+    if int(z_diff.shape[0]) != int(request_count):
+        raise RuntimeError(
+            "Ming TTS hidden batch does not match request batch: "
+            f"{int(z_diff.shape[0])} != {int(request_count)}"
+        )
+    return z_diff
 
 
 class MingBailingMoeAttention(nn.Module):
@@ -654,14 +830,15 @@ class MingTTSSGLangModel(nn.Module):
             )
 
         try:
-            from sglang_omni.models.ming_tts.fm.dit import Aggregator
+            from sglang_omni.models.ming_omni.talker.talker_module.aggregator import (
+                Aggregator,
+            )
             from sglang_omni.models.ming_tts.fm.flowloss import FlowLoss
         except ImportError as exc:
             raise ImportError(
-                "MingTTSSGLangModel requires sglang_omni.models.ming_tts.fm "
-                "for Aggregator and FlowLoss, including its x-transformers "
-                "dependency. Install project dependencies or run "
-                "`pip install x-transformers` before loading this model."
+                "MingTTSSGLangModel requires Ming-Omni talker FM modules and "
+                "Ming-TTS FlowLoss, including x-transformers. Install project "
+                "dependencies before loading this model."
             ) from exc
 
         audio_config = self.config.audio_tokenizer_config
@@ -682,9 +859,114 @@ class MingTTSSGLangModel(nn.Module):
         )
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(192, self.hidden_size, bias=True)
+        self._ar_tail_graphs = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
+
+    @torch.no_grad()
+    def init_ar_tail_graphs(self, batch_sizes: list[int]) -> None:
+        graphs = _MingARTailGraphs(self)
+        graphs.capture(batch_sizes)
+        self._ar_tail_graphs = graphs
+        logger.info("Ming TTS AR tail CUDA graphs captured for bs=%s", batch_sizes)
+
+    @torch.no_grad()
+    def run_ar_tail(self, inputs: MingARTailInputs) -> MingARTailOutputs:
+        self._check_ar_tail_cfg(inputs.cfg)
+        noise, timesteps, sde_random = self._make_ar_tail_sampling_inputs(
+            batch_size=int(inputs.hidden_states.shape[0]),
+            device=inputs.hidden_states.device,
+        )
+        tail_graphs = self._ar_tail_graphs
+        if tail_graphs is not None:
+            return tail_graphs.replay(
+                inputs,
+                noise=noise,
+                sde_random=sde_random,
+            )
+        return self._compute_ar_tail_tensor(
+            inputs,
+            noise=noise,
+            timesteps=timesteps,
+            sde_random=sde_random,
+        )
+
+    def _compute_ar_tail_tensor(
+        self,
+        inputs: MingARTailInputs,
+        *,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+    ) -> MingARTailOutputs:
+        sampled = self.flowloss.sample_final_with_noise(
+            z=inputs.hidden_states,
+            latent_history=inputs.latent_history,
+            noise=noise,
+            cfg=inputs.cfg,
+            sigma=inputs.sigma,
+            temperature=inputs.temperature,
+            timesteps=timesteps,
+            sde_random=sde_random,
+            validate_cfg=False,
+        )
+        feedback = self.linear_proj_audio(sampled).reshape(
+            int(inputs.hidden_states.shape[0]),
+            -1,
+        )
+        stop_prob = self.stop_head(inputs.hidden_states).softmax(dim=-1)[:, 0, 1]
+        return MingARTailOutputs(
+            sampled=sampled,
+            feedback_embeddings=feedback,
+            stop_prob=stop_prob,
+        )
+
+    def _make_ar_tail_sampling_inputs(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        noise_rows: list[torch.Tensor] = []
+        sde_rows: list[torch.Tensor] = []
+        timesteps = None
+        for _ in range(int(batch_size)):
+            row_noise = torch.randn(
+                1,
+                int(self.latent_dim),
+                int(self.patch_size),
+                device=device,
+            )
+            row_timesteps, row_sde_random = build_cfm_sampling_schedule(
+                steps=_MING_TTS_CFM_STEPS,
+                device=device,
+                dtype=row_noise.dtype,
+                batch_size=1,
+                patch_size=int(self.patch_size),
+                latent_dim=int(self.latent_dim),
+            )
+            noise_rows.append(row_noise)
+            sde_rows.append(row_sde_random)
+            if timesteps is None:
+                timesteps = row_timesteps
+
+        if timesteps is None:
+            raise RuntimeError("Ming TTS AR tail requires batch_size > 0")
+        return torch.cat(noise_rows, dim=0), timesteps, torch.cat(sde_rows, dim=1)
+
+    @staticmethod
+    def _check_ar_tail_cfg(cfg: torch.Tensor | list[float]) -> None:
+        if isinstance(cfg, torch.Tensor):
+            invalid = torch.logical_or(cfg < 1e-5, cfg == 1.0)
+            is_invalid = bool(torch.any(invalid).detach().cpu().item())
+        else:
+            is_invalid = any(value < 1e-5 or value == 1.0 for value in cfg)
+        if is_invalid:
+            raise NotImplementedError(
+                "Ming-Omni-TTS tail requires guided CFM sampling "
+                "with cfg >= 1e-5 and cfg != 1.0"
+            )
 
     @torch.no_grad()
     def forward(
