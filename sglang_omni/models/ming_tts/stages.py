@@ -124,6 +124,7 @@ def create_sglang_tts_engine_executor(
     context_length: int | None = None,
     server_args_overrides: dict[str, Any] | None = None,
     enable_ming_ar_cuda_graph: bool = False,
+    enable_ming_ar_tail_cuda_graph: bool = False,
     enable_ming_ar_projected_prefill_radix_cache: bool = False,
     total_gpu_memory_fraction: float | None = None,
     tp_rank: int = 0,
@@ -186,6 +187,15 @@ def create_sglang_tts_engine_executor(
         projected_prefill_radix_cache_enabled = _coerce_bool(
             user_overrides.pop("enable_ming_ar_projected_prefill_radix_cache"),
             name="server_args_overrides.enable_ming_ar_projected_prefill_radix_cache",
+        )
+    tail_cuda_graph_enabled = _coerce_bool(
+        enable_ming_ar_tail_cuda_graph,
+        name="enable_ming_ar_tail_cuda_graph",
+    )
+    if "enable_ming_ar_tail_cuda_graph" in user_overrides:
+        tail_cuda_graph_enabled = _coerce_bool(
+            user_overrides.pop("enable_ming_ar_tail_cuda_graph"),
+            name="server_args_overrides.enable_ming_ar_tail_cuda_graph",
         )
     cuda_graph_values = {value for _, value in cuda_graph_settings}
     if len(cuda_graph_values) > 1:
@@ -355,6 +365,11 @@ def create_sglang_tts_engine_executor(
         context_length=int(context_length),
         **overrides,
     )
+    server_args.enable_ming_ar_tail_cuda_graph = bool(tail_cuda_graph_enabled)
+    tail_cuda_graph_max_bs = overrides.get("max_running_requests")
+    server_args.ming_ar_tail_cuda_graph_max_bs = (
+        int(tail_cuda_graph_max_bs) if tail_cuda_graph_max_bs is not None else None
+    )
     requested_disable_cuda_graph = bool(
         getattr(server_args, "disable_cuda_graph", False)
     )
@@ -373,7 +388,7 @@ def create_sglang_tts_engine_executor(
         "bootstrap_disable_cuda_graph=%s "
         "cuda_graph_bs=%s cuda_graph_max_bs=%s enable_torch_compile=%s "
         "torch_compile_max_bs=%s projected_prefill_radix_cache=%s "
-        "nccl_port=%s",
+        "tail_cuda_graph=%s nccl_port=%s",
         gpu_id,
         tp_rank,
         tp_size,
@@ -386,6 +401,7 @@ def create_sglang_tts_engine_executor(
         getattr(server_args, "enable_torch_compile", None),
         getattr(server_args, "torch_compile_max_bs", None),
         projected_prefill_radix_cache_enabled,
+        tail_cuda_graph_enabled,
         nccl_port,
     )
     (
@@ -419,6 +435,7 @@ def create_sglang_tts_engine_executor(
         "projected_prefill_radix_cache_enabled": bool(
             projected_prefill_radix_cache_enabled
         ),
+        "tail_cuda_graph_enabled": bool(tail_cuda_graph_enabled),
     }
     logger.info(
         "Ming AR CUDA graph startup: enabled=%s target=%s layer_count=%s "
@@ -426,7 +443,7 @@ def create_sglang_tts_engine_executor(
         "max_running_requests=%s cuda_graph_bs=%s "
         "enable_torch_compile=%s torch_compile_max_bs=%s "
         "disable_radix_cache=%s chunked_prefill_size=%s "
-        "projected_prefill_radix_cache=%s",
+        "projected_prefill_radix_cache=%s tail_cuda_graph=%s",
         ming_ar_cuda_graph_info["enabled"],
         ming_ar_cuda_graph_info["target"],
         ming_ar_cuda_graph_info["layer_count"],
@@ -442,6 +459,7 @@ def create_sglang_tts_engine_executor(
         getattr(server_args, "disable_radix_cache", None),
         getattr(server_args, "chunked_prefill_size", None),
         ming_ar_cuda_graph_info["projected_prefill_radix_cache_enabled"],
+        ming_ar_cuda_graph_info["tail_cuda_graph_enabled"],
     )
     tokenizer = load_ming_tts_tokenizer(
         checkpoint_dir,

@@ -16,11 +16,14 @@ from sglang_omni.models.ming_tts.ar_runtime import (
     get_ming_ar_state,
     update_ming_ar_latent_history_,
 )
+from sglang_omni.models.ming_tts.fm.cfm import build_cfm_sampling_schedule
 from sglang_omni.models.ming_tts.profile_events import (
     emit_ming_event,
     ming_profile_event,
     tensor_metadata,
 )
+
+_MING_TTS_CFM_STEPS = 10
 
 
 @dataclass
@@ -82,6 +85,15 @@ class MingARStepResult:
         )
 
 
+@dataclass
+class MingARTailTensorOutputs:
+    """Pure tensor outputs produced by the Ming AR tail compute boundary."""
+
+    sampled: torch.Tensor
+    feedback_embeddings: torch.Tensor
+    stop_prob: torch.Tensor
+
+
 def normalize_ming_ar_hidden_states(
     hidden: Any,
     *,
@@ -106,11 +118,383 @@ def normalize_ming_ar_hidden_states(
     return z_diff
 
 
-class MingARTailExecutor:
-    """Eager Ming AR tail after the SGLang backbone hidden-state forward."""
+def build_ming_tts_cfm_sampling_inputs(
+    *,
+    batch_size: int,
+    device: torch.device,
+    latent_dim: int,
+    patch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    noise_rows: list[torch.Tensor] = []
+    sde_rows: list[torch.Tensor] = []
+    timesteps = None
+    for _ in range(int(batch_size)):
+        row_noise = torch.randn(
+            1,
+            int(latent_dim),
+            int(patch_size),
+            device=device,
+        )
+        row_timesteps, row_sde_random = build_cfm_sampling_schedule(
+            steps=_MING_TTS_CFM_STEPS,
+            device=device,
+            dtype=row_noise.dtype,
+            batch_size=1,
+            patch_size=int(patch_size),
+            latent_dim=int(latent_dim),
+        )
+        noise_rows.append(row_noise)
+        sde_rows.append(row_sde_random)
+        if timesteps is None:
+            timesteps = row_timesteps
 
-    def __init__(self, model: Any) -> None:
+    if timesteps is None:
+        raise RuntimeError("Ming TTS CFM sampling inputs require batch_size > 0")
+
+    noise = torch.cat(noise_rows, dim=0)
+    sde_random = torch.cat(sde_rows, dim=1)
+    return noise, timesteps, sde_random
+
+
+def _validate_ming_tail_cfg_values(cfg: torch.Tensor | list[float]) -> None:
+    if isinstance(cfg, torch.Tensor):
+        invalid = torch.logical_or(cfg < 1e-5, cfg == 1.0)
+        is_invalid = bool(torch.any(invalid).detach().cpu().item())
+    else:
+        is_invalid = any(value < 1e-5 or value == 1.0 for value in cfg)
+    if is_invalid:
+        raise NotImplementedError(
+            "Ming-Omni-TTS tail requires guided CFM sampling "
+            "with cfg >= 1e-5 and cfg != 1.0"
+        )
+
+
+class MingARTailGraphExecutor:
+    """Exact-batch CUDA graph for the pure Ming AR tail tensor compute."""
+
+    def __init__(self, model: Any, batch_size: int) -> None:
         self.model = model
+        self.batch_size = int(batch_size)
+        self.initialized = False
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.z_diff_placeholder: torch.Tensor | None = None
+        self.history_placeholder: torch.Tensor | None = None
+        self.noise_placeholder: torch.Tensor | None = None
+        self.timesteps_placeholder: torch.Tensor | None = None
+        self.sde_random_placeholder: torch.Tensor | None = None
+        self.cfg_placeholder: torch.Tensor | None = None
+        self.sigma_placeholder: torch.Tensor | None = None
+        self.temperature_placeholder: torch.Tensor | None = None
+        self.sampled_placeholder: torch.Tensor | None = None
+        self.feedback_placeholder: torch.Tensor | None = None
+        self.stop_prob_placeholder: torch.Tensor | None = None
+
+    def execute(
+        self,
+        *,
+        z_diff: torch.Tensor,
+        latent_history: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: torch.Tensor,
+        sigma: torch.Tensor,
+        temperature: torch.Tensor,
+        validate_cfg: bool = True,
+    ) -> MingARTailTensorOutputs:
+        self._validate_inputs(
+            z_diff=z_diff,
+            latent_history=latent_history,
+            noise=noise,
+            timesteps=timesteps,
+            sde_random=sde_random,
+            cfg=cfg,
+            sigma=sigma,
+            temperature=temperature,
+        )
+        if validate_cfg:
+            _validate_ming_tail_cfg_values(cfg)
+        if not self.initialized:
+            self._initialize_graph(
+                z_diff=z_diff,
+                latent_history=latent_history,
+                noise=noise,
+                timesteps=timesteps,
+                sde_random=sde_random,
+                cfg=cfg,
+                sigma=sigma,
+                temperature=temperature,
+            )
+
+        self._copy_inputs(
+            z_diff=z_diff,
+            latent_history=latent_history,
+            noise=noise,
+            timesteps=timesteps,
+            sde_random=sde_random,
+            cfg=cfg,
+            sigma=sigma,
+            temperature=temperature,
+        )
+        if self.graph is None:
+            raise RuntimeError("Ming TTS tail CUDA graph is not initialized")
+        self.graph.replay()
+
+        sampled = torch.empty_like(self._required_tensor(self.sampled_placeholder))
+        sampled.copy_(self._required_tensor(self.sampled_placeholder))
+        feedback = torch.empty_like(self._required_tensor(self.feedback_placeholder))
+        feedback.copy_(self._required_tensor(self.feedback_placeholder))
+        stop_prob = torch.empty_like(self._required_tensor(self.stop_prob_placeholder))
+        stop_prob.copy_(self._required_tensor(self.stop_prob_placeholder))
+        return MingARTailTensorOutputs(
+            sampled=sampled,
+            feedback_embeddings=feedback,
+            stop_prob=stop_prob,
+        )
+
+    def _initialize_graph(
+        self,
+        *,
+        z_diff: torch.Tensor,
+        latent_history: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: torch.Tensor,
+        sigma: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        self.z_diff_placeholder = torch.empty_like(z_diff)
+        self.history_placeholder = torch.empty_like(latent_history)
+        self.noise_placeholder = torch.empty_like(noise)
+        self.timesteps_placeholder = torch.empty_like(timesteps)
+        self.sde_random_placeholder = torch.empty_like(sde_random)
+        self.cfg_placeholder = torch.empty_like(cfg)
+        self.sigma_placeholder = torch.empty_like(sigma)
+        self.temperature_placeholder = torch.empty_like(temperature)
+        self._copy_inputs(
+            z_diff=z_diff,
+            latent_history=latent_history,
+            noise=noise,
+            timesteps=timesteps,
+            sde_random=sde_random,
+            cfg=cfg,
+            sigma=sigma,
+            temperature=temperature,
+        )
+
+        self._run_tail_compute()
+        torch.cuda.synchronize(device=z_diff.device)
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                (
+                    self.sampled_placeholder,
+                    self.feedback_placeholder,
+                    self.stop_prob_placeholder,
+                ) = self._run_tail_compute()
+        except BaseException:
+            self.graph = None
+            self.initialized = False
+            self.sampled_placeholder = None
+            self.feedback_placeholder = None
+            self.stop_prob_placeholder = None
+            raise
+
+        self.graph = graph
+        self.initialized = True
+
+    def _run_tail_compute(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z_diff = self._required_tensor(self.z_diff_placeholder)
+        sampled = self.model.flowloss.sample_final_with_noise(
+            z=z_diff,
+            latent_history=self._required_tensor(self.history_placeholder),
+            noise=self._required_tensor(self.noise_placeholder),
+            cfg=self._required_tensor(self.cfg_placeholder),
+            patch_size=int(self.model.patch_size),
+            sigma=self._required_tensor(self.sigma_placeholder),
+            temperature=self._required_tensor(self.temperature_placeholder),
+            timesteps=self._required_tensor(self.timesteps_placeholder),
+            sde_random=self._required_tensor(self.sde_random_placeholder),
+            validate_cfg=False,
+        )
+        feedback = self.model.linear_proj_audio(sampled).reshape(self.batch_size, -1)
+        stop_prob = self.model.stop_head(z_diff).softmax(dim=-1)[:, 0, 1]
+        return sampled, feedback, stop_prob
+
+    def _copy_inputs(
+        self,
+        *,
+        z_diff: torch.Tensor,
+        latent_history: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: torch.Tensor,
+        sigma: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        self._required_tensor(self.z_diff_placeholder).copy_(z_diff)
+        self._required_tensor(self.history_placeholder).copy_(latent_history)
+        self._required_tensor(self.noise_placeholder).copy_(noise)
+        self._required_tensor(self.timesteps_placeholder).copy_(timesteps)
+        self._required_tensor(self.sde_random_placeholder).copy_(sde_random)
+        self._required_tensor(self.cfg_placeholder).copy_(cfg)
+        self._required_tensor(self.sigma_placeholder).copy_(sigma)
+        self._required_tensor(self.temperature_placeholder).copy_(temperature)
+
+    def _validate_inputs(
+        self,
+        *,
+        z_diff: torch.Tensor,
+        latent_history: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: torch.Tensor,
+        sigma: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        tensors = {
+            "z_diff": z_diff,
+            "latent_history": latent_history,
+            "noise": noise,
+            "timesteps": timesteps,
+            "sde_random": sde_random,
+            "cfg": cfg,
+            "sigma": sigma,
+            "temperature": temperature,
+        }
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError(f"Ming TTS tail graph input {name} is not a tensor")
+            if tensor.device.type != "cuda":
+                raise RuntimeError("Ming TTS tail CUDA graph requires CUDA tensors")
+            if tensor.device != z_diff.device:
+                raise RuntimeError(
+                    "Ming TTS tail graph inputs must be on one CUDA device"
+                )
+
+        batch_size = self.batch_size
+        expected_noise = (
+            batch_size,
+            int(self.model.latent_dim),
+            int(self.model.patch_size),
+        )
+        expected_history = (
+            batch_size,
+            int(self.model.history_patch_size),
+            int(self.model.latent_dim),
+        )
+        expected_sde = (
+            _MING_TTS_CFM_STEPS,
+            batch_size,
+            int(self.model.patch_size),
+            int(self.model.latent_dim),
+        )
+        expected_hidden = self._expected_hidden_size()
+        if (
+            int(z_diff.shape[0]) != batch_size
+            or z_diff.ndim != 3
+            or int(z_diff.shape[1]) != 1
+            or int(z_diff.shape[2]) != expected_hidden
+        ):
+            raise RuntimeError(
+                "Ming TTS tail graph hidden shape mismatch: "
+                f"got {tuple(z_diff.shape)}, expected "
+                f"({batch_size}, 1, {expected_hidden})"
+            )
+        if tuple(latent_history.shape) != expected_history:
+            raise RuntimeError(
+                "Ming TTS tail graph history shape mismatch: "
+                f"expected {expected_history}, got {tuple(latent_history.shape)}"
+            )
+        if tuple(noise.shape) != expected_noise:
+            raise RuntimeError(
+                "Ming TTS tail graph noise shape mismatch: "
+                f"expected {expected_noise}, got {tuple(noise.shape)}"
+            )
+        if tuple(sde_random.shape) != expected_sde:
+            raise RuntimeError(
+                "Ming TTS tail graph sde_random shape mismatch: "
+                f"expected {expected_sde}, got {tuple(sde_random.shape)}"
+            )
+        if tuple(timesteps.shape) != (_MING_TTS_CFM_STEPS + 1,):
+            raise RuntimeError(
+                "Ming TTS tail graph timesteps shape mismatch: "
+                f"got {tuple(timesteps.shape)}"
+            )
+        for name, tensor in (
+            ("cfg", cfg),
+            ("sigma", sigma),
+            ("temperature", temperature),
+        ):
+            if tuple(tensor.shape) != (batch_size,):
+                raise RuntimeError(
+                    f"Ming TTS tail graph {name} must have shape "
+                    f"({batch_size},), got {tuple(tensor.shape)}"
+                )
+
+    @staticmethod
+    def _required_tensor(tensor: torch.Tensor | None) -> torch.Tensor:
+        if tensor is None:
+            raise RuntimeError("Ming TTS tail CUDA graph tensor is not initialized")
+        return tensor
+
+    def _expected_hidden_size(self) -> int:
+        embedding = getattr(self.model, "_decode_input_embedding", None)
+        weight = getattr(embedding, "weight", None)
+        if weight is not None:
+            return int(weight.shape[1])
+        return int(getattr(self.model, "hidden_size"))
+
+
+class MingARTailGraphExecutorCache:
+    """Lazy exact-batch CUDA graph cache for Ming AR tail compute."""
+
+    def __init__(self, model: Any, *, max_batch_size: int | None = None) -> None:
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self._executors: dict[int, MingARTailGraphExecutor] = {}
+
+    def execute(self, **kwargs) -> MingARTailTensorOutputs:
+        z_diff = kwargs["z_diff"]
+        batch_size = int(z_diff.shape[0])
+        if self.max_batch_size is not None and batch_size > int(self.max_batch_size):
+            raise RuntimeError(
+                "Ming TTS tail CUDA graph batch exceeds configured capacity: "
+                f"{batch_size} > {int(self.max_batch_size)}"
+            )
+        executor = self._executors.get(batch_size)
+        if executor is None:
+            executor = MingARTailGraphExecutor(self.model, batch_size)
+            self._executors[batch_size] = executor
+        return executor.execute(**kwargs)
+
+
+class MingARTailExecutor:
+    """Ming AR tail compute after the SGLang backbone hidden-state forward."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        enable_cuda_graph: bool = False,
+        cuda_graph_max_bs: int | None = None,
+    ) -> None:
+        self.model = model
+        self.enable_cuda_graph = bool(enable_cuda_graph)
+        self._tail_graph_cache = (
+            MingARTailGraphExecutorCache(
+                model,
+                max_batch_size=cuda_graph_max_bs,
+            )
+            if self.enable_cuda_graph
+            else None
+        )
 
     def step_batch(self, hidden: torch.Tensor, requests: list[Any]) -> MingARStepResult:
         weight = self.model._decode_input_embedding.weight
@@ -147,101 +531,247 @@ class MingARTailExecutor:
         else:
             context = nullcontext()
 
+        batch_event_id = str(requests[0].request_id)
         with context:
-            for row_idx, sched_req in enumerate(requests):
-                ar_state = get_ming_ar_state(sched_req.data)
-                step = int(ar_state.generation_steps)
-                result.generation_steps[row_idx] = step
-                history = ar_state.ensure_latent_history(
+            with ming_profile_event(
+                batch_event_id,
+                "ming_tail_gather",
+                {
+                    "batch_size": int(batch_size),
+                    "hidden": tensor_metadata(z_diff),
+                },
+            ):
+                ar_states = [get_ming_ar_state(req.data) for req in requests]
+                steps = [int(state.generation_steps) for state in ar_states]
+                max_steps = [int(state.max_decode_steps) for state in ar_states]
+                cfg_values = [float(state.cfg) for state in ar_states]
+                _validate_ming_tail_cfg_values(cfg_values)
+                histories = [
+                    state.ensure_latent_history(
+                        device=device,
+                        history_patch_size=int(self.model.history_patch_size),
+                        latent_dim=int(self.model.latent_dim),
+                    )
+                    for state in ar_states
+                ]
+                history_batch = torch.cat(histories, dim=0)
+                steps_tensor = torch.tensor(steps, dtype=torch.long, device=device)
+                max_steps_tensor = torch.tensor(
+                    max_steps,
+                    dtype=torch.long,
                     device=device,
-                    history_patch_size=int(self.model.history_patch_size),
-                    latent_dim=int(self.model.latent_dim),
                 )
-                row_hidden = z_diff[row_idx : row_idx + 1]
-                row_metadata = {
-                    "batch_size": len(requests),
-                    "row_idx": int(row_idx),
-                    "generation_step": int(step),
-                }
+                cfg_tensor = torch.tensor(
+                    cfg_values,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                sigma_tensor = torch.tensor(
+                    [float(state.sigma) for state in ar_states],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                temperature_tensor = torch.tensor(
+                    [float(state.flow_temperature) for state in ar_states],
+                    dtype=torch.float32,
+                    device=device,
+                )
 
+            noise, timesteps, sde_random = build_ming_tts_cfm_sampling_inputs(
+                batch_size=batch_size,
+                device=device,
+                latent_dim=int(self.model.latent_dim),
+                patch_size=int(self.model.patch_size),
+            )
+            feedback_all: torch.Tensor | None = None
+            if self.enable_cuda_graph:
+                if self._tail_graph_cache is None:
+                    raise RuntimeError("Ming TTS tail graph cache is not initialized")
                 with ming_profile_event(
-                    sched_req.request_id,
-                    "ming_flowloss_sample",
-                    row_metadata,
+                    batch_event_id,
+                    "ming_tail_graph_replay",
+                    {
+                        "batch_size": int(batch_size),
+                        "hidden": tensor_metadata(z_diff),
+                        "history": tensor_metadata(history_batch),
+                    },
                 ):
-                    sampled, _trajectory = self.model.flowloss.sample(
-                        row_hidden,
-                        history,
-                        cfg=float(ar_state.cfg),
+                    graph_outputs = self._tail_graph_cache.execute(
+                        z_diff=z_diff,
+                        latent_history=history_batch,
+                        noise=noise,
+                        timesteps=timesteps,
+                        sde_random=sde_random,
+                        cfg=cfg_tensor,
+                        sigma=sigma_tensor,
+                        temperature=temperature_tensor,
+                        validate_cfg=False,
+                    )
+                sampled = graph_outputs.sampled
+                stop_prob = graph_outputs.stop_prob
+                feedback_all = graph_outputs.feedback_embeddings
+            else:
+                with ming_profile_event(
+                    batch_event_id,
+                    "ming_flowloss_batch_sample",
+                    {
+                        "batch_size": int(batch_size),
+                        "hidden": tensor_metadata(z_diff),
+                        "history": tensor_metadata(history_batch),
+                    },
+                ):
+                    sampled, _trajectory = self.model.flowloss.sample_with_noise(
+                        z=z_diff,
+                        latent_history=history_batch,
+                        noise=noise,
+                        cfg=cfg_tensor,
                         patch_size=int(self.model.patch_size),
-                        sigma=float(ar_state.sigma),
-                        temperature=float(ar_state.flow_temperature),
+                        sigma=sigma_tensor,
+                        temperature=temperature_tensor,
+                        timesteps=timesteps,
+                        sde_random=sde_random,
+                        validate_cfg=False,
                     )
-                if not isinstance(sampled, torch.Tensor):
-                    sampled = torch.as_tensor(sampled)
-                if sampled.ndim == 2:
-                    sampled = sampled.unsqueeze(0)
-                expected = (
-                    1,
-                    int(self.model.patch_size),
-                    int(self.model.latent_dim),
+            if not isinstance(sampled, torch.Tensor):
+                raise RuntimeError("Ming TTS sampled latent must be a tensor")
+            expected = (
+                int(batch_size),
+                int(self.model.patch_size),
+                int(self.model.latent_dim),
+            )
+            if tuple(sampled.shape) != expected:
+                raise RuntimeError(
+                    f"Ming TTS sampled latent must have shape {expected}, "
+                    f"got {tuple(sampled.shape)}"
                 )
-                if tuple(sampled.shape) != expected:
+
+            if feedback_all is not None:
+                expected_feedback = (int(batch_size), int(hidden_size))
+                if tuple(feedback_all.shape) != expected_feedback:
                     raise RuntimeError(
-                        f"Ming TTS sampled latent must have shape {expected}, "
-                        f"got {tuple(sampled.shape)}"
+                        "Ming TTS tail graph feedback shape mismatch: "
+                        f"expected {expected_feedback}, got {tuple(feedback_all.shape)}"
                     )
-                sampled_chunk = sampled.squeeze(0).detach()
-                ar_state.generated_latents.append(sampled_chunk)
-                result.generated_latents[row_idx] = sampled_chunk
-
+            else:
                 with ming_profile_event(
-                    sched_req.request_id,
-                    "ming_stop_head",
-                    row_metadata,
+                    batch_event_id,
+                    "ming_stop_head_batch",
+                    {
+                        "batch_size": int(batch_size),
+                        "hidden": tensor_metadata(z_diff),
+                    },
                 ):
-                    stop_prob = self.model.stop_head(row_hidden).softmax(dim=-1)[
-                        0,
-                        0,
-                        1,
-                    ]
-                    stop = bool(stop_prob.item() > 0.5 and step > 3)
-                ar_state.generated_last_chunk.append(stop)
-                result.stop_flags[row_idx] = stop
-                if stop:
-                    ar_state.stop_step = step
-                    next_ids.append(int(ar_state.audio_eos_token_id))
-                    ar_state.generation_steps = step + 1
-                    continue
+                    stop_prob = self.model.stop_head(z_diff).softmax(dim=-1)[:, 0, 1]
+            if tuple(stop_prob.shape) != (int(batch_size),):
+                raise RuntimeError(
+                    "Ming TTS stop probability shape mismatch: "
+                    f"got {tuple(stop_prob.shape)}"
+                )
+            with ming_profile_event(
+                batch_event_id,
+                "ming_stop_decision_batch",
+                {
+                    "batch_size": int(batch_size),
+                    "stop_prob": tensor_metadata(stop_prob),
+                },
+            ):
+                stop_flags = (stop_prob > 0.5) & (steps_tensor > 3)
 
-                if ar_state.latent_history is None:
-                    raise RuntimeError("Ming TTS latent_history must be initialized")
-                update_ming_ar_latent_history_(ar_state.latent_history, sampled)
-
-                next_ids.append(int(ar_state.audio_patch_token_id))
-                will_finish_by_length = step + 1 >= int(ar_state.max_decode_steps)
-                if not will_finish_by_length:
-                    with ming_profile_event(
-                        sched_req.request_id,
-                        "ming_feedback_proj",
-                        row_metadata,
-                    ):
-                        feedback = self.model.linear_proj_audio(sampled)
-                    feedback = feedback.reshape(-1).detach()
-                    if int(feedback.shape[0]) != hidden_size:
-                        raise RuntimeError(
-                            "Ming TTS feedback projection hidden size mismatch: "
-                            f"{int(feedback.shape[0])} != {hidden_size}"
-                        )
-                    result.feedback_embeddings[row_idx].copy_(
-                        feedback.to(
-                            device=result.feedback_embeddings.device,
-                            dtype=result.feedback_embeddings.dtype,
-                        )
+            length_flags = steps_tensor + 1 >= max_steps_tensor
+            continuation_flags = torch.logical_not(
+                torch.logical_or(stop_flags, length_flags)
+            )
+            feedback_rows = torch.nonzero(
+                continuation_flags,
+                as_tuple=False,
+            ).flatten()
+            feedback_row_count = int(feedback_rows.numel())
+            feedback_by_row: dict[int, torch.Tensor] = {}
+            feedback_rows_list: list[int] = []
+            if feedback_all is not None:
+                feedback_rows_list = [
+                    int(row) for row in feedback_rows.detach().cpu().tolist()
+                ]
+            elif feedback_row_count:
+                with ming_profile_event(
+                    batch_event_id,
+                    "ming_feedback_proj_batch",
+                    {
+                        "batch_size": int(batch_size),
+                        "continuation_count": int(feedback_row_count),
+                        "sampled": tensor_metadata(sampled),
+                    },
+                ):
+                    feedback_batch = self.model.linear_proj_audio(
+                        sampled.index_select(0, feedback_rows)
                     )
-                    result.feedback_mask[row_idx] = True
-                    ar_state.pending_feedback_queue.append(feedback)
-                ar_state.generation_steps = step + 1
+                feedback_batch = feedback_batch.reshape(feedback_row_count, -1)
+                if int(feedback_batch.shape[1]) != hidden_size:
+                    raise RuntimeError(
+                        "Ming TTS feedback projection hidden size mismatch: "
+                        f"{int(feedback_batch.shape[1])} != {hidden_size}"
+                    )
+                feedback_rows_list = [
+                    int(row) for row in feedback_rows.detach().cpu().tolist()
+                ]
+                for local_idx, row_idx in enumerate(feedback_rows_list):
+                    feedback_by_row[row_idx] = feedback_batch[local_idx].detach()
+
+            stop_list = [bool(value) for value in stop_flags.detach().cpu().tolist()]
+            length_list = [
+                bool(value) for value in length_flags.detach().cpu().tolist()
+            ]
+            with ming_profile_event(
+                batch_event_id,
+                "ming_tail_scatter",
+                {
+                    "batch_size": int(batch_size),
+                    "stop_count": int(sum(stop_list)),
+                    "length_count": int(sum(length_list)),
+                    "continuation_count": int(len(feedback_rows_list)),
+                },
+            ):
+                for row_idx, ar_state in enumerate(ar_states):
+                    step = steps[row_idx]
+                    result.generation_steps[row_idx] = step
+                    sampled_row = sampled[row_idx : row_idx + 1]
+                    sampled_chunk = sampled_row.squeeze(0).detach()
+                    ar_state.generated_latents.append(sampled_chunk)
+                    result.generated_latents[row_idx] = sampled_chunk
+
+                    stop = stop_list[row_idx]
+                    ar_state.generated_last_chunk.append(stop)
+                    result.stop_flags[row_idx] = stop
+                    if stop:
+                        ar_state.stop_step = step
+                        next_ids.append(int(ar_state.audio_eos_token_id))
+                        ar_state.generation_steps = step + 1
+                        continue
+
+                    if ar_state.latent_history is None:
+                        raise RuntimeError(
+                            "Ming TTS latent_history must be initialized"
+                        )
+                    update_ming_ar_latent_history_(
+                        ar_state.latent_history,
+                        sampled_row,
+                    )
+
+                    next_ids.append(int(ar_state.audio_patch_token_id))
+                    if not length_list[row_idx]:
+                        if feedback_all is not None:
+                            feedback = feedback_all[row_idx].detach()
+                        else:
+                            feedback = feedback_by_row[row_idx]
+                        result.feedback_embeddings[row_idx].copy_(
+                            feedback.to(
+                                device=result.feedback_embeddings.device,
+                                dtype=result.feedback_embeddings.dtype,
+                            )
+                        )
+                        result.feedback_mask[row_idx] = True
+                        ar_state.pending_feedback_queue.append(feedback)
+                    ar_state.generation_steps = step + 1
 
         result.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)
@@ -282,8 +812,21 @@ class MingTTSModelRunner(ModelRunner):
 
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
-        self._ar_tail = MingARTailExecutor(self.model)
         server_args = getattr(tp_worker, "server_args", None)
+        tail_graph_max_bs = getattr(
+            server_args,
+            "ming_ar_tail_cuda_graph_max_bs",
+            None,
+        )
+        if tail_graph_max_bs is None:
+            tail_graph_max_bs = getattr(server_args, "max_running_requests", None)
+        self._ar_tail = MingARTailExecutor(
+            self.model,
+            enable_cuda_graph=bool(
+                getattr(server_args, "enable_ming_ar_tail_cuda_graph", False)
+            ),
+            cuda_graph_max_bs=tail_graph_max_bs,
+        )
         self._tp_rank = int(getattr(tp_worker, "tp_rank", 0) or 0)
         self._tp_size = int(getattr(server_args, "tp_size", 1) or 1)
         self._feedback_buffer_contract = self._capture_feedback_buffer_contract()
