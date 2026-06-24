@@ -7,18 +7,31 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
+
 from .cfm import CFM
-from .dit import DiT
 
 
 class FlowLoss(nn.Module):
     """Ming-Omni-TTS flow-matching latent head."""
 
-    def __init__(self, z_channels: int, llm_cond_dim: int, **kwargs) -> None:
+    def __init__(
+        self,
+        z_channels: int,
+        llm_cond_dim: int,
+        patch_size: int | None = None,
+        history_patch_size: int | None = None,
+        **dit_kwargs,
+    ) -> None:
         super().__init__()
+        del patch_size, history_patch_size
         self.z_channels = z_channels
         self.cfm = CFM(
-            model=DiT(in_channels=z_channels, llm_cond_dim=llm_cond_dim, **kwargs)
+            model=DiT(
+                in_channels=z_channels,
+                llm_cond_dim=llm_cond_dim,
+                **dit_kwargs,
+            )
         )
 
     def forward(
@@ -37,22 +50,26 @@ class FlowLoss(nn.Module):
             patch_size=patch_size,
         )
 
-    def sample(
+    def sample_final_with_noise(
         self,
         z: torch.Tensor,
         latent_history: torch.Tensor,
-        cfg: float = 1.0,
-        patch_size: int = 1,
-        sigma: float = 0.25,
-        temperature: float = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        noise = torch.randn(z.shape[0], self.z_channels, patch_size, device=z.device)
-        return self.cfm.sample(
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: float | torch.Tensor = 1.0,
+        sigma: float | torch.Tensor = 0.25,
+        temperature: float | torch.Tensor = 0,
+        validate_cfg: bool = True,
+    ) -> torch.Tensor:
+        return self.cfm.sample_final_with_noise(
             noise=noise,
             c=z,
             latent_history=latent_history,
             cfg_scale=cfg,
-            patch_size=patch_size,
             sigma=sigma,
             temperature=temperature,
+            timesteps=timesteps,
+            sde_random=sde_random,
+            validate_cfg=validate_cfg,
         )

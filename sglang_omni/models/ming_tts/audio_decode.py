@@ -9,8 +9,8 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
-from sglang_omni.models.ming_tts.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
     MingTTSState,
@@ -50,11 +50,6 @@ class MingAudioDecoder(torch.nn.Module):
             config = AudioVAEconfig(
                 sample_rate=getattr(audio_config, "sample_rate", None),
                 enc_kwargs=getattr(audio_config, "enc_kwargs", None),
-                semantic_module_kwargs=getattr(
-                    audio_config,
-                    "semantic_module_kwargs",
-                    None,
-                ),
                 dec_kwargs=getattr(audio_config, "dec_kwargs", None),
                 init_method=getattr(audio_config, "init_method", "normal"),
                 patch_size=getattr(audio_config, "patch_size", -1),
