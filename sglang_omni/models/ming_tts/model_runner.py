@@ -822,8 +822,8 @@ class MingTTSModelRunner(ModelRunner):
             tail_graph_max_bs = getattr(server_args, "max_running_requests", None)
         self._ar_tail = MingARTailExecutor(
             self.model,
-            enable_cuda_graph=bool(
-                getattr(server_args, "enable_ming_ar_tail_cuda_graph", False)
+            enable_cuda_graph=not bool(
+                getattr(server_args, "disable_cuda_graph", True)
             ),
             cuda_graph_max_bs=tail_graph_max_bs,
         )

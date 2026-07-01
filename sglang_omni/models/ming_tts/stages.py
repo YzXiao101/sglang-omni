@@ -188,15 +188,11 @@ def create_sglang_tts_engine_executor(
             user_overrides.pop("enable_ming_ar_projected_prefill_radix_cache"),
             name="server_args_overrides.enable_ming_ar_projected_prefill_radix_cache",
         )
-    tail_cuda_graph_enabled = _coerce_bool(
-        enable_ming_ar_tail_cuda_graph,
-        name="enable_ming_ar_tail_cuda_graph",
-    )
+    # Legacy compatibility only. Tail graph now follows AR graph state so the
+    # serving matrix has one fewer independent control.
+    del enable_ming_ar_tail_cuda_graph
     if "enable_ming_ar_tail_cuda_graph" in user_overrides:
-        tail_cuda_graph_enabled = _coerce_bool(
-            user_overrides.pop("enable_ming_ar_tail_cuda_graph"),
-            name="server_args_overrides.enable_ming_ar_tail_cuda_graph",
-        )
+        user_overrides.pop("enable_ming_ar_tail_cuda_graph")
     cuda_graph_values = {value for _, value in cuda_graph_settings}
     if len(cuda_graph_values) > 1:
         detail = ", ".join(f"{name}={value}" for name, value in cuda_graph_settings)
@@ -365,15 +361,17 @@ def create_sglang_tts_engine_executor(
         context_length=int(context_length),
         **overrides,
     )
-    server_args.enable_ming_ar_tail_cuda_graph = bool(tail_cuda_graph_enabled)
-    tail_cuda_graph_max_bs = overrides.get("max_running_requests")
-    server_args.ming_ar_tail_cuda_graph_max_bs = (
-        int(tail_cuda_graph_max_bs) if tail_cuda_graph_max_bs is not None else None
-    )
     requested_disable_cuda_graph = bool(
         getattr(server_args, "disable_cuda_graph", False)
     )
     want_cuda_graph = not requested_disable_cuda_graph
+    server_args.enable_ming_ar_tail_cuda_graph = bool(want_cuda_graph)
+    tail_cuda_graph_max_bs = overrides.get("max_running_requests")
+    server_args.ming_ar_tail_cuda_graph_max_bs = (
+        int(tail_cuda_graph_max_bs)
+        if want_cuda_graph and tail_cuda_graph_max_bs is not None
+        else None
+    )
     if want_cuda_graph:
         # Bootstrap SGLang allocators with graph capture disabled, then capture
         # explicitly after Ming's fixed feedback buffers and server args are ready.
@@ -401,7 +399,7 @@ def create_sglang_tts_engine_executor(
         getattr(server_args, "enable_torch_compile", None),
         getattr(server_args, "torch_compile_max_bs", None),
         projected_prefill_radix_cache_enabled,
-        tail_cuda_graph_enabled,
+        want_cuda_graph,
         nccl_port,
     )
     (
@@ -435,7 +433,7 @@ def create_sglang_tts_engine_executor(
         "projected_prefill_radix_cache_enabled": bool(
             projected_prefill_radix_cache_enabled
         ),
-        "tail_cuda_graph_enabled": bool(tail_cuda_graph_enabled),
+        "tail_cuda_graph_enabled": bool(want_cuda_graph),
     }
     logger.info(
         "Ming AR CUDA graph startup: enabled=%s target=%s layer_count=%s "
