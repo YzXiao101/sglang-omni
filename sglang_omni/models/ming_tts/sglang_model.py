@@ -847,10 +847,12 @@ class MingTTSSGLangModel(nn.Module):
         self.history_patch_size = int(
             self.config.ditar_config.get("history_patch_size", self.patch_size)
         )
+        aggregator_config = dict(self.config.aggregator_config)
+        aggregator_config.setdefault("attn_backend", "torch")
         self.linear_proj_audio = Aggregator(
             in_channels=self.latent_dim,
             llm_input_dim=self.hidden_size,
-            **self.config.aggregator_config,
+            **aggregator_config,
         )
         self.flowloss = FlowLoss(
             z_channels=self.latent_dim,
