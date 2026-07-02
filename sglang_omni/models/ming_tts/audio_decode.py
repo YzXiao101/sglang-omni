@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
+from copy import deepcopy
 from typing import Any
 
 import torch
@@ -43,14 +44,14 @@ class MingAudioDecoder(torch.nn.Module):
         dtype: str | torch.dtype = "bfloat16",
     ) -> "MingAudioDecoder":
         if isinstance(audio_config, AudioVAEconfig):
-            config = audio_config
+            config = deepcopy(audio_config)
         elif isinstance(audio_config, dict):
-            config = AudioVAEconfig(**audio_config)
+            config = AudioVAEconfig(**deepcopy(audio_config))
         else:
             config = AudioVAEconfig(
                 sample_rate=getattr(audio_config, "sample_rate", None),
-                enc_kwargs=getattr(audio_config, "enc_kwargs", None),
-                dec_kwargs=getattr(audio_config, "dec_kwargs", None),
+                enc_kwargs=deepcopy(getattr(audio_config, "enc_kwargs", None)),
+                dec_kwargs=deepcopy(getattr(audio_config, "dec_kwargs", None)),
                 init_method=getattr(audio_config, "init_method", "normal"),
                 patch_size=getattr(audio_config, "patch_size", -1),
             )
@@ -65,6 +66,10 @@ class MingAudioDecoder(torch.nn.Module):
                 "Ming-Omni-TTS AudioVAE config sample_rate must be "
                 f"{MING_TTS_SAMPLE_RATE}, got {sample_rate}"
             )
+        # Match Ming-Omni talker's Qwen2 backbone policy and avoid Transformers
+        # auto-selecting a flash-attention path for AudioVAE Qwen2 blocks.
+        for stage_kwargs in (config.enc_kwargs, config.dec_kwargs):
+            stage_kwargs["backbone"]["_attn_implementation"] = "sdpa"
         if isinstance(dtype, torch.dtype):
             torch_dtype = dtype
         elif dtype == "auto":
