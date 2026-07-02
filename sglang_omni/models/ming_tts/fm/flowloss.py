@@ -26,6 +26,7 @@ class FlowLoss(nn.Module):
         super().__init__()
         del patch_size, history_patch_size
         self.z_channels = z_channels
+        dit_kwargs.setdefault("attn_backend", "torch")
         self.cfm = CFM(
             model=DiT(
                 in_channels=z_channels,
