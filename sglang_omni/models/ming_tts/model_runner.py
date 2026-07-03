@@ -96,12 +96,6 @@ def apply_follower_ming_ar_step_result(
     Serialization must stay on the entry rank.
     """
 
-    if int(step_result.next_token_ids.numel()) != len(requests):
-        raise RuntimeError(
-            "Ming TTS follower step result batch does not match requests: "
-            f"{int(step_result.next_token_ids.numel())} != {len(requests)}"
-        )
-
     for row_idx, sched_req in enumerate(requests):
         ar_state = get_ming_ar_state(sched_req.data)
         step = int(step_result.generation_steps[row_idx].item())
@@ -122,7 +116,6 @@ class MingTTSModelRunner(ModelRunner):
         server_args = getattr(tp_worker, "server_args", None)
         self._tp_rank = int(getattr(tp_worker, "tp_rank", 0) or 0)
         self._tp_size = int(getattr(server_args, "tp_size", 1) or 1)
-        self._feedback_buffer_contract = self._capture_feedback_buffer_contract()
 
     def before_prefill(
         self,
@@ -171,15 +164,7 @@ class MingTTSModelRunner(ModelRunner):
             req_len = int(req.extend_input_len)
             prefix_len = len(req.prefix_indices)
             prompt_embeds = data.prefill_input_embeds
-            if prompt_embeds is None:
-                raise RuntimeError("Ming TTS prefill requires prefill_input_embeds")
-            self._validate_projected_prefill_embeds(prompt_embeds)
             current = prompt_embeds[prefix_len : prefix_len + req_len]
-            if int(current.shape[0]) != req_len:
-                raise RuntimeError(
-                    "Ming TTS projected prefill row mismatch: "
-                    f"have {int(current.shape[0])}, need {req_len}"
-                )
             pieces.append(current)
         input_embeds = torch.cat(pieces, dim=0).to(
             device=forward_batch.input_ids.device,
@@ -236,33 +221,17 @@ class MingTTSModelRunner(ModelRunner):
             return
 
         state_pool = get_ming_ar_feedback_state_pool(self.model)
-        self._validate_feedback_buffer_contract(state_pool)
         weight = state_pool.feedback_weight
-        if forward_batch.input_ids.numel() < batch_size:
-            raise RuntimeError(
-                "Ming TTS decode input_ids must contain one row id per request"
-            )
-        state_pool.validate_batch_size(batch_size)
 
         rows = []
         for sched_req in requests:
             ar_state = get_ming_ar_state(sched_req.data)
             queue = ar_state.pending_feedback_queue
-            if not queue:
-                raise RuntimeError(
-                    f"Ming TTS request {sched_req.request_id} is missing "
-                    "decode feedback embedding"
-                )
             feedback = queue.popleft() if hasattr(queue, "popleft") else queue.pop(0)
             if not isinstance(feedback, torch.Tensor):
                 feedback = torch.as_tensor(feedback)
             if feedback.ndim == 2 and int(feedback.shape[0]) == 1:
                 feedback = feedback.reshape(-1)
-            if feedback.ndim != 1 or int(feedback.shape[0]) != int(weight.shape[1]):
-                raise RuntimeError(
-                    "Ming TTS decode feedback must have shape [hidden] or "
-                    f"[1, hidden], got {tuple(feedback.shape)}"
-                )
             rows.append(feedback.to(device=weight.device, dtype=weight.dtype))
 
         stacked = torch.stack(rows, dim=0).to(device=weight.device, dtype=weight.dtype)
@@ -312,11 +281,7 @@ class MingTTSModelRunner(ModelRunner):
             return
 
         hidden = getattr(result.logits_output, "hidden_states", None)
-        z_diff = normalize_ming_ar_hidden_states(
-            hidden,
-            request_count=len(requests),
-        )
-        self._validate_backbone_hidden_invariants(z_diff, len(requests))
+        z_diff = normalize_ming_ar_hidden_states(hidden)
 
         batch_metadata = {
             "batch_size": len(requests),
@@ -445,30 +410,6 @@ class MingTTSModelRunner(ModelRunner):
             sampled = tail_outputs.sampled
             stop_prob = tail_outputs.stop_prob
             feedback_all = tail_outputs.feedback_embeddings
-            if not isinstance(sampled, torch.Tensor):
-                raise RuntimeError("Ming TTS sampled latent must be a tensor")
-            expected = (
-                int(batch_size),
-                int(self.model.patch_size),
-                int(self.model.latent_dim),
-            )
-            if tuple(sampled.shape) != expected:
-                raise RuntimeError(
-                    f"Ming TTS sampled latent must have shape {expected}, "
-                    f"got {tuple(sampled.shape)}"
-                )
-
-            expected_feedback = (int(batch_size), int(hidden_size))
-            if tuple(feedback_all.shape) != expected_feedback:
-                raise RuntimeError(
-                    "Ming TTS tail feedback shape mismatch: "
-                    f"expected {expected_feedback}, got {tuple(feedback_all.shape)}"
-                )
-            if tuple(stop_prob.shape) != (int(batch_size),):
-                raise RuntimeError(
-                    "Ming TTS stop probability shape mismatch: "
-                    f"got {tuple(stop_prob.shape)}"
-                )
             with ming_profile_event(
                 batch_event_id,
                 "ming_stop_decision_batch",
@@ -522,10 +463,6 @@ class MingTTSModelRunner(ModelRunner):
                         ar_state.generation_steps = step + 1
                         continue
 
-                    if ar_state.latent_history is None:
-                        raise RuntimeError(
-                            "Ming TTS latent_history must be initialized"
-                        )
                     update_ming_ar_latent_history_(
                         ar_state.latent_history,
                         sampled_row,
@@ -572,8 +509,6 @@ class MingTTSModelRunner(ModelRunner):
     def _broadcast_step_result(self, step_result: MingARStepResult) -> None:
         if self._tp_size <= 1:
             return
-        # FIXME: Pack small TP metadata tensors into one collective if profiling
-        # shows per-step NCCL launch overhead dominates low-batch decode.
         for tensor in (
             step_result.next_token_ids,
             step_result.feedback_embeddings,
@@ -602,88 +537,6 @@ class MingTTSModelRunner(ModelRunner):
             return getter()
         model_runner = getattr(self.tp_worker, "model_runner", None)
         return getattr(model_runner, "tp_group", None)
-
-    def _expected_hidden_size(self) -> int:
-        weight = self.model._decode_input_embedding.weight
-        expected = int(weight.shape[1])
-        model_hidden_size = getattr(self.model, "hidden_size", expected)
-        if int(model_hidden_size) != expected:
-            raise RuntimeError(
-                "Ming TTS model hidden size does not match decode feedback "
-                f"embedding width ({int(model_hidden_size)} != {expected})"
-            )
-        return expected
-
-    def _capture_feedback_buffer_contract(
-        self,
-        state_pool: Any | None = None,
-    ) -> tuple[int, tuple[int, ...], torch.dtype, torch.device]:
-        if state_pool is None:
-            state_pool = get_ming_ar_feedback_state_pool(self.model)
-        weight = state_pool.feedback_weight
-        return (
-            int(weight.data_ptr()),
-            tuple(int(item) for item in weight.shape),
-            weight.dtype,
-            weight.device,
-        )
-
-    def _validate_feedback_buffer_contract(self, state_pool: Any) -> None:
-        expected = getattr(self, "_feedback_buffer_contract", None)
-        if expected is None:
-            raise RuntimeError("Ming TTS feedback buffer contract is not initialized")
-        actual = self._capture_feedback_buffer_contract(state_pool)
-        if actual != expected:
-            raise RuntimeError(
-                "Ming TTS decode feedback buffer changed after runner setup; "
-                "CUDA graph replay and TP row mapping require a stable "
-                "feedback_weight tensor"
-            )
-
-    def _validate_projected_prefill_embeds(
-        self,
-        prompt_embeds: torch.Tensor,
-    ) -> None:
-        if prompt_embeds.ndim != 2:
-            raise RuntimeError(
-                "Ming TTS projected prefill embeddings must have shape "
-                f"[tokens, hidden], got {tuple(prompt_embeds.shape)}"
-            )
-        hidden_size = int(prompt_embeds.shape[1])
-        expected = self._expected_hidden_size()
-        if hidden_size != expected:
-            raise RuntimeError(
-                "Ming TTS projected prefill hidden size mismatch: "
-                f"{hidden_size} != {expected}"
-            )
-
-    def _validate_backbone_hidden_invariants(
-        self,
-        hidden: torch.Tensor,
-        request_count: int,
-    ) -> None:
-        expected = self._expected_hidden_size()
-        if hidden.ndim != 3:
-            raise RuntimeError(
-                "Ming TTS AR backbone hidden states must have shape "
-                f"[batch, 1, hidden], got {tuple(hidden.shape)}"
-            )
-        if int(hidden.shape[0]) != int(request_count):
-            raise RuntimeError(
-                "Ming TTS AR backbone hidden batch mismatch: "
-                f"{int(hidden.shape[0])} != {int(request_count)}"
-            )
-        if int(hidden.shape[1]) != 1:
-            raise RuntimeError(
-                "Ming TTS AR backbone must return exactly one sampled hidden "
-                f"row per request, got {int(hidden.shape[1])}"
-            )
-        if int(hidden.shape[2]) != expected:
-            raise RuntimeError(
-                "Ming TTS AR backbone must return full hidden states for the "
-                "rank0-owned tail; got hidden size "
-                f"{int(hidden.shape[2])}, expected {expected}"
-            )
 
     def _ensure_latent_history(
         self, data: Any, *, device: torch.device

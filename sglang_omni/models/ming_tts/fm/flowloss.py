@@ -61,7 +61,6 @@ class FlowLoss(nn.Module):
         cfg: float | torch.Tensor = 1.0,
         sigma: float | torch.Tensor = 0.25,
         temperature: float | torch.Tensor = 0,
-        validate_cfg: bool = True,
     ) -> torch.Tensor:
         return self.cfm.sample_final_with_noise(
             noise=noise,
@@ -72,5 +71,4 @@ class FlowLoss(nn.Module):
             temperature=temperature,
             timesteps=timesteps,
             sde_random=sde_random,
-            validate_cfg=validate_cfg,
         )

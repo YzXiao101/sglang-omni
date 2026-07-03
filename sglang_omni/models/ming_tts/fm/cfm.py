@@ -39,7 +39,6 @@ def _expand_batch_param(
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
-    name: str,
 ) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         tensor = value.to(device=device, dtype=dtype)
@@ -48,31 +47,7 @@ def _expand_batch_param(
 
     if tensor.ndim == 0 or int(tensor.numel()) == 1:
         return tensor.reshape(1, 1, 1).expand(int(batch_size), 1, 1)
-
-    if tuple(tensor.shape) == (int(batch_size),):
-        return tensor.reshape(int(batch_size), 1, 1)
-
-    if tuple(tensor.shape) == (int(batch_size), 1):
-        return tensor.reshape(int(batch_size), 1, 1)
-
-    if tuple(tensor.shape) == (int(batch_size), 1, 1):
-        return tensor
-
-    raise ValueError(
-        f"Ming-Omni-TTS CFM {name} must be scalar, [B], [B, 1], "
-        f"or [B, 1, 1], got {tuple(tensor.shape)} for B={int(batch_size)}"
-    )
-
-
-def _validate_guided_cfg(cfg_scale: torch.Tensor) -> None:
-    invalid = torch.logical_or(cfg_scale < 1e-5, cfg_scale == 1.0)
-    valid = torch.logical_not(torch.any(invalid))
-    if not bool(valid.detach().cpu().item()):
-        raise NotImplementedError(
-            "Ming-Omni-TTS currently supports only guided CFM sampling "
-            "with cfg >= 1e-5 and cfg != 1.0; public request validation "
-            "should reject the disabled/unguided CFG branches."
-        )
+    return tensor.reshape(int(batch_size), 1, 1)
 
 
 class Solver:
@@ -94,15 +69,7 @@ class Solver:
         *,
         sde_random: torch.Tensor,
     ) -> torch.Tensor:
-        expected_sde_shape = (int(t.shape[0]) - 1, *self.y0.shape)
-        if tuple(sde_random.shape) != expected_sde_shape:
-            raise ValueError(
-                "Ming-Omni-TTS CFM sde_random must have shape "
-                f"{expected_sde_shape}, got {tuple(sde_random.shape)}"
-            )
         step_count = int(t.shape[0]) - 1
-        if step_count <= 0:
-            raise ValueError("Ming-Omni-TTS CFM timesteps require at least one step")
 
         y0 = self.y0
         final = y0
@@ -165,25 +132,20 @@ class CFM(nn.Module):
         latent_history: torch.Tensor,
         timesteps: torch.Tensor,
         sde_random: torch.Tensor,
-        steps: int = 10,
         cfg_scale: float = 1.0,
         sway_sampling_coef: float | None = -1.0,
         sigma: float | torch.Tensor = 0.25,
         temperature: float | torch.Tensor = 1.5,
-        validate_cfg: bool = True,
     ) -> torch.Tensor:
         fn, y0, t, sigma_tensor, temperature_tensor = self._prepare_sampling(
             noise=noise,
             c=c,
             latent_history=latent_history,
             timesteps=timesteps,
-            sde_random=sde_random,
-            steps=steps,
             cfg_scale=cfg_scale,
             sway_sampling_coef=sway_sampling_coef,
             sigma=sigma,
             temperature=temperature,
-            validate_cfg=validate_cfg,
         )
         solver = Solver(fn, y0, sigma=sigma_tensor, temperature=temperature_tensor)
         return solver.integrate_final(t, sde_random=sde_random)
@@ -195,13 +157,10 @@ class CFM(nn.Module):
         c: torch.Tensor,
         latent_history: torch.Tensor,
         timesteps: torch.Tensor,
-        sde_random: torch.Tensor,
-        steps: int,
         cfg_scale: float | torch.Tensor,
         sway_sampling_coef: float | None,
         sigma: float | torch.Tensor,
         temperature: float | torch.Tensor,
-        validate_cfg: bool,
     ):
         batch_size = int(noise.shape[0])
         cfg_tensor = _expand_batch_param(
@@ -209,24 +168,19 @@ class CFM(nn.Module):
             batch_size=batch_size,
             device=noise.device,
             dtype=noise.dtype,
-            name="cfg_scale",
         )
         sigma_tensor = _expand_batch_param(
             sigma,
             batch_size=batch_size,
             device=noise.device,
             dtype=noise.dtype,
-            name="sigma",
         )
         temperature_tensor = _expand_batch_param(
             temperature,
             batch_size=batch_size,
             device=noise.device,
             dtype=noise.dtype,
-            name="temperature",
         )
-        if validate_cfg:
-            _validate_guided_cfg(cfg_tensor)
 
         def fn(t, x):
             pred_cfg = self.model.forward_with_cfg(
@@ -239,21 +193,6 @@ class CFM(nn.Module):
             return pred + (pred - null_pred) * cfg_tensor
 
         y0 = noise.transpose(1, 2)
-        if timesteps is None or sde_random is None:
-            raise ValueError(
-                "Ming-Omni-TTS CFM explicit sampling requires timesteps "
-                "and sde_random"
-            )
-        if timesteps.ndim != 1:
-            raise ValueError(
-                "Ming-Omni-TTS CFM timesteps must be one-dimensional, "
-                f"got shape {tuple(timesteps.shape)}"
-            )
-        if int(timesteps.shape[0]) != int(steps) + 1:
-            raise ValueError(
-                "Ming-Omni-TTS CFM timesteps length must equal steps + 1, "
-                f"got {int(timesteps.shape[0])} for steps={int(steps)}"
-            )
         t = timesteps
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)

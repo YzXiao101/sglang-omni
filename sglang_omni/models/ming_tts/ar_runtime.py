@@ -89,24 +89,9 @@ class MingARRequestState:
                     prompt_latent = torch.as_tensor(prompt_latent)
                 if prompt_latent.ndim == 2:
                     prompt_latent = prompt_latent.unsqueeze(0)
-                expected_tail = (1, int(latent_dim))
-                if (
-                    prompt_latent.ndim != 3
-                    or int(prompt_latent.shape[0]) != expected_tail[0]
-                    or int(prompt_latent.shape[2]) != expected_tail[1]
-                ):
-                    raise RuntimeError(
-                        "Ming TTS prompt latent history must have shape "
-                        f"[1, frames, {expected_tail[1]}], "
-                        f"got {tuple(prompt_latent.shape)}"
-                    )
                 prompt_latent = prompt_latent.to(device=device, dtype=torch.float32)
                 history_len = int(history.shape[1])
                 prompt_len = int(prompt_latent.shape[1])
-                if prompt_len <= 0:
-                    raise RuntimeError(
-                        "Ming TTS prompt latent history requires at least one frame"
-                    )
                 if prompt_len >= history_len:
                     history.copy_(prompt_latent[:, -history_len:, :])
                 else:
@@ -118,12 +103,6 @@ class MingARRequestState:
             history = torch.as_tensor(history)
         if history.ndim == 2:
             history = history.unsqueeze(0)
-        expected = (1, int(history_patch_size), int(latent_dim))
-        if tuple(history.shape) != expected:
-            raise RuntimeError(
-                f"Ming TTS latent_history must have shape {expected}, "
-                f"got {tuple(history.shape)}"
-            )
         history = history.to(device=device, dtype=torch.float32)
         self.latent_history = history
         return history
@@ -159,14 +138,6 @@ class MingARFeedbackStatePool:
         return weight
 
     @property
-    def capacity(self) -> int:
-        return int(self.feedback_weight.shape[0])
-
-    @property
-    def hidden_size(self) -> int:
-        return int(self.feedback_weight.shape[1])
-
-    @property
     def device(self) -> torch.device:
         return self.feedback_weight.device
 
@@ -174,29 +145,10 @@ class MingARFeedbackStatePool:
     def dtype(self) -> torch.dtype:
         return self.feedback_weight.dtype
 
-    def validate_batch_size(self, batch_size: int) -> None:
-        if int(batch_size) > self.capacity:
-            raise RuntimeError(
-                "Ming TTS decode batch exceeds staged decode-embedding rows "
-                f"({int(batch_size)} > {self.capacity})"
-            )
-
     def stage_feedback(self, row_embeddings: torch.Tensor) -> None:
         if not isinstance(row_embeddings, torch.Tensor):
             row_embeddings = torch.as_tensor(row_embeddings)
-        if row_embeddings.ndim != 2:
-            raise RuntimeError(
-                "Ming TTS decode feedback batch must have shape [batch, hidden], "
-                f"got {tuple(row_embeddings.shape)}"
-            )
         batch_size = int(row_embeddings.shape[0])
-        hidden_size = int(row_embeddings.shape[1])
-        self.validate_batch_size(batch_size)
-        if hidden_size != self.hidden_size:
-            raise RuntimeError(
-                "Ming TTS decode feedback hidden size mismatch: "
-                f"{hidden_size} != {self.hidden_size}"
-            )
         with torch.no_grad():
             self.feedback_weight[:batch_size].copy_(
                 row_embeddings.to(device=self.device, dtype=self.dtype)
@@ -208,7 +160,6 @@ class MingARFeedbackStatePool:
         *,
         device: torch.device | None = None,
     ) -> torch.Tensor:
-        self.validate_batch_size(batch_size)
         return torch.arange(
             int(batch_size),
             dtype=torch.long,

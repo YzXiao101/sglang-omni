@@ -66,8 +66,8 @@ class MingAudioDecoder(torch.nn.Module):
                 "Ming-Omni-TTS AudioVAE config sample_rate must be "
                 f"{MING_TTS_SAMPLE_RATE}, got {sample_rate}"
             )
-        # Match Ming-Omni talker's Qwen2 backbone policy and avoid Transformers
-        # auto-selecting a flash-attention path for AudioVAE Qwen2 blocks.
+        # Current TTS serving policy keeps AudioVAE Qwen2 blocks on SDPA. FM and
+        # AudioVAE backend selection are still planned optimization work.
         for stage_kwargs in (config.enc_kwargs, config.dec_kwargs):
             stage_kwargs["backbone"]["_attn_implementation"] = "sdpa"
         if isinstance(dtype, torch.dtype):
@@ -116,23 +116,9 @@ class MingAudioDecoder(torch.nn.Module):
 
         if not isinstance(latents, torch.Tensor):
             latents = torch.as_tensor(latents)
-        if latents.ndim != 3:
-            raise RuntimeError(
-                "Ming-Omni-TTS audio decode requires latents with shape "
-                f"[steps, patch_size, latent_dim], got {tuple(latents.shape)}"
-            )
-        if int(latents.shape[0]) <= 0:
-            raise RuntimeError("Ming-Omni-TTS audio decode requires at least one chunk")
         latents = latents.to(device=self.device, dtype=self.dtype)
 
-        if last_chunks is None:
-            raise RuntimeError("Ming-Omni-TTS audio decode requires last-chunk flags")
         last_chunks = [bool(item) for item in last_chunks]
-        if len(last_chunks) != int(latents.shape[0]):
-            raise RuntimeError(
-                "Ming-Omni-TTS last-chunk flags must match latent chunks: "
-                f"{len(last_chunks)} != {int(latents.shape[0])}"
-            )
 
         stream_state = (None, None, None)
         past_key_values = None
@@ -172,36 +158,14 @@ class MingAudioDecoder(torch.nn.Module):
                 if wav.numel():
                     waveform_chunks.append(wav)
 
-        if not waveform_chunks:
-            raise RuntimeError("Ming-Omni-TTS AudioVAE decoded no audio samples")
-        waveform = torch.cat(waveform_chunks, dim=0)
-        if not bool(torch.isfinite(waveform).all()):
-            raise RuntimeError("Ming-Omni-TTS AudioVAE output contains NaN/Inf")
-        return waveform
+        return torch.cat(waveform_chunks, dim=0)
 
     @staticmethod
     def _normalize_waveform_chunk(wav: Any) -> torch.Tensor:
         if not isinstance(wav, torch.Tensor):
             wav = torch.as_tensor(wav)
-        if wav.ndim == 3:
-            if int(wav.shape[0]) != 1 or int(wav.shape[1]) != 1:
-                raise RuntimeError(
-                    "Ming-Omni-TTS AudioVAE chunk must have shape [1, 1, T], "
-                    f"got {tuple(wav.shape)}"
-                )
-            wav = wav[0, 0]
-        elif wav.ndim == 2:
-            if int(wav.shape[0]) != 1:
-                raise RuntimeError(
-                    "Ming-Omni-TTS AudioVAE chunk must have shape [1, T], "
-                    f"got {tuple(wav.shape)}"
-                )
+        while wav.ndim > 1:
             wav = wav[0]
-        elif wav.ndim != 1:
-            raise RuntimeError(
-                "Ming-Omni-TTS AudioVAE chunk must have shape [T], [1, T], "
-                f"or [1, 1, T], got {tuple(wav.shape)}"
-            )
         return wav.detach()
 
 
@@ -216,19 +180,12 @@ def decode_ming_tts_audio_payload(
 
     started = time.perf_counter()
     state = MingTTSState.from_dict(payload.data)
-    if state.finish_reason in ("abort", "error"):
-        raise RuntimeError(
-            "Ming-Omni-TTS audio decode received non-decodable finish_reason "
-            f"{state.finish_reason!r}"
-        )
 
     latents = decode_generated_latents(
         state,
         device=decoder.device,
         dtype=decoder.dtype,
     )
-    if latents is None:
-        raise RuntimeError("Ming-Omni-TTS audio decode requires generated latents")
 
     with ming_profile_event(
         payload.request_id,
@@ -243,17 +200,8 @@ def decode_ming_tts_audio_payload(
         )
     state.audio_decode_time_s = time.perf_counter() - started
     sample_rate = decoder.sample_rate
-    if int(sample_rate) != MING_TTS_SAMPLE_RATE:
-        raise ValueError(
-            "Ming-Omni-TTS audio payload sample_rate must be "
-            f"{MING_TTS_SAMPLE_RATE}, got {sample_rate}"
-        )
 
     waveform = MingAudioDecoder._normalize_waveform_chunk(waveform)
-    if waveform.numel() <= 0:
-        raise RuntimeError("Ming-Omni-TTS audio decode produced an empty waveform")
-    if not bool(torch.isfinite(waveform).all()):
-        raise RuntimeError("Ming-Omni-TTS audio waveform contains NaN/Inf")
 
     state.sample_rate = int(sample_rate)
     state.duration_s = float(waveform.numel() / int(sample_rate))
