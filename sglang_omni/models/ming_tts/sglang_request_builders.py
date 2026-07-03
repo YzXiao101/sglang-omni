@@ -40,7 +40,6 @@ class MingTTSSGLangRequestData(ARRequestData):
     generation_steps: int = 0
     suppress_tokens: list[int] | None = None
     prefill_input_embeds: Any = None
-    decode_input_embeds: Any = None
     row_prefill_radix_cache_enabled: bool = False
     row_prefill_extra_key: str | None = None
     row_prefill_input_ids: Any = None
@@ -81,20 +80,9 @@ def _build_prefill_input_embeds(
                 positions = [
                     int(position) + 1 for position in (state.spk_token_positions or [])
                 ]
-            if len(positions) != int(spk_emb.shape[0]):
-                raise ValueError(
-                    "Ming-Omni-TTS speaker embedding count does not match "
-                    "prompt injection positions: "
-                    f"{int(spk_emb.shape[0])} != {len(positions)}"
-                )
             projected_spk = model.spk_head(spk_emb)
             for row, position in enumerate(positions):
                 position = int(position)
-                if position < 0 or position >= int(prompt_embeds.shape[0]):
-                    raise ValueError(
-                        "Ming-Omni-TTS speaker injection position is outside "
-                        f"prompt length: {position}"
-                    )
                 prompt_embeds[position] = projected_spk[row].to(
                     device=prompt_embeds.device,
                     dtype=prompt_embeds.dtype,
@@ -106,16 +94,6 @@ def _build_prefill_input_embeds(
             start = state.prompt_latent_start_position
             if start is None:
                 start = int(state.audio_token_position) + 1
-            if token_count <= 0:
-                raise ValueError(
-                    "Ming-Omni-TTS prompt_latent_token_count must be > 0 "
-                    "when prompt_latent is present"
-                )
-            if int(prompt_latent.shape[1]) != token_count * int(model.patch_size):
-                raise ValueError(
-                    "Ming-Omni-TTS prompt latent frame count does not match "
-                    "prompt latent token count"
-                )
             projected_prompt = model.linear_proj_audio(
                 prompt_latent.to(dtype=dtype).reshape(
                     -1,
@@ -129,11 +107,6 @@ def _build_prefill_input_embeds(
                 int(projected_prompt.shape[-1]),
             )[0]
             end = int(start) + int(token_count)
-            if end > int(prompt_embeds.shape[0]):
-                raise ValueError(
-                    "Ming-Omni-TTS prompt latent injection range exceeds "
-                    f"prompt length: start={start}, count={token_count}"
-                )
             prompt_embeds[int(start) : end] = projected_prompt.to(
                 device=prompt_embeds.device,
                 dtype=prompt_embeds.dtype,
@@ -172,14 +145,6 @@ def make_ming_tts_scheduler_adapters(
 
         state = MingTTSState.from_dict(payload.data)
         input_ids_list = [int(token_id) for token_id in (state.input_ids or [])]
-        if not input_ids_list:
-            raise ValueError(
-                "Ming-Omni-TTS SGLang request requires preprocessed input_ids"
-            )
-        if state.audio_token_position is None:
-            raise ValueError(
-                "Ming-Omni-TTS SGLang request requires audio_token_position"
-            )
 
         vocab_size = None
         for owner in (
@@ -199,26 +164,6 @@ def make_ming_tts_scheduler_adapters(
                 break
         if vocab_size is None:
             vocab_size = int(len(tokenizer.tokenizer))
-
-        for name, token_id in (
-            ("audio_patch", int(tokenizer.special.audio_patch)),
-            ("audio_eos", int(tokenizer.special.end_of_audio)),
-        ):
-            if token_id < 0 or token_id >= vocab_size:
-                raise ValueError(
-                    "Ming-Omni-TTS control token id exceeds vocab_size: "
-                    f"{name}={token_id}, vocab_size={vocab_size}"
-                )
-        bad_prompt_ids = [
-            token_id
-            for token_id in input_ids_list
-            if token_id < 0 or token_id >= vocab_size
-        ]
-        if bad_prompt_ids:
-            raise ValueError(
-                "Ming-Omni-TTS prompt contains token ids outside vocab_size: "
-                f"{bad_prompt_ids[:8]!r}, vocab_size={vocab_size}"
-            )
 
         sampling_params = SamplingParams(
             max_new_tokens=int(state.max_decode_steps),
@@ -310,7 +255,6 @@ def make_ming_tts_scheduler_adapters(
         )
         req.tokenizer = None
         req._input_embeds_are_projected = prefill_input_embeds is not None
-        req._codec_suppress_tokens = None
 
         input_ids = torch.tensor(req_input_ids_list, dtype=torch.long)
         prompt_input_ids = torch.tensor(input_ids_list, dtype=torch.long)
@@ -359,10 +303,6 @@ def make_ming_tts_scheduler_adapters(
         ar_state = get_ming_ar_state(data)
         payload = data.stage_payload
         state = data.state or MingTTSState.from_dict(payload.data)
-        if not ar_state.generated_latents:
-            raise ValueError(
-                "Ming-Omni-TTS engine finished without generated latent chunks"
-            )
 
         latent_chunks: list[Any] = []
         for latent in ar_state.generated_latents:
@@ -373,11 +313,6 @@ def make_ming_tts_scheduler_adapters(
             )
             if tensor.ndim == 3 and int(tensor.shape[0]) == 1:
                 tensor = tensor.squeeze(0)
-            if tensor.ndim != 2:
-                raise ValueError(
-                    "Ming-Omni-TTS generated latent chunks must have shape "
-                    "[patch_size, latent_dim]"
-                )
             latent_chunks.append(tensor)
 
         raw = data.finish_reason
@@ -390,31 +325,6 @@ def make_ming_tts_scheduler_adapters(
 
         normalized = str(raw).lower() if raw is not None else None
         if ar_state.stop_step is not None:
-            if ar_state.generated_last_chunk and not bool(
-                ar_state.generated_last_chunk[-1]
-            ):
-                raise RuntimeError(
-                    "Ming-Omni-TTS stop_step was recorded but the final latent "
-                    "chunk is not marked as last_chunk"
-                )
-            stop_at_budget_boundary = int(ar_state.stop_step) + 1 >= int(
-                ar_state.max_decode_steps
-            ) and len(ar_state.generated_latents) >= int(ar_state.max_decode_steps)
-            length_at_budget_boundary = (
-                normalized is not None
-                and "length" in normalized
-                and stop_at_budget_boundary
-            )
-            if normalized is not None and not (
-                normalized in ("stop", "matched", "eos", "finish_matched_token")
-                or "matched" in normalized
-                or "eos" in normalized
-                or length_at_budget_boundary
-            ):
-                raise RuntimeError(
-                    "Ming-Omni-TTS stop-head recorded stop_step="
-                    f"{ar_state.stop_step}, but SGLang finished_reason was {raw!r}"
-                )
             finish_reason = "stop"
         elif normalized is not None:
             if "length" in normalized:
@@ -423,11 +333,6 @@ def make_ming_tts_scheduler_adapters(
                 finish_reason = "abort"
             elif "error" in normalized:
                 finish_reason = "error"
-            elif normalized in ("stop", "matched", "eos", "finish_matched_token"):
-                raise RuntimeError(
-                    "Ming-Omni-TTS SGLang reported a stop finish without a "
-                    "runner stop_step"
-                )
             else:
                 finish_reason = str(raw)
         elif len(ar_state.generated_latents) >= int(ar_state.max_decode_steps):

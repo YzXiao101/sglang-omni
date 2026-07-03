@@ -160,14 +160,6 @@ class _MingARTailGraph:
         noise: torch.Tensor,
         sde_random: torch.Tensor,
     ) -> MingARTailOutputs:
-        if int(inputs.hidden_states.shape[0]) != self.batch_size:
-            raise RuntimeError(
-                "Ming TTS tail graph batch mismatch: "
-                f"{int(inputs.hidden_states.shape[0])} != {self.batch_size}"
-            )
-        if self.graph is None or self.inputs is None or self.outputs is None:
-            raise RuntimeError("Ming TTS tail graph is not captured")
-
         self.inputs.hidden_states.copy_(inputs.hidden_states)
         self.inputs.latent_history.copy_(inputs.latent_history)
         self.inputs.cfg.copy_(inputs.cfg)
@@ -203,37 +195,16 @@ class _MingARTailGraphs:
         sde_random: torch.Tensor,
     ) -> MingARTailOutputs:
         batch_size = int(inputs.hidden_states.shape[0])
-        graph = self.graphs.get(batch_size)
-        if graph is None:
-            raise RuntimeError(
-                "Ming TTS tail graph has no exact batch capture for "
-                f"batch_size={batch_size}"
-            )
+        graph = self.graphs[batch_size]
         return graph.replay(inputs, noise=noise, sde_random=sde_random)
 
 
 def normalize_ming_ar_hidden_states(
     hidden: Any,
-    *,
-    request_count: int,
 ) -> torch.Tensor:
-    if not isinstance(hidden, torch.Tensor):
-        raise RuntimeError("Ming TTS model output did not include hidden states")
     if hidden.ndim == 2:
-        z_diff = hidden.unsqueeze(1)
-    elif hidden.ndim == 3 and int(hidden.shape[1]) == 1:
-        z_diff = hidden
-    else:
-        raise RuntimeError(
-            "Ming TTS hidden states must have shape [batch, hidden] or "
-            f"[batch, 1, hidden], got {tuple(hidden.shape)}"
-        )
-    if int(z_diff.shape[0]) != int(request_count):
-        raise RuntimeError(
-            "Ming TTS hidden batch does not match request batch: "
-            f"{int(z_diff.shape[0])} != {int(request_count)}"
-        )
-    return z_diff
+        return hidden.unsqueeze(1)
+    return hidden
 
 
 class MingBailingMoeAttention(nn.Module):
@@ -875,7 +846,6 @@ class MingTTSSGLangModel(nn.Module):
 
     @torch.no_grad()
     def run_ar_tail(self, inputs: MingARTailInputs) -> MingARTailOutputs:
-        self._check_ar_tail_cfg(inputs.cfg)
         noise, timesteps, sde_random = self._make_ar_tail_sampling_inputs(
             batch_size=int(inputs.hidden_states.shape[0]),
             device=inputs.hidden_states.device,
@@ -911,7 +881,6 @@ class MingTTSSGLangModel(nn.Module):
             temperature=inputs.temperature,
             timesteps=timesteps,
             sde_random=sde_random,
-            validate_cfg=False,
         )
         feedback = self.linear_proj_audio(sampled).reshape(
             int(inputs.hidden_states.shape[0]),
@@ -953,22 +922,7 @@ class MingTTSSGLangModel(nn.Module):
             if timesteps is None:
                 timesteps = row_timesteps
 
-        if timesteps is None:
-            raise RuntimeError("Ming TTS AR tail requires batch_size > 0")
         return torch.cat(noise_rows, dim=0), timesteps, torch.cat(sde_rows, dim=1)
-
-    @staticmethod
-    def _check_ar_tail_cfg(cfg: torch.Tensor | list[float]) -> None:
-        if isinstance(cfg, torch.Tensor):
-            invalid = torch.logical_or(cfg < 1e-5, cfg == 1.0)
-            is_invalid = bool(torch.any(invalid).detach().cpu().item())
-        else:
-            is_invalid = any(value < 1e-5 or value == 1.0 for value in cfg)
-        if is_invalid:
-            raise NotImplementedError(
-                "Ming-Omni-TTS tail requires guided CFM sampling "
-                "with cfg >= 1e-5 and cfg != 1.0"
-            )
 
     @torch.no_grad()
     def forward(

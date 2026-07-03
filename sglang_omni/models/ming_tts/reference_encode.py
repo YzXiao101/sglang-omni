@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference audio encoding for Ming-Omni-TTS zero-shot TTS."""
+"""Reference audio encoding for Ming-Omni-TTS reference-conditioned TTS."""
 
 from __future__ import annotations
 
@@ -60,11 +60,6 @@ class MingSpeakerEmbeddingExtractor:
 
         if not isinstance(waveform, torch.Tensor):
             waveform = torch.as_tensor(waveform)
-        if waveform.ndim != 2 or int(waveform.shape[0]) != 1:
-            raise ValueError(
-                "Ming-Omni-TTS speaker reference waveform must have shape [1, T], "
-                f"got {tuple(waveform.shape)}"
-            )
         feat = kaldi.fbank(
             waveform,
             num_mel_bins=80,
@@ -133,12 +128,6 @@ class MingTTSReferenceEncoder:
         state = MingTTSState.from_dict(payload.data)
         if state.ref_audio is None:
             return payload
-        if state.ref_text is None or not str(state.ref_text).strip():
-            raise ValueError("Ming-Omni-TTS reference audio requires ref_text")
-        if not isinstance(state.ref_audio, str):
-            raise ValueError(
-                "Ming-Omni-TTS reference audio must be a local audio path string"
-            )
 
         with ming_profile_event(
             payload.request_id,
@@ -174,17 +163,7 @@ class MingTTSReferenceEncoder:
                     prompt_waveform,
                     waveform_length,
                 )
-        if prompt_latent.ndim != 3 or int(prompt_latent.shape[0]) != 1:
-            raise RuntimeError(
-                "Ming-Omni-TTS prompt latent must have shape [1, frames, latent_dim], "
-                f"got {tuple(prompt_latent.shape)}"
-            )
         frames = int(prompt_latent.shape[1])
-        if frames % self.patch_size != 0:
-            raise RuntimeError(
-                "Ming-Omni-TTS prompt latent frames must be divisible by patch_size: "
-                f"frames={frames}, patch_size={self.patch_size}"
-            )
         prompt_latent_token_count = frames // self.patch_size
         with ming_profile_event(
             payload.request_id,

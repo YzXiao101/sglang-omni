@@ -163,9 +163,9 @@ def create_sglang_tts_engine_executor(
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
-    # FIXME: Keep this mode-matrix validation explicit while Ming AR graph,
-    # radix, and TP support is still being proven. Once temporary benchmark
-    # wrappers are removed, collapse this block into a smaller config validator.
+    # Keep graph/cache/TP compatibility checks next to server-arg construction.
+    # These combinations affect SGLang pools, CUDA graph capture, and Ming's
+    # fixed feedback rows before the scheduler starts.
     user_overrides = dict(server_args_overrides or {})
     cuda_graph_settings: list[tuple[str, bool]] = []
     explicit_cuda_graph_arg = _coerce_bool(
@@ -370,8 +370,8 @@ def create_sglang_tts_engine_executor(
 
     logger.info(
         "Ming AR SGLang startup: gpu_id=%s tp_rank=%s/%s pid=%s "
-        "total_gpu_memory_fraction=%s requested_disable_cuda_graph=%s "
-        "bootstrap_disable_cuda_graph=%s "
+        "total_gpu_memory_fraction=%s ar_cuda_graph_requested=%s "
+        "runtime_disable_cuda_graph=%s bootstrap_disable_cuda_graph=%s "
         "cuda_graph_bs=%s cuda_graph_max_bs=%s enable_torch_compile=%s "
         "torch_compile_max_bs=%s projected_prefill_radix_cache=%s "
         "tail_cuda_graph=%s nccl_port=%s",
@@ -380,6 +380,7 @@ def create_sglang_tts_engine_executor(
         tp_size,
         os.getpid(),
         total_gpu_memory_fraction,
+        want_cuda_graph,
         requested_disable_cuda_graph,
         bootstrap_disable_cuda_graph,
         getattr(server_args, "cuda_graph_bs", None),
