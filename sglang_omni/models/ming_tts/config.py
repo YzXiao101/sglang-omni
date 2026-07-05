@@ -29,6 +29,14 @@ class MingTTSPipelineConfig(PipelineConfig):
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         return {"talker": TTS_ENGINE_STAGE}
 
+    @classmethod
+    def talker_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"talker": TTS_ENGINE_STAGE}
+
+    @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"generation": TTS_ENGINE_STAGE}
+
     model_path: str
     entry_stage: str = PREPROCESSING_STAGE
     stages: list[StageConfig] = [
@@ -96,11 +104,6 @@ class MingTTSPipelineConfig(PipelineConfig):
                 raise ValueError(
                     "Ming-Omni-TTS tts_engine TP GPU list length must match "
                     f"tp_size; got gpu={stage.gpu!r}, tp_size={stage.tp_size}."
-                )
-            if len(set(stage.gpu)) != len(stage.gpu):
-                raise ValueError(
-                    "Ming-Omni-TTS tts_engine TP GPU ids must be distinct; "
-                    f"got gpu={stage.gpu!r}."
                 )
 
 
