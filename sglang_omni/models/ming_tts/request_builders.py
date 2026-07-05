@@ -8,6 +8,7 @@ from typing import Any
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_DEFAULT_MAX_DECODE_STEPS,
     MingTTSState,
+    store_ming_tts_state,
 )
 from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
@@ -374,11 +375,7 @@ def _preprocess_ming_tts_payload_impl(
         state.audio_token_position = plan.audio_token_position
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
-    return StagePayload(
-        request_id=payload.request_id,
-        request=payload.request,
-        data=state.to_dict(),
-    )
+    return store_ming_tts_state(payload, state)
 
 
 __all__ = [

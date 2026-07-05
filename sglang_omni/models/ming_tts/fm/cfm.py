@@ -125,7 +125,7 @@ class CFM(nn.Module):
         return loss.mean()
 
     @torch.no_grad()
-    def sample_final_with_noise(
+    def sample(
         self,
         noise: torch.Tensor,
         c: torch.Tensor,

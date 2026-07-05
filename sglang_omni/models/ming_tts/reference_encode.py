@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
 from pathlib import Path
 from typing import Any
 
+import onnxruntime
+import torch
+import torchaudio
+import torchaudio.compliance.kaldi as kaldi
+import torchaudio.functional as F
+
 from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
+from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
-    MingTTSState,
     encode_prompt_latent,
     encode_speaker_embedding,
+    load_ming_tts_state,
+    store_ming_tts_state,
 )
 from sglang_omni.models.ming_tts.profile_events import (
     ming_profile_event,
@@ -28,14 +34,6 @@ class MingSpeakerEmbeddingExtractor:
     """CampPlus speaker embedding extractor matching the official reference path."""
 
     def __init__(self, campplus_model: str, *, target_sr: int = 16000) -> None:
-        try:
-            import onnxruntime
-        except ImportError as exc:
-            raise RuntimeError(
-                "Ming-Omni-TTS reference audio requires onnxruntime for "
-                "campplus.onnx speaker embedding extraction."
-            ) from exc
-
         session_options = onnxruntime.SessionOptions()
         session_options.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -49,15 +47,6 @@ class MingSpeakerEmbeddingExtractor:
         self.target_sr = int(target_sr)
 
     def __call__(self, waveform: Any) -> Any:
-        try:
-            import torch
-            import torchaudio.compliance.kaldi as kaldi
-        except ImportError as exc:
-            raise RuntimeError(
-                "Ming-Omni-TTS reference audio requires torch and torchaudio "
-                "kaldi compliance features for CampPlus speaker embeddings."
-            ) from exc
-
         if not isinstance(waveform, torch.Tensor):
             waveform = torch.as_tensor(waveform)
         feat = kaldi.fbank(
@@ -100,7 +89,7 @@ class MingTTSReferenceEncoder:
     @classmethod
     def from_config(
         cls,
-        audio_config: Any,
+        audio_config: AudioVAEconfig,
         *,
         checkpoint_dir: str,
         device: str = "cuda:0",
@@ -125,7 +114,7 @@ class MingTTSReferenceEncoder:
         tokenizer: MingTTSTokenizerBundle,
         context_length: int,
     ) -> StagePayload:
-        state = MingTTSState.from_dict(payload.data)
+        state = load_ming_tts_state(payload)
         if state.ref_audio is None:
             return payload
 
@@ -138,11 +127,6 @@ class MingTTSReferenceEncoder:
                 state.ref_audio
             )
         prompt_waveform = self._pad_waveform(prompt_waveform)
-
-        try:
-            import torch
-        except ImportError as exc:
-            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
 
         with torch.inference_mode():
             waveform_length = torch.tensor(
@@ -181,10 +165,6 @@ class MingTTSReferenceEncoder:
             setattr(state, field_name, value)
         state.prompt_latent_token_count = int(prompt_latent_token_count)
         state.prompt_text = str(state.ref_text)
-        state.speaker_fingerprint = self._speaker_fingerprint(
-            state.ref_audio,
-            state.ref_text,
-        )
 
         plan = build_ming_tts_prompt(
             state,
@@ -210,22 +190,9 @@ class MingTTSReferenceEncoder:
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
 
-        return StagePayload(
-            request_id=payload.request_id,
-            request=payload.request,
-            data=state.to_dict(),
-        )
+        return store_ming_tts_state(payload, state)
 
     def _load_reference_waveform(self, path: str) -> tuple[Any, Any]:
-        try:
-            import torchaudio
-            import torchaudio.functional as F
-        except ImportError as exc:
-            raise RuntimeError(
-                "Ming-Omni-TTS reference audio requires torchaudio to load and "
-                "resample prompt wav files."
-            ) from exc
-
         waveform, sample_rate = torchaudio.load(path)
         if waveform.ndim != 2 or int(waveform.shape[0]) != 1:
             raise ValueError(
@@ -248,11 +215,6 @@ class MingTTSReferenceEncoder:
         return waveform, speaker_waveform
 
     def _pad_waveform(self, waveform: Any) -> Any:
-        try:
-            import torch
-        except ImportError as exc:
-            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
-
         pad_align = int(1 / 12.5 * self.patch_size * self.sample_rate)
         new_len = (int(waveform.shape[-1]) + pad_align - 1) // pad_align * pad_align
         if new_len == int(waveform.shape[-1]):
@@ -267,11 +229,6 @@ class MingTTSReferenceEncoder:
         return padded
 
     def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
-        try:
-            import torch
-        except ImportError as exc:
-            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
-
         if not isinstance(waveform, torch.Tensor):
             waveform = torch.as_tensor(waveform)
         # Official generate() runs AudioVAE encode under bf16 autocast; this
@@ -282,27 +239,10 @@ class MingTTSReferenceEncoder:
         )
 
     def _audio_vae_floating_dtype(self) -> Any:
-        try:
-            import torch
-        except ImportError as exc:
-            raise RuntimeError("Ming-Omni-TTS reference audio requires torch") from exc
-
         for parameter in self.audio_vae.parameters():
             if parameter.is_floating_point():
                 return parameter.dtype
         return torch.float32
-
-    @staticmethod
-    def _speaker_fingerprint(path: str, ref_text: str | None) -> str:
-        hasher = hashlib.sha256()
-        hasher.update(str(ref_text or "").encode("utf-8"))
-        if os.path.isfile(path):
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    hasher.update(chunk)
-        else:
-            hasher.update(path.encode("utf-8"))
-        return hasher.hexdigest()[:24]
 
 
 __all__ = [

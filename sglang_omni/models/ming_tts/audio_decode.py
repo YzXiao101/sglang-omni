@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
-from copy import deepcopy
 from typing import Any
 
 import torch
@@ -13,12 +12,13 @@ import torch
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
-    MING_TTS_SAMPLE_RATE,
-    MingTTSState,
     decode_generated_latents,
+    load_ming_tts_state,
+    store_ming_tts_state,
 )
 from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 
@@ -27,49 +27,23 @@ class MingAudioDecoder(torch.nn.Module):
 
     def __init__(self, audio_vae: AudioVAE, *, sample_rate: int) -> None:
         super().__init__()
-        if int(sample_rate) != MING_TTS_SAMPLE_RATE:
-            raise ValueError(
-                "Ming-Omni-TTS currently requires AudioVAE sample_rate "
-                f"{MING_TTS_SAMPLE_RATE}, got {sample_rate}"
-            )
         self.audio_vae = audio_vae
         self.sample_rate = int(sample_rate)
 
     @classmethod
     def from_config(
         cls,
-        audio_config: Any,
+        audio_config: AudioVAEconfig,
         *,
         device: str | torch.device = "cuda:0",
         dtype: str | torch.dtype = "bfloat16",
     ) -> "MingAudioDecoder":
-        if isinstance(audio_config, AudioVAEconfig):
-            config = deepcopy(audio_config)
-        elif isinstance(audio_config, dict):
-            config = AudioVAEconfig(**deepcopy(audio_config))
-        else:
-            config = AudioVAEconfig(
-                sample_rate=getattr(audio_config, "sample_rate", None),
-                enc_kwargs=deepcopy(getattr(audio_config, "enc_kwargs", None)),
-                dec_kwargs=deepcopy(getattr(audio_config, "dec_kwargs", None)),
-                init_method=getattr(audio_config, "init_method", "normal"),
-                patch_size=getattr(audio_config, "patch_size", -1),
+        if audio_config.semantic_module_kwargs is not None:
+            raise ValueError(
+                "Ming-Omni-TTS serving currently uses the talker AudioVAE "
+                "encode/decode path and does not support semantic_module_kwargs"
             )
 
-        if not isinstance(config.enc_kwargs, dict):
-            raise ValueError("Ming-Omni-TTS AudioVAE config is missing enc_kwargs")
-        if not isinstance(config.dec_kwargs, dict):
-            raise ValueError("Ming-Omni-TTS AudioVAE config is missing dec_kwargs")
-        sample_rate = int(getattr(config, "sample_rate", 0))
-        if sample_rate != MING_TTS_SAMPLE_RATE:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE config sample_rate must be "
-                f"{MING_TTS_SAMPLE_RATE}, got {sample_rate}"
-            )
-        # Current TTS serving policy keeps AudioVAE Qwen2 blocks on SDPA. FM and
-        # AudioVAE backend selection are still planned optimization work.
-        for stage_kwargs in (config.enc_kwargs, config.dec_kwargs):
-            stage_kwargs["backbone"]["_attn_implementation"] = "sdpa"
         if isinstance(dtype, torch.dtype):
             torch_dtype = dtype
         elif dtype == "auto":
@@ -82,9 +56,9 @@ class MingAudioDecoder(torch.nn.Module):
         else:
             raise TypeError(f"Unsupported Ming-Omni-TTS AudioVAE dtype: {dtype!r}")
 
-        model = AudioVAE(config).eval()
+        model = AudioVAE(audio_config).eval()
         model.to(device=torch.device(device), dtype=torch_dtype)
-        return cls(model, sample_rate=sample_rate)
+        return cls(model, sample_rate=int(audio_config.sample_rate))
 
     @property
     def device(self) -> torch.device:
@@ -155,8 +129,7 @@ class MingAudioDecoder(torch.nn.Module):
                         last_chunk=last_chunk,
                     )
                 wav = self._normalize_waveform_chunk(wav)
-                if wav.numel():
-                    waveform_chunks.append(wav)
+                waveform_chunks.append(wav)
 
         return torch.cat(waveform_chunks, dim=0)
 
@@ -179,7 +152,7 @@ def decode_ming_tts_audio_payload(
     """Decode generated acoustic latents into the terminal waveform payload."""
 
     started = time.perf_counter()
-    state = MingTTSState.from_dict(payload.data)
+    state = load_ming_tts_state(payload)
 
     latents = decode_generated_latents(
         state,
@@ -210,7 +183,7 @@ def decode_ming_tts_audio_payload(
         state.generated_latents_shape = None
         state.generated_latents_dtype = None
 
-    payload.data = state.to_dict()
+    payload = store_ming_tts_state(payload, state)
     payload.data.update(
         audio_waveform_payload(
             waveform,
@@ -219,14 +192,8 @@ def decode_ming_tts_audio_payload(
             source_hint="Ming-Omni-TTS",
         )
     )
-    if state.prompt_tokens or state.completion_tokens or state.engine_time_s:
-        usage: dict[str, Any] = {
-            "prompt_tokens": int(state.prompt_tokens),
-            "completion_tokens": int(state.completion_tokens),
-            "total_tokens": int(state.prompt_tokens + state.completion_tokens),
-        }
-        if state.engine_time_s:
-            usage["engine_time_s"] = round(float(state.engine_time_s), 6)
+    usage = build_usage(state)
+    if usage is not None:
         payload.data["usage"] = usage
     return payload
 

@@ -7,11 +7,15 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
+from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
+
 MING_TTS_ARCHITECTURE = "BailingMMNativeForConditionalGeneration"
 MING_TTS_LLM_ARCHITECTURE = "BailingMoeForCausalLM"
 MING_TTS_MODEL_ARCH_OVERRIDE = "MingTTSSGLangModel"
 MING_TTS_SAMPLE_RATE = 44100
 MING_TTS_MROPE_SECTION = [16, 24, 24]
+MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION = "sdpa"
+MING_TTS_TAIL_ATTN_BACKEND = "torch"
 
 _ming_tts_hf_config_registered = False
 
@@ -139,13 +143,14 @@ class BailingMMTTSConfig(PretrainedConfig):
         audio_tokenizer_config: PretrainedConfig | dict[str, Any] | None = None,
         ditar_config: dict[str, Any] | None = None,
         aggregator_config: dict[str, Any] | None = None,
+        tail_attn_backend: str | None = None,
         model_type: str | None = None,
         **kwargs: Any,
     ) -> None:
         if isinstance(llm_config, dict):
             llm_config = BailingMoeTTSConfig(**llm_config)
         if isinstance(audio_tokenizer_config, dict):
-            audio_tokenizer_config = PretrainedConfig(**audio_tokenizer_config)
+            audio_tokenizer_config = AudioVAEconfig(**audio_tokenizer_config)
 
         self.raw_model_type = model_type or self.model_type
         self.llm_config = llm_config
@@ -154,11 +159,13 @@ class BailingMMTTSConfig(PretrainedConfig):
         self.aggregator_config = (
             dict(aggregator_config) if aggregator_config is not None else None
         )
+        self.tail_attn_backend = MING_TTS_TAIL_ATTN_BACKEND
         is_default_init = (
             llm_config is None
             and audio_tokenizer_config is None
             and ditar_config is None
             and aggregator_config is None
+            and tail_attn_backend is None
             and model_type is None
             and not kwargs
         )
@@ -304,9 +311,11 @@ __all__ = [
     "BailingMMTTSConfig",
     "BailingMoeTTSConfig",
     "MING_TTS_ARCHITECTURE",
+    "MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION",
     "MING_TTS_LLM_ARCHITECTURE",
     "MING_TTS_MODEL_ARCH_OVERRIDE",
     "MING_TTS_MROPE_SECTION",
     "MING_TTS_SAMPLE_RATE",
+    "MING_TTS_TAIL_ATTN_BACKEND",
     "register_ming_tts_hf_config",
 ]

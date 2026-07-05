@@ -6,6 +6,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import PipelineStateBase
+from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
+from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
+
 MING_TTS_SAMPLE_RATE = 44100
 MING_TTS_DEFAULT_MAX_DECODE_STEPS = 200
 MING_TTS_LATENT_TRANSPORT_DTYPE = "float32"
@@ -14,11 +21,6 @@ MING_TTS_LATENT_TRANSPORT_VERSION = 1
 
 def encode_generated_latents(latents: Any) -> dict[str, Any]:
     """Encode generated latent chunks as the cross-stage wire format."""
-
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError("Ming-Omni-TTS latent transport requires torch") from exc
 
     if not isinstance(latents, torch.Tensor):
         latents = torch.as_tensor(latents)
@@ -38,11 +40,6 @@ def decode_generated_latents(
     dtype: Any | None = None,
 ) -> Any | None:
     """Restore generated latent chunks from the cross-stage wire format."""
-
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError("Ming-Omni-TTS latent transport requires torch") from exc
 
     if isinstance(data, MingTTSState):
         raw = data.generated_latents_bytes
@@ -139,11 +136,6 @@ def decode_prompt_latent(
 
 
 def _encode_float_tensor(tensor: Any, *, name: str) -> Any:
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(f"{name} transport requires torch") from exc
-
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(tensor)
     return tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -157,11 +149,6 @@ def _decode_float_tensor(
     device: Any | None,
     dtype: Any | None,
 ) -> Any | None:
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(f"{name} transport requires torch") from exc
-
     if raw is None or shape is None:
         return None
     tensor = torch.frombuffer(bytes(raw), dtype=torch.float32).clone()
@@ -172,7 +159,7 @@ def _decode_float_tensor(
 
 
 @dataclass
-class MingTTSState:
+class MingTTSState(PipelineStateBase):
     """Per-request state for Ming-Omni-TTS generation."""
 
     # Request input
@@ -202,7 +189,6 @@ class MingTTSState:
     prompt_latent_bytes: bytes | None = None
     prompt_latent_shape: list[int] | None = None
     prompt_latent_dtype: str | None = None
-    speaker_fingerprint: str | None = None
 
     # Generation params
     max_decode_steps: int = MING_TTS_DEFAULT_MAX_DECODE_STEPS
@@ -277,8 +263,6 @@ class MingTTSState:
             data["prompt_latent_bytes"] = self.prompt_latent_bytes
             data["prompt_latent_shape"] = list(self.prompt_latent_shape or [])
             data["prompt_latent_dtype"] = self.prompt_latent_dtype
-        if self.speaker_fingerprint is not None:
-            data["speaker_fingerprint"] = self.speaker_fingerprint
         if self.seed is not None:
             data["seed"] = int(self.seed)
         if self.generated_latents_bytes is not None:
@@ -298,12 +282,7 @@ class MingTTSState:
             data["stop_step"] = int(self.stop_step)
         if self.finish_reason is not None:
             data["finish_reason"] = self.finish_reason
-        if self.prompt_tokens:
-            data["prompt_tokens"] = int(self.prompt_tokens)
-        if self.completion_tokens:
-            data["completion_tokens"] = int(self.completion_tokens)
-        if self.engine_time_s:
-            data["engine_time_s"] = float(self.engine_time_s)
+        self.append_usage_fields(data)
         if self.duration_s is not None:
             data["duration_s"] = float(self.duration_s)
         if self.audio_decode_time_s:
@@ -365,7 +344,6 @@ class MingTTSState:
             prompt_latent_bytes=bytes_or_none(data.get("prompt_latent_bytes")),
             prompt_latent_shape=int_list_or_none(data.get("prompt_latent_shape")),
             prompt_latent_dtype=data.get("prompt_latent_dtype"),
-            speaker_fingerprint=data.get("speaker_fingerprint"),
             max_decode_steps=int_or_default(
                 data.get("max_decode_steps"),
                 MING_TTS_DEFAULT_MAX_DECODE_STEPS,
@@ -418,6 +396,14 @@ class MingTTSState:
         )
 
 
+def load_ming_tts_state(payload: StagePayload) -> MingTTSState:
+    return _load_pipeline_state(payload, MingTTSState)
+
+
+def store_ming_tts_state(payload: StagePayload, state: MingTTSState) -> StagePayload:
+    return _store_pipeline_state(payload, state)
+
+
 __all__ = [
     "MING_TTS_DEFAULT_MAX_DECODE_STEPS",
     "MING_TTS_LATENT_TRANSPORT_DTYPE",
@@ -430,4 +416,6 @@ __all__ = [
     "encode_prompt_latent",
     "encode_generated_latents",
     "encode_speaker_embedding",
+    "load_ming_tts_state",
+    "store_ming_tts_state",
 ]
