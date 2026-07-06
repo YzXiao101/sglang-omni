@@ -12,8 +12,8 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 import torchaudio.functional as F
 
+from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
-from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
     encode_prompt_latent,

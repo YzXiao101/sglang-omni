@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
-from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
+from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
     decode_generated_latents,
     load_ming_tts_state,

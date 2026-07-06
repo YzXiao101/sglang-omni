@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AudioVAE config for Ming-Omni-TTS.
-
-Adapted from the official Ming-omni-tts ``audio_tokenizer`` package.
-"""
+"""AudioVAE checkpoint config adapter for Ming-Omni-TTS."""
 
 from __future__ import annotations
 
