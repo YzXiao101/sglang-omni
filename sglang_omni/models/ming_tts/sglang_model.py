@@ -16,8 +16,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from torch import nn
 
 from sglang_omni.models.ming_omni.talker.talker_module.aggregator import Aggregator
-from sglang_omni.models.ming_tts.fm.cfm import build_cfm_sampling_schedule
-from sglang_omni.models.ming_tts.fm.flowloss import FlowLoss
+from sglang_omni.models.ming_tts.flow_matching import (
+    FlowLoss,
+    build_cfm_sampling_schedule,
+)
 from sglang_omni.models.ming_tts.hf_config import MING_TTS_TAIL_ATTN_BACKEND
 from sglang_omni.models.ming_tts.weight_loading import (
     MING_TTS_LM_HEAD_SKIP_REASON,
@@ -466,30 +468,12 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-    def _route_primary(self, hidden_states: torch.Tensor) -> Any:
-        router_logits = self.gate(hidden_states).float()
-        return self.topk(hidden_states, router_logits)
-
-    def _route(
-        self,
-        hidden_states: torch.Tensor,
-        image_mask: Optional[torch.Tensor] = None,
-        audio_mask: Optional[torch.Tensor] = None,
-    ) -> Any:
-        if image_mask is not None or audio_mask is not None:
-            raise ValueError(
-                "Ming-Omni-TTS serving does not support modality-mask MoE routing"
-            )
-        return self._route_primary(hidden_states)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
-        image_mask: Optional[torch.Tensor] = None,
-        audio_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, original_shape[-1])
@@ -497,7 +481,8 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
             hidden_states.clone() if self.shared_experts is not None else hidden_states
         )
 
-        topk_output = self._route(hidden_states, image_mask, audio_mask)
+        router_logits = self.gate(hidden_states).float()
+        topk_output = self.topk(hidden_states, router_logits)
         hidden_states = self.experts(hidden_states, topk_output)
         if self.shared_experts is not None:
             hidden_states = hidden_states + self.shared_experts(shared_input)
@@ -630,7 +615,7 @@ class MingBailingMoeTextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self._validate_supported_config(config)
+        self._check_supported_bailing_moe_config(config)
         self.vocab_size = int(config.vocab_size)
         self.hidden_size = int(config.hidden_size)
         self.word_embeddings = VocabParallelEmbedding(
@@ -655,7 +640,7 @@ class MingBailingMoeTextModel(nn.Module):
         self.norm = RMSNorm(self.hidden_size, eps=float(config.rms_norm_eps))
 
     @staticmethod
-    def _validate_supported_config(config: Any) -> None:
+    def _check_supported_bailing_moe_config(config: Any) -> None:
         hidden_act = getattr(config, "hidden_act", "silu")
         if hidden_act != "silu":
             raise ValueError(
@@ -950,12 +935,9 @@ class MingTTSSGLangModel(nn.Module):
         if input_embeds is None:
             input_embeds = getattr(forward_batch, "input_embeds", None)
 
-        forward_mode = getattr(forward_batch, "forward_mode", None)
-        is_decode = (
-            forward_mode is not None
-            and hasattr(forward_mode, "is_decode")
-            and bool(forward_mode.is_decode())
-        )
+        forward_mode = forward_batch.forward_mode
+        is_decode = bool(forward_mode.is_decode())
+        is_extend = bool(forward_mode.is_extend())
         if input_embeds is None and is_decode:
             input_embeds = self._decode_input_embedding(input_ids)
             input_ids = None
@@ -969,12 +951,6 @@ class MingTTSSGLangModel(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
             input_embeds=input_embeds,
-        )
-        forward_mode = getattr(forward_batch, "forward_mode", None)
-        is_extend = (
-            forward_mode is not None
-            and hasattr(forward_mode, "is_extend")
-            and bool(forward_mode.is_extend())
         )
         if is_extend:
             extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)

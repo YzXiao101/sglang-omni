@@ -8,9 +8,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import (
-    resolve_ming_tts_audio_vae_config,
-)
+from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
 from sglang_omni.models.ming_tts.hf_config import (
     MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     MING_TTS_MODEL_ARCH_OVERRIDE,

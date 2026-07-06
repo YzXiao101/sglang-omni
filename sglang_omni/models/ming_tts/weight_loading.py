@@ -368,6 +368,7 @@ def load_ming_tts_audio_vae_weights(
         keys_by_shard.setdefault(manifest.weight_map[key], []).append(key)
 
     state_dict = {}
+    checkpoint_keys_by_target: dict[str, str] = {}
     resolved_path = Path(manifest.model_path)
     for shard, shard_keys in sorted(keys_by_shard.items()):
         shard_path = resolved_path / shard
@@ -377,6 +378,7 @@ def load_ming_tts_audio_vae_weights(
                 if key.startswith(MING_TTS_AUDIO_PREFIX):
                     output_key = key[len(MING_TTS_AUDIO_PREFIX) :]
                 state_dict[output_key] = handle.get_tensor(key)
+                checkpoint_keys_by_target[output_key] = key
 
     if not state_dict:
         raise FileNotFoundError(
@@ -386,8 +388,12 @@ def load_ming_tts_audio_vae_weights(
     incompatible = audio_vae.load_state_dict(state_dict, strict=False)
     missing = [str(key) for key in getattr(incompatible, "missing_keys", ())]
     unexpected = [str(key) for key in getattr(incompatible, "unexpected_keys", ())]
-    for key in state_dict:
-        report.add_loaded(OWNER_AUDIO_VAE, key, target_param=key)
+    for target_key in state_dict:
+        report.add_loaded(
+            OWNER_AUDIO_VAE,
+            checkpoint_keys_by_target[target_key],
+            target_param=target_key,
+        )
     if missing:
         report.missing.setdefault(OWNER_AUDIO_VAE, []).extend(missing)
     if unexpected:

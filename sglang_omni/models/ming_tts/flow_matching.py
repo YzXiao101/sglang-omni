@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 inclusionAI
-# Adapted from Ming-omni-tts/fm/CFM.py.
+# Adapted from Ming-omni-tts/fm/CFM.py and Ming-omni-tts/fm/flowloss.py.
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang_omni.models.ming_omni.talker.talker_module.cfm import get_epss_timesteps
+from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
 
 
 def build_cfm_sampling_schedule(
@@ -63,7 +64,7 @@ class Solver:
         self.sigma = sigma
         self.temperature = temperature
 
-    def integrate_final(
+    def integrate(
         self,
         t: torch.Tensor,
         *,
@@ -72,19 +73,19 @@ class Solver:
         step_count = int(t.shape[0]) - 1
 
         y0 = self.y0
-        final = y0
+        sampled = y0
         for step, (t0, t1) in enumerate(zip(t[:-1], t[1:])):
             dt = t1 - t0
             f0 = self.func(t0, y0)
             y1 = y0 + dt * f0
-            final = y1
+            sampled = y1
 
             if step + 1 < step_count:
                 noise = sde_random[step]
                 shift = self.sigma * (self.temperature**0.5) * (abs(dt) ** 0.5) * noise
                 y0 = y1 + shift
 
-        return final
+        return sampled
 
 
 class CFM(nn.Module):
@@ -148,7 +149,7 @@ class CFM(nn.Module):
             temperature=temperature,
         )
         solver = Solver(fn, y0, sigma=sigma_tensor, temperature=temperature_tensor)
-        return solver.integrate_final(t, sde_random=sde_random)
+        return solver.integrate(t, sde_random=sde_random)
 
     def _prepare_sampling(
         self,
@@ -198,3 +199,67 @@ class CFM(nn.Module):
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
         return fn, y0, t, sigma_tensor, temperature_tensor
+
+
+class FlowLoss(nn.Module):
+    """Ming-Omni-TTS flow-matching latent head."""
+
+    def __init__(
+        self,
+        z_channels: int,
+        llm_cond_dim: int,
+        patch_size: int | None = None,
+        history_patch_size: int | None = None,
+        **dit_kwargs,
+    ) -> None:
+        super().__init__()
+        del patch_size, history_patch_size
+        self.z_channels = z_channels
+        self.cfm = CFM(
+            model=DiT(
+                in_channels=z_channels,
+                llm_cond_dim=llm_cond_dim,
+                **dit_kwargs,
+            )
+        )
+
+    def forward(
+        self,
+        cond: torch.Tensor,
+        target: torch.Tensor,
+        latent_history: torch.Tensor,
+        mask: torch.Tensor,
+        patch_size: int,
+    ) -> torch.Tensor:
+        return self.cfm(
+            cond=cond,
+            target=target,
+            latent_history=latent_history,
+            mask=mask,
+            patch_size=patch_size,
+        )
+
+    def sample(
+        self,
+        z: torch.Tensor,
+        latent_history: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+        sde_random: torch.Tensor,
+        cfg: float | torch.Tensor = 1.0,
+        sigma: float | torch.Tensor = 0.25,
+        temperature: float | torch.Tensor = 0,
+    ) -> torch.Tensor:
+        return self.cfm.sample(
+            noise=noise,
+            c=z,
+            latent_history=latent_history,
+            cfg_scale=cfg,
+            sigma=sigma,
+            temperature=temperature,
+            timesteps=timesteps,
+            sde_random=sde_random,
+        )
+
+
+__all__ = ["CFM", "FlowLoss", "Solver", "build_cfm_sampling_schedule"]

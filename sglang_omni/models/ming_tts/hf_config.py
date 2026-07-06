@@ -7,10 +7,8 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from sglang_omni.models.ming_tts.audio_vae.configuration_audio_vae import AudioVAEconfig
+from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 
-MING_TTS_ARCHITECTURE = "BailingMMNativeForConditionalGeneration"
-MING_TTS_LLM_ARCHITECTURE = "BailingMoeForCausalLM"
 MING_TTS_MODEL_ARCH_OVERRIDE = "MingTTSSGLangModel"
 MING_TTS_SAMPLE_RATE = 44100
 MING_TTS_MROPE_SECTION = [16, 24, 24]
@@ -143,7 +141,6 @@ class BailingMMTTSConfig(PretrainedConfig):
         audio_tokenizer_config: PretrainedConfig | dict[str, Any] | None = None,
         ditar_config: dict[str, Any] | None = None,
         aggregator_config: dict[str, Any] | None = None,
-        tail_attn_backend: str | None = None,
         model_type: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -159,13 +156,11 @@ class BailingMMTTSConfig(PretrainedConfig):
         self.aggregator_config = (
             dict(aggregator_config) if aggregator_config is not None else None
         )
-        self.tail_attn_backend = MING_TTS_TAIL_ATTN_BACKEND
         is_default_init = (
             llm_config is None
             and audio_tokenizer_config is None
             and ditar_config is None
             and aggregator_config is None
-            and tail_attn_backend is None
             and model_type is None
             and not kwargs
         )
@@ -179,14 +174,6 @@ class BailingMMTTSConfig(PretrainedConfig):
                 f"{self.model_type!r}; got {self.raw_model_type!r}"
             )
 
-        architectures = getattr(self, "architectures", None) or []
-        if architectures and MING_TTS_ARCHITECTURE not in architectures:
-            raise ValueError(
-                "Ming-Omni-TTS config declares unsupported architecture; "
-                "expected "
-                f"{MING_TTS_ARCHITECTURE!r}; got {architectures!r}"
-            )
-
         if self.llm_config is None:
             raise ValueError("Ming-Omni-TTS config is missing llm_config")
         if getattr(self.llm_config, "model_type", None) != "bailing_moe":
@@ -194,13 +181,6 @@ class BailingMMTTSConfig(PretrainedConfig):
                 "Ming-Omni-TTS currently supports only the 16.8B MoE TTS "
                 "checkpoint (llm_config.model_type='bailing_moe'); dense "
                 "branch is currently unsupported."
-            )
-        llm_architectures = getattr(self.llm_config, "architectures", None) or []
-        if llm_architectures and MING_TTS_LLM_ARCHITECTURE not in llm_architectures:
-            raise ValueError(
-                "Ming-Omni-TTS llm_config declares unsupported architecture; "
-                "expected "
-                f"{MING_TTS_LLM_ARCHITECTURE!r}; got {llm_architectures!r}"
             )
 
         for field in (
@@ -218,21 +198,6 @@ class BailingMMTTSConfig(PretrainedConfig):
         ):
             if getattr(self.llm_config, field, None) is None:
                 raise ValueError(f"Ming-Omni-TTS llm_config is missing {field}")
-
-        if int(self.llm_config.head_dim) * int(
-            self.llm_config.num_attention_heads
-        ) != int(self.llm_config.hidden_size):
-            raise ValueError(
-                "Ming-Omni-TTS llm_config head_dim * num_attention_heads must "
-                "equal hidden_size"
-            )
-
-        if self.llm_config.raw_rope_scaling != {"factor": None, "type": "3D"}:
-            raise ValueError(
-                "Ming-Omni-TTS currently requires raw llm_config.rope_scaling "
-                "{'factor': None, 'type': '3D'}; got "
-                f"{self.llm_config.raw_rope_scaling!r}"
-            )
 
         if self.audio_tokenizer_config is None:
             raise ValueError("Ming-Omni-TTS config is missing audio_tokenizer_config")
@@ -310,9 +275,7 @@ def register_ming_tts_hf_config() -> None:
 __all__ = [
     "BailingMMTTSConfig",
     "BailingMoeTTSConfig",
-    "MING_TTS_ARCHITECTURE",
     "MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION",
-    "MING_TTS_LLM_ARCHITECTURE",
     "MING_TTS_MODEL_ARCH_OVERRIDE",
     "MING_TTS_MROPE_SECTION",
     "MING_TTS_SAMPLE_RATE",
