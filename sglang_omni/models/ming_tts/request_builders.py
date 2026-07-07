@@ -10,7 +10,6 @@ from sglang_omni.models.ming_tts.payload_types import (
     MingTTSState,
     store_ming_tts_state,
 )
-from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -38,22 +37,6 @@ _DEFAULT_TASK_TYPES = {"", "default", "tts", "speech"}
 
 
 def preprocess_ming_tts_payload(
-    payload: StagePayload,
-    *,
-    tokenizer: MingTTSTokenizerBundle,
-    context_length: int,
-    max_decode_steps_cap: int | None = None,
-) -> StagePayload:
-    with ming_profile_event(payload.request_id, "ming_preprocess"):
-        return _preprocess_ming_tts_payload_impl(
-            payload,
-            tokenizer=tokenizer,
-            context_length=context_length,
-            max_decode_steps_cap=max_decode_steps_cap,
-        )
-
-
-def _preprocess_ming_tts_payload_impl(
     payload: StagePayload,
     *,
     tokenizer: MingTTSTokenizerBundle,

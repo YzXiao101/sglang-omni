@@ -105,10 +105,9 @@ def _resolve_ming_tts_engine_startup(
 ) -> MingTTSEngineStartup:
     tp_rank = int(tp_rank)
     tp_size = int(tp_size)
-    if tp_size not in (1, 2):
+    if tp_size <= 0:
         raise ValueError(
-            "Ming-Omni-TTS tts_engine currently supports only tp_size=1 or "
-            f"tp_size=2; got tp_size={tp_size}"
+            f"Ming-Omni-TTS tts_engine tp_size must be positive; got {tp_size}"
         )
     if tp_rank < 0 or tp_rank >= tp_size:
         raise ValueError(
@@ -187,26 +186,22 @@ def _build_ming_tts_server_args(startup: MingTTSEngineStartup) -> Any:
     overrides.pop("context_length", None)
     overrides["tp_size"] = startup.tp_size
 
-    radix_cache_enabled = not coerce_bool(
-        overrides.get("disable_radix_cache", True),
+    if "disable_radix_cache" in user_overrides and not coerce_bool(
+        user_overrides["disable_radix_cache"],
         name="server_args_overrides.disable_radix_cache",
-    )
-    graph_enabled = not coerce_bool(
-        overrides.get("disable_cuda_graph", True),
-        name="server_args_overrides.disable_cuda_graph",
-    )
-    if graph_enabled or radix_cache_enabled:
-        if (
-            "chunked_prefill_size" in user_overrides
-            and int(overrides.get("chunked_prefill_size") or 0) != 0
-        ):
-            raise ValueError(
-                "Ming-Omni-TTS graph/cache requires chunked_prefill_size=0 "
-                "because generated continuous state does not have chunk "
-                "rollback semantics"
-            )
-        if "chunked_prefill_size" not in user_overrides:
-            overrides["chunked_prefill_size"] = 0
+    ):
+        raise ValueError("Ming-Omni-TTS prefix/radix cache is not currently supported")
+    overrides["disable_radix_cache"] = True
+
+    if (
+        "chunked_prefill_size" in user_overrides
+        and int(overrides.get("chunked_prefill_size") or 0) != 0
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS requires chunked_prefill_size=0 because generated "
+            "continuous state does not have chunk rollback semantics"
+        )
+    overrides["chunked_prefill_size"] = 0
     if bool(overrides.get("enable_torch_compile", False)):
         raise ValueError("Ming-Omni-TTS torch.compile is not currently supported")
 
@@ -354,8 +349,6 @@ def _build_ming_tts_omni_scheduler(
     request_builder, result_adapter = make_ming_tts_scheduler_adapters(
         model=model,
         tokenizer=tokenizer,
-        radix_cache_enabled=not bool(getattr(server_args, "disable_radix_cache", True)),
-        model_cache_identity=str(startup.checkpoint_dir),
         owns_acoustic_result=startup.tp_rank == 0,
     )
     return OmniScheduler(

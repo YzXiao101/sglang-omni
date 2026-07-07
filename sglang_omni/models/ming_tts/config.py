@@ -87,17 +87,17 @@ class MingTTSPipelineConfig(PipelineConfig):
                     )
                 continue
 
-            if stage.tp_size not in (1, 2):
+            if stage.tp_size <= 0:
                 raise ValueError(
-                    "Ming-Omni-TTS tts_engine currently supports only "
-                    f"tp_size=1 or tp_size=2; got tp_size={stage.tp_size}."
+                    "Ming-Omni-TTS tts_engine tp_size must be positive; "
+                    f"got tp_size={stage.tp_size}."
                 )
             if stage.tp_size == 1:
                 continue
             if not isinstance(stage.gpu, list):
                 raise ValueError(
-                    "Ming-Omni-TTS tts_engine tp_size=2 requires "
-                    "gpu=[rank0_gpu, rank1_gpu]."
+                    "Ming-Omni-TTS tts_engine tensor parallelism requires "
+                    "gpu=[rank0_gpu, rank1_gpu, ...]."
                 )
             if len(stage.gpu) != stage.tp_size:
                 raise ValueError(
