@@ -285,10 +285,9 @@ def _finish_ming_tts_graph_startup(
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
         if startup.tp_rank == 0:
-            max_tail_graph_bs = int(
-                getattr(server_args, "max_running_requests", None) or 1
+            model.init_tail_graphs(
+                list(model_worker.model_runner.graph_runner.capture_bs)
             )
-            model.init_tail_graphs(list(range(1, max_tail_graph_bs + 1)))
 
     ming_ar_text_model = getattr(model, "model", None)
     ming_ar_layers = getattr(ming_ar_text_model, "layers", None)
