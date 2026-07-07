@@ -165,18 +165,26 @@ class _MingTTSTailGraph:
         noise: torch.Tensor,
         sde_random: torch.Tensor,
     ) -> MingTTSTailOutputs:
-        self.inputs.hidden_states.copy_(inputs.hidden_states)
-        self.inputs.latent_history.copy_(inputs.latent_history)
-        self.inputs.cfg.copy_(inputs.cfg)
-        self.inputs.sigma.copy_(inputs.sigma)
-        self.inputs.temperature.copy_(inputs.temperature)
-        self.noise.copy_(noise)
-        self.sde_random.copy_(sde_random)
+        batch_size = int(inputs.hidden_states.shape[0])
+        self.inputs.hidden_states[:batch_size].copy_(inputs.hidden_states)
+        self.inputs.hidden_states[batch_size:].zero_()
+        self.inputs.latent_history[:batch_size].copy_(inputs.latent_history)
+        self.inputs.latent_history[batch_size:].zero_()
+        self.inputs.cfg[:batch_size].copy_(inputs.cfg)
+        self.inputs.cfg[batch_size:].zero_()
+        self.inputs.sigma[:batch_size].copy_(inputs.sigma)
+        self.inputs.sigma[batch_size:].zero_()
+        self.inputs.temperature[:batch_size].copy_(inputs.temperature)
+        self.inputs.temperature[batch_size:].zero_()
+        self.noise[:batch_size].copy_(noise)
+        self.noise[batch_size:].zero_()
+        self.sde_random[:, :batch_size].copy_(sde_random)
+        self.sde_random[:, batch_size:].zero_()
         self.graph.replay()
         return MingTTSTailOutputs(
-            sampled=self.outputs.sampled.clone(),
-            feedback_embeddings=self.outputs.feedback_embeddings.clone(),
-            stop_prob=self.outputs.stop_prob.clone(),
+            sampled=self.outputs.sampled[:batch_size].clone(),
+            feedback_embeddings=self.outputs.feedback_embeddings[:batch_size].clone(),
+            stop_prob=self.outputs.stop_prob[:batch_size].clone(),
         )
 
 
@@ -184,13 +192,11 @@ class _MingTTSTailGraphCache:
     def __init__(self, model: Any) -> None:
         self.model = model
         self.graphs: dict[int, _MingTTSTailGraph] = {}
+        self.buckets: tuple[int, ...] = ()
 
     def capture(self, batch_sizes: list[int]) -> None:
-        buckets = sorted(
-            {int(batch_size) for batch_size in batch_sizes},
-            reverse=True,
-        )
-        for batch_size in buckets:
+        self.buckets = tuple(sorted({int(batch_size) for batch_size in batch_sizes}))
+        for batch_size in reversed(self.buckets):
             graph = _MingTTSTailGraph(self.model, batch_size)
             graph.capture()
             self.graphs[batch_size] = graph
@@ -203,8 +209,14 @@ class _MingTTSTailGraphCache:
         sde_random: torch.Tensor,
     ) -> MingTTSTailOutputs:
         batch_size = int(inputs.hidden_states.shape[0])
-        graph = self.graphs[batch_size]
-        return graph.replay(inputs, noise=noise, sde_random=sde_random)
+        for bucket in self.buckets:
+            if bucket >= batch_size:
+                graph = self.graphs[bucket]
+                return graph.replay(inputs, noise=noise, sde_random=sde_random)
+        raise RuntimeError(
+            "Ming TTS tail CUDA graph bucket does not cover active batch "
+            f"{batch_size}; captured={list(self.buckets)}"
+        )
 
 
 class MingBailingMoeAttention(nn.Module):
@@ -839,7 +851,10 @@ class MingTTSSGLangModel(nn.Module):
         graphs = _MingTTSTailGraphCache(self)
         graphs.capture(batch_sizes)
         self._tail_graphs = graphs
-        logger.info("Ming TTS tail CUDA graphs captured for bs=%s", batch_sizes)
+        logger.info(
+            "Ming TTS tail CUDA graphs captured for bs=%s",
+            list(graphs.buckets),
+        )
 
     @torch.no_grad()
     def run_tail_step(self, inputs: MingTTSTailInputs) -> MingTTSTailOutputs:
