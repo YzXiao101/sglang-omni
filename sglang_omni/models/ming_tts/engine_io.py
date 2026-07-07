@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,12 +17,9 @@ from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
     store_ming_tts_state,
 )
-from sglang_omni.models.ming_tts.profile_events import ming_profile_event
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-
-MING_ROW_PREFILL_CACHE_VERSION = "ming_tts_row_prefill_v1"
 
 
 @dataclass
@@ -91,67 +86,19 @@ class MingTTSDecodeState:
 
 
 @dataclass
-class MingTTSStaticPrefillCacheKey:
-    """Synthetic prefill radix key for projected Ming-TTS embeddings."""
-
-    input_ids: list[int]
-    extra_key: str
-
-
-def _build_prefill_row_cache_key_ids(prefill_input_embeds: torch.Tensor) -> list[int]:
-    rows = (
-        prefill_input_embeds.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    )
-    key_ids: list[int] = []
-    for row in rows:
-        digest = hashlib.blake2b(row.numpy().tobytes(), digest_size=8).digest()
-        key_ids.append(int.from_bytes(digest, "little") & ((1 << 63) - 1))
-    return key_ids
-
-
-def _build_row_prefill_extra_key(
-    *,
-    model_identity: str,
-    input_dtype: torch.dtype,
-    hidden_size: int,
-    patch_size: int,
-    latent_dim: int,
-    audio_start_token_id: int,
-    audio_patch_token_id: int,
-    audio_eos_token_id: int,
-) -> str:
-    payload: dict[str, Any] = {
-        "version": MING_ROW_PREFILL_CACHE_VERSION,
-        "model_identity": str(model_identity),
-        "input_dtype": str(input_dtype),
-        "hidden_size": int(hidden_size),
-        "patch_size": int(patch_size),
-        "latent_dim": int(latent_dim),
-        "audio_start_token_id": int(audio_start_token_id),
-        "audio_patch_token_id": int(audio_patch_token_id),
-        "audio_eos_token_id": int(audio_eos_token_id),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    digest = hashlib.blake2b(raw, digest_size=16).hexdigest()
-    return f"ming_tts:row-prefill:v1:{digest}"
-
-
-@dataclass
 class MingTTSSGLangRequestData(SGLangARRequestData):
     """Scheduler-owned state for Ming-Omni-TTS generation."""
 
     enforce_request_limits: bool = True
-    static_prefill_cache_key: MingTTSStaticPrefillCacheKey | None = None
     decode_state: MingTTSDecodeState | None = None
     state: MingTTSState | None = None
     prompt_input_ids: Any = None
 
     def release_tensors(self) -> None:
         self.prefill_input_embeds = None
-        self.decode_input_embeds = None
+        self.decode_input_embeds = []
         if self.decode_state is not None:
             self.decode_state.release_tensors()
-        self.pending_feedback_queue.clear()
 
 
 def _build_prefill_input_embeds(
@@ -223,17 +170,11 @@ def make_ming_tts_scheduler_adapters(
     *,
     model: Any,
     tokenizer: MingTTSTokenizerBundle,
-    radix_cache_enabled: bool = False,
-    model_cache_identity: str = "",
     owns_acoustic_result: bool = True,
 ):
     """Build StagePayload <-> SGLang request adapters for Ming-Omni-TTS."""
 
     def request_builder(payload: StagePayload) -> MingTTSSGLangRequestData:
-        with ming_profile_event(payload.request_id, "ming_ar_request_build"):
-            return _request_builder_impl(payload)
-
-    def _request_builder_impl(payload: StagePayload) -> MingTTSSGLangRequestData:
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -287,9 +228,7 @@ def make_ming_tts_scheduler_adapters(
             device=weight.device,
             dtype=torch.float32,
         )
-        requires_projected_prefill = (
-            radix_cache_enabled or spk_emb is not None or prompt_latent is not None
-        )
+        requires_projected_prefill = spk_emb is not None or prompt_latent is not None
         prefill_input_embeds = None
         if requires_projected_prefill:
             prefill_input_embeds, prompt_latent_for_history = (
@@ -304,30 +243,8 @@ def make_ming_tts_scheduler_adapters(
                 )
             )
 
-        static_prefill_cache_key = None
-        if radix_cache_enabled:
-            static_prefill_cache_key = MingTTSStaticPrefillCacheKey(
-                input_ids=_build_prefill_row_cache_key_ids(prefill_input_embeds),
-                extra_key=_build_row_prefill_extra_key(
-                    model_identity=model_cache_identity,
-                    input_dtype=weight.dtype,
-                    hidden_size=int(weight.shape[1]),
-                    patch_size=int(model.patch_size),
-                    latent_dim=int(model.latent_dim),
-                    audio_start_token_id=int(tokenizer.special.audio_start),
-                    audio_patch_token_id=int(tokenizer.special.audio_patch),
-                    audio_eos_token_id=int(tokenizer.special.end_of_audio),
-                ),
-            )
-
-        # Default to a request-local radix namespace; only row-prefill synthetic
-        # ids opt into cross-request sharing.
-        if static_prefill_cache_key is None:
-            req_input_ids_list = input_ids_list
-            req_extra_key = f"ming_tts:{payload.request_id}"
-        else:
-            req_input_ids_list = static_prefill_cache_key.input_ids
-            req_extra_key = static_prefill_cache_key.extra_key
+        req_input_ids_list = input_ids_list
+        req_extra_key = f"ming_tts:{payload.request_id}"
         req = Req(
             rid=payload.request_id,
             origin_input_text="",
@@ -361,7 +278,7 @@ def make_ming_tts_scheduler_adapters(
             req=req,
             state=state,
             prefill_input_embeds=prefill_input_embeds,
-            static_prefill_cache_key=static_prefill_cache_key,
+            input_embeds_are_projected=prefill_input_embeds is not None,
             decode_state=decode_state,
         )
         data.stage_payload = payload
@@ -371,78 +288,77 @@ def make_ming_tts_scheduler_adapters(
         try:
             if not owns_acoustic_result:
                 return data.stage_payload
-            request_id = data.stage_payload.request_id
-            with ming_profile_event(request_id, "ming_response_serialize"):
-                return _result_adapter_impl(data)
+            decode_state = data.decode_state
+            payload = data.stage_payload
+            state = (
+                data.state if data.state is not None else load_ming_tts_state(payload)
+            )
+
+            latent_chunks: list[Any] = []
+            for latent in decode_state.generated_latents:
+                tensor = (
+                    latent.detach()
+                    if hasattr(latent, "detach")
+                    else torch.as_tensor(latent)
+                )
+                if tensor.ndim == 3 and int(tensor.shape[0]) == 1:
+                    tensor = tensor.squeeze(0)
+                latent_chunks.append(tensor)
+
+            raw = data.finish_reason
+            if raw is None and data.req is not None:
+                finished_reason = getattr(data.req, "finished_reason", None)
+                if finished_reason is not None and hasattr(finished_reason, "to_json"):
+                    raw = finished_reason.to_json().get("type")
+                elif finished_reason is not None:
+                    raw = str(finished_reason)
+
+            normalized = str(raw).lower() if raw is not None else None
+            if decode_state.stop_step is not None:
+                finish_reason = "stop"
+            elif normalized is not None:
+                if "length" in normalized:
+                    finish_reason = "length"
+                elif "abort" in normalized:
+                    finish_reason = "abort"
+                elif "error" in normalized:
+                    finish_reason = "error"
+                else:
+                    finish_reason = str(raw)
+            elif len(decode_state.generated_latents) >= int(
+                decode_state.max_decode_steps
+            ):
+                finish_reason = "length"
+            else:
+                finish_reason = "stop"
+
+            prompt_input_ids = data.prompt_input_ids
+            if prompt_input_ids is None:
+                prompt_tokens = 0
+            else:
+                shape = getattr(prompt_input_ids, "shape", None)
+                prompt_tokens = (
+                    int(shape[0])
+                    if shape is not None and len(shape)
+                    else len(prompt_input_ids)
+                )
+
+            generated = torch.stack(latent_chunks, dim=0)
+            state.generated_last_chunk = [
+                bool(item) for item in decode_state.generated_last_chunk
+            ]
+            state.stop_step = decode_state.stop_step
+            state.finish_reason = finish_reason
+            state.prompt_tokens = prompt_tokens
+            state.completion_tokens = len(latent_chunks)
+            state.engine_time_s = time.perf_counter() - decode_state.engine_start_s
+
+            for field_name, value in encode_generated_latents(generated).items():
+                setattr(state, field_name, value)
+
+            return store_ming_tts_state(payload, state)
         finally:
             data.release_tensors()
-
-    def _result_adapter_impl(data: MingTTSSGLangRequestData) -> StagePayload:
-        decode_state = data.decode_state
-        payload = data.stage_payload
-        state = data.state if data.state is not None else load_ming_tts_state(payload)
-
-        latent_chunks: list[Any] = []
-        for latent in decode_state.generated_latents:
-            tensor = (
-                latent.detach()
-                if hasattr(latent, "detach")
-                else torch.as_tensor(latent)
-            )
-            if tensor.ndim == 3 and int(tensor.shape[0]) == 1:
-                tensor = tensor.squeeze(0)
-            latent_chunks.append(tensor)
-
-        raw = data.finish_reason
-        if raw is None and data.req is not None:
-            finished_reason = getattr(data.req, "finished_reason", None)
-            if finished_reason is not None and hasattr(finished_reason, "to_json"):
-                raw = finished_reason.to_json().get("type")
-            elif finished_reason is not None:
-                raw = str(finished_reason)
-
-        normalized = str(raw).lower() if raw is not None else None
-        if decode_state.stop_step is not None:
-            finish_reason = "stop"
-        elif normalized is not None:
-            if "length" in normalized:
-                finish_reason = "length"
-            elif "abort" in normalized:
-                finish_reason = "abort"
-            elif "error" in normalized:
-                finish_reason = "error"
-            else:
-                finish_reason = str(raw)
-        elif len(decode_state.generated_latents) >= int(decode_state.max_decode_steps):
-            finish_reason = "length"
-        else:
-            finish_reason = "stop"
-
-        prompt_input_ids = data.prompt_input_ids
-        if prompt_input_ids is None:
-            prompt_tokens = 0
-        else:
-            shape = getattr(prompt_input_ids, "shape", None)
-            prompt_tokens = (
-                int(shape[0])
-                if shape is not None and len(shape)
-                else len(prompt_input_ids)
-            )
-
-        generated = torch.stack(latent_chunks, dim=0)
-        state.generated_last_chunk = [
-            bool(item) for item in decode_state.generated_last_chunk
-        ]
-        state.stop_step = decode_state.stop_step
-        state.finish_reason = finish_reason
-        state.prompt_tokens = prompt_tokens
-        state.completion_tokens = len(latent_chunks)
-        state.engine_time_s = time.perf_counter() - decode_state.engine_start_s
-
-        for field_name, value in encode_generated_latents(generated).items():
-            setattr(state, field_name, value)
-
-        return store_ming_tts_state(payload, state)
 
     return request_builder, result_adapter
 
@@ -450,6 +366,5 @@ def make_ming_tts_scheduler_adapters(
 __all__ = [
     "MingTTSDecodeState",
     "MingTTSSGLangRequestData",
-    "MingTTSStaticPrefillCacheKey",
     "make_ming_tts_scheduler_adapters",
 ]
