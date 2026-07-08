@@ -447,6 +447,35 @@ class MingTTSModelRunner(ModelRunner):
                 feedback_embeddings=tensor_stats(feedback_embeddings),
                 feedback_mask=step_update.feedback_mask.detach().cpu().tolist(),
             )
+            for row_idx, sched_req in enumerate(requests):
+                decode_state = decode_states[row_idx]
+                write_event(
+                    "tts_engine",
+                    "tail_row",
+                    tp_rank=self._tp_rank,
+                    rid=sched_req.request_id,
+                    row=row_idx,
+                    step=steps[row_idx],
+                    max_steps=max_steps[row_idx],
+                    next_token_id=next_ids[row_idx],
+                    stop=stop_list[row_idx],
+                    length=length_list[row_idx],
+                    stop_prob=float(stop_prob[row_idx].detach().cpu().item()),
+                    feedback_mask=bool(
+                        step_update.feedback_mask[row_idx].detach().cpu().item()
+                    ),
+                    generated_count=len(decode_state.generated_latents),
+                    decode_input_embeds_len=len(sched_req.data.decode_input_embeds),
+                    hidden_state=tensor_stats(hidden_states[row_idx : row_idx + 1]),
+                    latent_history_before=tensor_stats(
+                        history_batch[row_idx : row_idx + 1]
+                    ),
+                    latent_history_after=tensor_stats(decode_state.latent_history),
+                    sampled=tensor_stats(sampled[row_idx : row_idx + 1]),
+                    feedback_embedding=tensor_stats(
+                        feedback_embeddings[row_idx : row_idx + 1]
+                    ),
+                )
         return step_update
 
     @staticmethod
