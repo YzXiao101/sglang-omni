@@ -343,10 +343,17 @@ def make_ming_tts_scheduler_adapters(
                     else len(prompt_input_ids)
                 )
 
-            generated = torch.stack(latent_chunks, dim=0)
-            state.generated_last_chunk = [
-                bool(item) for item in decode_state.generated_last_chunk
-            ]
+            if latent_chunks:
+                generated = torch.stack(latent_chunks, dim=0)
+                state.generated_last_chunk = [
+                    bool(item) for item in decode_state.generated_last_chunk
+                ]
+            else:
+                generated = torch.empty(
+                    (0, int(model.patch_size), int(model.latent_dim)),
+                    dtype=torch.float32,
+                )
+                state.generated_last_chunk = []
             state.stop_step = decode_state.stop_step
             state.finish_reason = finish_reason
             state.prompt_tokens = prompt_tokens
