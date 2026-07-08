@@ -9,6 +9,11 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.payload_types import (
     MingTTSState,
     decode_prompt_latent,
@@ -269,6 +274,24 @@ def make_ming_tts_scheduler_adapters(
             prompt_latent_for_history=prompt_latent_for_history,
             engine_start_s=time.perf_counter(),
         )
+        if is_enabled():
+            write_event(
+                "tts_engine_io",
+                "request_built",
+                rid=payload.request_id,
+                input_ids_len=len(input_ids_list),
+                prompt_tokens=int(state.prompt_tokens),
+                requires_projected_prefill=requires_projected_prefill,
+                spk_token_positions=state.spk_token_positions,
+                spk_injection_positions=state.spk_injection_positions,
+                audio_token_position=state.audio_token_position,
+                prompt_latent_start_position=state.prompt_latent_start_position,
+                prompt_latent_token_count=int(state.prompt_latent_token_count),
+                spk_emb=tensor_stats(spk_emb),
+                prompt_latent=tensor_stats(prompt_latent),
+                prefill_input_embeds=tensor_stats(prefill_input_embeds),
+                prompt_latent_for_history=tensor_stats(prompt_latent_for_history),
+            )
         data = MingTTSSGLangRequestData(
             input_ids=input_ids,
             prompt_input_ids=prompt_input_ids,
@@ -356,6 +379,18 @@ def make_ming_tts_scheduler_adapters(
             for field_name, value in encode_generated_latents(generated).items():
                 setattr(state, field_name, value)
 
+            if is_enabled():
+                write_event(
+                    "tts_engine_io",
+                    "result_built",
+                    rid=payload.request_id,
+                    finish_reason=finish_reason,
+                    prompt_tokens=int(state.prompt_tokens),
+                    completion_tokens=int(state.completion_tokens),
+                    stop_step=state.stop_step,
+                    generated_last_chunk=list(state.generated_last_chunk or []),
+                    generated_latents=tensor_stats(generated),
+                )
             return store_ming_tts_state(payload, state)
         finally:
             data.release_tensors()

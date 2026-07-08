@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
+from sglang_omni.models.ming_tts.debug_trace import is_enabled, write_event
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_DEFAULT_MAX_DECODE_STEPS,
     MingTTSState,
@@ -358,6 +360,27 @@ def preprocess_ming_tts_payload(
         state.audio_token_position = plan.audio_token_position
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
+    if is_enabled():
+        write_event(
+            "preprocessing",
+            "request",
+            rid=payload.request_id,
+            text_hash=hashlib.sha1(text.encode("utf-8")).hexdigest()[:16],
+            text_len=len(text),
+            has_ref_audio=state.ref_audio is not None,
+            ref_text_hash=(
+                hashlib.sha1(state.ref_text.encode("utf-8")).hexdigest()[:16]
+                if state.ref_text is not None
+                else None
+            ),
+            prompt_tokens=int(state.prompt_tokens),
+            input_ids_len=len(state.input_ids or []),
+            max_decode_steps=int(state.max_decode_steps),
+            cfg=float(state.cfg),
+            sigma=float(state.sigma),
+            temperature=float(state.temperature),
+            seed=state.seed,
+        )
     return store_ming_tts_state(payload, state)
 
 

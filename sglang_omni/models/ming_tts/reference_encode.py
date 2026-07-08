@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,11 @@ import torchaudio.functional as F
 
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
     encode_prompt_latent,
@@ -165,6 +171,21 @@ class MingTTSReferenceEncoder:
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
 
+        if is_enabled():
+            write_event(
+                "reference_encode",
+                "encoded_reference",
+                rid=payload.request_id,
+                ref_text_hash=hashlib.sha1(
+                    str(state.ref_text).encode("utf-8")
+                ).hexdigest()[:16],
+                prompt_tokens=int(state.prompt_tokens),
+                prompt_latent_token_count=int(state.prompt_latent_token_count),
+                prompt_waveform=tensor_stats(prompt_waveform),
+                speaker_waveform=tensor_stats(speaker_waveform),
+                speaker_embedding=tensor_stats(speaker_embedding),
+                prompt_latent=tensor_stats(prompt_latent),
+            )
         return store_ming_tts_state(payload, state)
 
     def _load_reference_waveform(self, path: str) -> tuple[Any, Any]:

@@ -11,6 +11,11 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.sglang_model import MingTTSTailInputs
 
 
@@ -152,6 +157,19 @@ class MingTTSModelRunner(ModelRunner):
             # extend region.
             req_embeds = torch.cat(req_parts, dim=0)
             batch_parts.append(req_embeds)
+            if is_enabled():
+                write_event(
+                    "tts_engine",
+                    "prefill_embeds",
+                    rid=sched_req.request_id,
+                    prefix_len=prefix_len,
+                    extend_len=extend_len,
+                    prompt_len=prompt_len,
+                    output_ids_len=len(req.output_ids),
+                    decode_input_embeds_len=len(data.decode_input_embeds or []),
+                    input_embeds_projected=data.prefill_input_embeds is not None,
+                    embeds=tensor_stats(req_embeds),
+                )
         return torch.cat(batch_parts, dim=0)
 
     def _forward_with_input_embeds(
@@ -208,6 +226,16 @@ class MingTTSModelRunner(ModelRunner):
 
         row_ids = self.model.stage_decode_feedback(torch.stack(rows, dim=0))
         forward_batch.input_ids[:batch_size].copy_(row_ids)
+        if is_enabled():
+            write_event(
+                "tts_engine",
+                "before_decode",
+                tp_rank=self._tp_rank,
+                rids=[sched_req.request_id for sched_req in requests],
+                steps=[int(sched_req.data.generation_steps) for sched_req in requests],
+                row_ids=row_ids.detach().cpu().tolist(),
+                feedback=tensor_stats(torch.stack(rows, dim=0)),
+            )
 
     def post_prefill(
         self,
@@ -331,6 +359,21 @@ class MingTTSModelRunner(ModelRunner):
                 device=device,
             )
 
+            if is_enabled():
+                write_event(
+                    "tts_engine",
+                    "tail_inputs",
+                    tp_rank=self._tp_rank,
+                    rids=[req.request_id for req in requests],
+                    steps=steps,
+                    max_steps=max_steps,
+                    hidden_states=tensor_stats(hidden_states),
+                    latent_history=tensor_stats(history_batch),
+                    cfg=cfg_tensor.detach().cpu().tolist(),
+                    sigma=sigma_tensor.detach().cpu().tolist(),
+                    temperature=temperature_tensor.detach().cpu().tolist(),
+                )
+
             # 3. Run the batched FlowLoss tail and build feedback embeddings.
             tail_outputs = self.model.run_tail_step(
                 MingTTSTailInputs(
@@ -389,6 +432,21 @@ class MingTTSModelRunner(ModelRunner):
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)
         )
+        if is_enabled():
+            write_event(
+                "tts_engine",
+                "tail_outputs",
+                tp_rank=self._tp_rank,
+                rids=[req.request_id for req in requests],
+                steps=steps,
+                next_token_ids=list(next_ids),
+                stop_flags=stop_list,
+                length_flags=length_list,
+                stop_prob=stop_prob.detach().cpu().tolist(),
+                sampled=tensor_stats(sampled),
+                feedback_embeddings=tensor_stats(feedback_embeddings),
+                feedback_mask=step_update.feedback_mask.detach().cpu().tolist(),
+            )
         return step_update
 
     @staticmethod
@@ -422,6 +480,18 @@ class MingTTSModelRunner(ModelRunner):
             if bool(step_update.feedback_mask[row_idx].item()):
                 feedback = step_update.feedback_embeddings[row_idx].detach().clone()
                 data.decode_input_embeds.append(feedback)
+        if is_enabled():
+            write_event(
+                "tts_engine",
+                "tp_follower_update",
+                tp_rank=self._tp_rank,
+                rids=[sched_req.request_id for sched_req in requests],
+                steps=[int(sched_req.data.generation_steps) for sched_req in requests],
+                next_token_ids=step_update.next_token_ids.detach().cpu().tolist(),
+                feedback_mask=step_update.feedback_mask.detach().cpu().tolist(),
+                stop_flags=step_update.stop_flags.detach().cpu().tolist(),
+                feedback_embeddings=tensor_stats(step_update.feedback_embeddings),
+            )
 
     @property
     def _is_entry_rank(self) -> bool:

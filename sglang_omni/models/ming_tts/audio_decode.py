@@ -11,6 +11,11 @@ import torch
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.payload_types import (
     decode_generated_latents,
     load_ming_tts_state,
@@ -80,6 +85,7 @@ class MingAudioDecoder(torch.nn.Module):
         last_chunks: list[bool],
         *,
         decode_mode: str = "chunked",
+        debug_rid: str | None = None,
     ) -> torch.Tensor:
         if decode_mode != "chunked":
             raise NotImplementedError(
@@ -115,8 +121,30 @@ class MingAudioDecoder(torch.nn.Module):
                 )
                 wav = self._normalize_waveform_chunk(wav)
                 waveform_chunks.append(wav)
+                if is_enabled():
+                    write_event(
+                        "audio_decode",
+                        "chunk_decoded",
+                        rid=debug_rid,
+                        step=step,
+                        last_chunk=last_chunk,
+                        latent=tensor_stats(chunk),
+                        waveform=tensor_stats(wav),
+                        waveform_samples=int(wav.numel()),
+                    )
 
-        return torch.cat(waveform_chunks, dim=0)
+        waveform = torch.cat(waveform_chunks, dim=0)
+        if is_enabled():
+            write_event(
+                "audio_decode",
+                "chunks_joined",
+                rid=debug_rid,
+                chunk_count=len(waveform_chunks),
+                last_chunks=last_chunks,
+                waveform=tensor_stats(waveform),
+                waveform_samples=int(waveform.numel()),
+            )
+        return waveform
 
     @staticmethod
     def _normalize_waveform_chunk(wav: Any) -> torch.Tensor:
@@ -149,6 +177,7 @@ def decode_ming_tts_audio_payload(
         latents,
         state.generated_last_chunk,
         decode_mode=decode_mode,
+        debug_rid=payload.request_id,
     )
     state.audio_decode_time_s = time.perf_counter() - started
     sample_rate = decoder.sample_rate
@@ -157,6 +186,19 @@ def decode_ming_tts_audio_payload(
 
     state.sample_rate = int(sample_rate)
     state.duration_s = float(waveform.numel() / int(sample_rate))
+    if is_enabled():
+        write_event(
+            "audio_decode",
+            "payload_decoded",
+            rid=payload.request_id,
+            finish_reason=state.finish_reason,
+            prompt_tokens=int(state.prompt_tokens),
+            completion_tokens=int(state.completion_tokens),
+            stop_step=state.stop_step,
+            duration_s=state.duration_s,
+            latents=tensor_stats(latents),
+            waveform=tensor_stats(waveform),
+        )
     if not keep_latents:
         state.generated_latents_bytes = None
         state.generated_latents_shape = None

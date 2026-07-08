@@ -16,6 +16,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from torch import nn
 
 from sglang_omni.models.ming_omni.talker.talker_module.aggregator import Aggregator
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.flow_matching import (
     FlowLoss,
     build_cfm_sampling_schedule,
@@ -157,6 +162,15 @@ class _MingTTSTailGraph:
                     sde_random=self.sde_random,
                 )
         self.graph = graph
+        if is_enabled():
+            write_event(
+                "tts_engine_model",
+                "tail_graph_captured",
+                batch_size=batch_size,
+                noise=tensor_stats(self.noise),
+                sde_random=tensor_stats(self.sde_random),
+                timesteps=tensor_stats(self.timesteps),
+            )
 
     def replay(
         self,
@@ -181,6 +195,20 @@ class _MingTTSTailGraph:
         self.sde_random[:, :batch_size].copy_(sde_random)
         self.sde_random[:, batch_size:].zero_()
         self.graph.replay()
+        if is_enabled():
+            write_event(
+                "tts_engine_model",
+                "tail_graph_replay",
+                batch_size=batch_size,
+                bucket=self.batch_size,
+                noise=tensor_stats(noise),
+                sde_random=tensor_stats(sde_random),
+                sampled=tensor_stats(self.outputs.sampled[:batch_size]),
+                feedback_embeddings=tensor_stats(
+                    self.outputs.feedback_embeddings[:batch_size]
+                ),
+                stop_prob=tensor_stats(self.outputs.stop_prob[:batch_size]),
+            )
         return MingTTSTailOutputs(
             sampled=self.outputs.sampled[:batch_size].clone(),
             feedback_embeddings=self.outputs.feedback_embeddings[:batch_size].clone(),
@@ -863,6 +891,16 @@ class MingTTSSGLangModel(nn.Module):
             device=inputs.hidden_states.device,
         )
         tail_graphs = self._tail_graphs
+        if is_enabled():
+            write_event(
+                "tts_engine_model",
+                "tail_sampling_inputs",
+                batch_size=int(inputs.hidden_states.shape[0]),
+                graph_enabled=tail_graphs is not None,
+                noise=tensor_stats(noise),
+                sde_random=tensor_stats(sde_random),
+                timesteps=tensor_stats(timesteps),
+            )
         if tail_graphs is not None:
             return tail_graphs.replay(
                 inputs,
