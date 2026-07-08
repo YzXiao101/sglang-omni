@@ -445,8 +445,8 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
 
         self.gate = MingBailingMoeGate(config)
         if self.multi_gate:
-            # Register modality gates for checkpoint coverage; the TTS serving
-            # path follows official generation and does not pass modality masks.
+            # note (yzxiao): Register modality gates for checkpoint coverage;
+            # TTS serving follows official generation and skips modality masks.
             self.image_gate = MingBailingMoeGate(config)
             self.audio_gate = MingBailingMoeGate(config)
         self.topk = TopK(
@@ -740,7 +740,7 @@ class MingBailingMoeTextModel(nn.Module):
 class MingTTSSGLangModel(nn.Module):
     """SGLang wrapper for Ming-TTS AR backbone and weighted TTS heads.
 
-    ``forward`` covers the hidden-state backbone path used by SGLang scheduling,
+    forward covers the hidden-state backbone path used by SGLang scheduling,
     CUDA graph, and TP.  FlowLoss sampling and latent feedback transitions run
     in the model runner's AR tail after this forward returns.
     """

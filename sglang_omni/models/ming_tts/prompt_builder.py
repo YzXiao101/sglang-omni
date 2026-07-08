@@ -30,8 +30,6 @@ class MingTTSPromptPlan:
     spk_injection_positions: list[int]
     prompt_latent_start_position: int | None
     prompt_latent_token_count: int
-    text_input_prefix_included: bool
-    has_embedding_injections: bool
 
 
 def build_ming_tts_prompt(
@@ -124,6 +122,4 @@ def build_ming_tts_prompt(
         spk_injection_positions=[position + 1 for position in spk_token_positions],
         prompt_latent_start_position=prompt_latent_start_position,
         prompt_latent_token_count=prompt_latent_token_count,
-        text_input_prefix_included=text_input_prefix_included,
-        has_embedding_injections=bool(spk_token_positions or prompt_latent_token_count),
     )

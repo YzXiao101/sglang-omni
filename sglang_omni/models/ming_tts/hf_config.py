@@ -8,9 +8,9 @@ from typing import Any
 from transformers import PretrainedConfig
 
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
+from sglang_omni.models.ming_tts.payload_types import MING_TTS_SAMPLE_RATE
 
 MING_TTS_MODEL_ARCH_OVERRIDE = "MingTTSSGLangModel"
-MING_TTS_SAMPLE_RATE = 44100
 MING_TTS_MROPE_SECTION = [16, 24, 24]
 MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION = "sdpa"
 MING_TTS_TAIL_ATTN_BACKEND = "torch"

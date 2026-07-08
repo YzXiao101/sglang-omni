@@ -425,8 +425,8 @@ class MingTTSModelRunner(ModelRunner):
 
     @property
     def _is_entry_rank(self) -> bool:
-        # Entry rank owns FlowLoss sampling and serialized acoustic output.
-        # TP followers keep only the metadata needed for the next backbone step.
+        # note (yzxiao): Entry rank owns FlowLoss sampling and serialized acoustic
+        # output; TP followers keep only next-step backbone metadata.
         return self._tp_rank == 0
 
     def _broadcast_tp_step_update(self, step_update: MingTTSTPStepUpdate) -> None:

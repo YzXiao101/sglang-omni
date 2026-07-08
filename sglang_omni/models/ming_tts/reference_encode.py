@@ -206,8 +206,8 @@ class MingTTSReferenceEncoder:
     def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
         if not isinstance(waveform, torch.Tensor):
             waveform = torch.as_tensor(waveform)
-        # Official generate() runs AudioVAE encode under bf16 autocast; this
-        # stage is isolated, so align the waveform to the loaded AudioVAE dtype.
+        # note (yzxiao): Official generate runs AudioVAE encode under bf16
+        # autocast; this isolated stage aligns waveform dtype to loaded weights.
         return waveform.to(
             device=self.device,
             dtype=self._audio_vae_floating_dtype(),

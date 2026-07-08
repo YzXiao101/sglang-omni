@@ -111,8 +111,8 @@ def _build_prefill_input_embeds(
     dtype: Any,
     device: Any,
 ) -> tuple[Any, Any]:
-    # Ming projected prefill is model-weight dependent: speaker embeddings and
-    # prompt latents must be projected before SGLang sees the prefill rows.
+    # note (yzxiao): Ming projected prefill depends on model weights; speaker
+    # embeddings and prompt latents are projected before SGLang sees prefill rows.
     embedding = model.get_input_embeddings()
     input_ids_for_embedding = torch.tensor(
         input_ids_list,
