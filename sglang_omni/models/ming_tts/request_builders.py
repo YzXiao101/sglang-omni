@@ -296,8 +296,8 @@ def preprocess_ming_tts_payload(
     seed_value = tts_params.get("seed", params.get("seed"))
     seed = None
     if seed_value is not None:
-        # Accepted for payload compatibility; Ming AR follows official
-        # unseeded FlowLoss sampling until request-local RNG support exists.
+        # note (yzxiao): Accept seed for payload compatibility; Ming AR follows
+        # official unseeded FlowLoss sampling until request-local RNG exists.
         seed = resolve_int("seed", seed_value)
         if seed < 0:
             raise ValueError(f"Ming-Omni-TTS seed must be non-negative, got {seed}")

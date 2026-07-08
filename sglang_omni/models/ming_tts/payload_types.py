@@ -64,10 +64,7 @@ def decode_generated_latents(
 def encode_speaker_embedding(spk_emb: Any) -> dict[str, Any]:
     """Encode raw CampPlus speaker embeddings for cross-stage transport."""
 
-    tensor = _encode_float_tensor(
-        spk_emb,
-        name="Ming-Omni-TTS speaker embedding",
-    )
+    tensor = _encode_float_tensor(spk_emb)
     return {
         "spk_emb_bytes": tensor.numpy().tobytes(),
         "spk_emb_shape": list(tensor.shape),
@@ -92,7 +89,6 @@ def decode_speaker_embedding(
     return _decode_float_tensor(
         raw,
         shape,
-        name="Ming-Omni-TTS speaker embedding",
         device=device,
         dtype=dtype,
     )
@@ -101,10 +97,7 @@ def decode_speaker_embedding(
 def encode_prompt_latent(prompt_latent: Any) -> dict[str, Any]:
     """Encode raw AudioVAE prompt latents for cross-stage transport."""
 
-    tensor = _encode_float_tensor(
-        prompt_latent,
-        name="Ming-Omni-TTS prompt latent",
-    )
+    tensor = _encode_float_tensor(prompt_latent)
     return {
         "prompt_latent_bytes": tensor.numpy().tobytes(),
         "prompt_latent_shape": list(tensor.shape),
@@ -129,13 +122,12 @@ def decode_prompt_latent(
     return _decode_float_tensor(
         raw,
         shape,
-        name="Ming-Omni-TTS prompt latent",
         device=device,
         dtype=dtype,
     )
 
 
-def _encode_float_tensor(tensor: Any, *, name: str) -> Any:
+def _encode_float_tensor(tensor: Any) -> Any:
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(tensor)
     return tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -145,7 +137,6 @@ def _decode_float_tensor(
     raw: Any,
     shape: Any,
     *,
-    name: str,
     device: Any | None,
     dtype: Any | None,
 ) -> Any | None:
@@ -162,7 +153,6 @@ def _decode_float_tensor(
 class MingTTSState(PipelineStateBase):
     """Per-request state for Ming-Omni-TTS generation."""
 
-    # Request input
     text: str = ""
     prompt: str | None = None
     instructions: str | None = None
@@ -171,7 +161,6 @@ class MingTTSState(PipelineStateBase):
     ref_audio: Any | None = None
     ref_text: str | None = None
 
-    # Prompt build output
     input_ids: list[int] | None = None
     prompt_text: str | None = None
     spk_token_positions: list[int] | None = None
@@ -179,10 +168,7 @@ class MingTTSState(PipelineStateBase):
     audio_token_position: int | None = None
     prompt_latent_start_position: int | None = None
     prompt_latent_token_count: int = 0
-    prompt_cache_key: str | None = None
-    embedding_cache_key: str | None = None
 
-    # Future reference / speaker transport fields
     spk_emb_bytes: bytes | None = None
     spk_emb_shape: list[int] | None = None
     spk_emb_dtype: str | None = None
@@ -190,14 +176,12 @@ class MingTTSState(PipelineStateBase):
     prompt_latent_shape: list[int] | None = None
     prompt_latent_dtype: str | None = None
 
-    # Generation params
     max_decode_steps: int = MING_TTS_DEFAULT_MAX_DECODE_STEPS
     cfg: float = 2.0
     sigma: float = 0.25
     temperature: float = 0.0
     seed: int | None = None
 
-    # TTS engine output
     generated_latents_bytes: bytes | None = None
     generated_latents_shape: list[int] | None = None
     generated_latents_dtype: str | None = None
@@ -209,7 +193,6 @@ class MingTTSState(PipelineStateBase):
     completion_tokens: int = 0
     engine_time_s: float = 0.0
 
-    # Audio metadata
     sample_rate: int = MING_TTS_SAMPLE_RATE
     duration_s: float | None = None
     audio_decode_time_s: float = 0.0
@@ -251,10 +234,6 @@ class MingTTSState(PipelineStateBase):
             )
         if self.prompt_latent_token_count:
             data["prompt_latent_token_count"] = int(self.prompt_latent_token_count)
-        if self.prompt_cache_key is not None:
-            data["prompt_cache_key"] = self.prompt_cache_key
-        if self.embedding_cache_key is not None:
-            data["embedding_cache_key"] = self.embedding_cache_key
         if self.spk_emb_bytes is not None:
             data["spk_emb_bytes"] = self.spk_emb_bytes
             data["spk_emb_shape"] = list(self.spk_emb_shape or [])
@@ -336,8 +315,6 @@ class MingTTSState(PipelineStateBase):
             prompt_latent_token_count=int(
                 data.get("prompt_latent_token_count", 0) or 0
             ),
-            prompt_cache_key=data.get("prompt_cache_key"),
-            embedding_cache_key=data.get("embedding_cache_key"),
             spk_emb_bytes=bytes_or_none(data.get("spk_emb_bytes")),
             spk_emb_shape=int_list_or_none(data.get("spk_emb_shape")),
             spk_emb_dtype=data.get("spk_emb_dtype"),
