@@ -91,6 +91,8 @@ class MingAudioDecoder(torch.nn.Module):
         latents = latents.to(device=self.device, dtype=self.dtype)
 
         last_chunks = [bool(item) for item in last_chunks]
+        if int(latents.shape[0]) == 0:
+            return torch.empty((0,), device=self.device, dtype=torch.float32)
 
         stream_state = (None, None, None)
         past_key_values = None

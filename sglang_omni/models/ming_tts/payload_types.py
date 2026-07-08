@@ -180,7 +180,6 @@ class MingTTSState(PipelineStateBase):
     cfg: float = 2.0
     sigma: float = 0.25
     temperature: float = 0.0
-    seed: int | None = None
 
     generated_latents_bytes: bytes | None = None
     generated_latents_shape: list[int] | None = None
@@ -242,8 +241,6 @@ class MingTTSState(PipelineStateBase):
             data["prompt_latent_bytes"] = self.prompt_latent_bytes
             data["prompt_latent_shape"] = list(self.prompt_latent_shape or [])
             data["prompt_latent_dtype"] = self.prompt_latent_dtype
-        if self.seed is not None:
-            data["seed"] = int(self.seed)
         if self.generated_latents_bytes is not None:
             data["generated_latents_bytes"] = self.generated_latents_bytes
             data["generated_latents_shape"] = list(self.generated_latents_shape or [])
@@ -328,7 +325,6 @@ class MingTTSState(PipelineStateBase):
             cfg=float_or_default(data.get("cfg"), 2.0),
             sigma=float_or_default(data.get("sigma"), 0.25),
             temperature=float_or_default(data.get("temperature"), 0.0),
-            seed=int(data["seed"]) if data.get("seed") is not None else None,
             generated_latents_bytes=bytes_or_none(data.get("generated_latents_bytes")),
             generated_latents_shape=int_list_or_none(
                 data.get("generated_latents_shape")

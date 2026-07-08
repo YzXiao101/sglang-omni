@@ -250,6 +250,15 @@ def preprocess_ming_tts_payload(
                 f"Ming-Omni-TTS does not use logits sampling field {field!r}"
             )
 
+    if (
+        first_present(tts_engine_params, tts_params, params, names=("seed",))
+        is not None
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS seed is currently unsupported because "
+            "FlowLoss sampling is unseeded"
+        )
+
     max_steps_value = first_present(
         tts_engine_params,
         tts_params,
@@ -293,15 +302,6 @@ def preprocess_ming_tts_payload(
     ):
         temperature_value = params["temperature"]
 
-    seed_value = tts_params.get("seed", params.get("seed"))
-    seed = None
-    if seed_value is not None:
-        # note (yzxiao): Accept seed for payload compatibility; Ming AR follows
-        # official unseeded FlowLoss sampling until request-local RNG exists.
-        seed = resolve_int("seed", seed_value)
-        if seed < 0:
-            raise ValueError(f"Ming-Omni-TTS seed must be non-negative, got {seed}")
-
     prompt = (
         input_prompt
         or optional_text(tts_params.get("prompt"))
@@ -326,7 +326,6 @@ def preprocess_ming_tts_payload(
             default=0.25,
         ),
         temperature=resolve_float("temperature", temperature_value, default=0.0),
-        seed=seed,
     )
     if state.cfg < 1e-5 or state.cfg == 1.0:
         raise ValueError(
