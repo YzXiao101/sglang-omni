@@ -115,8 +115,6 @@ class MingTTSModelRunner(ModelRunner):
             prompt_len = int(prompt_ids.shape[0])
             req_parts = []
 
-            # 1. Materialize prompt rows from projected prompt embeds when
-            # present, otherwise from the normal text embedding table.
             prompt_start = min(prefix_len, prompt_len)
             prompt_stop = min(end, prompt_len)
             if prompt_stop > prompt_start:
@@ -130,9 +128,8 @@ class MingTTSModelRunner(ModelRunner):
                     ].to(device=device, dtype=dtype)
                 req_parts.append(prompt_rows)
 
-            # 2. Materialize generated audio-feedback rows after the original
-            # prompt. This branch is used when a retracted request prefills
-            # over previously generated audio_patch tokens.
+            # Note (yzxiao): Retraction may re-prefill generated audio tokens,
+            # whose rows live in feedback embeddings rather than token embeds.
             gen_start = max(prefix_len, prompt_len) - prompt_len
             gen_end = max(end - prompt_len, 0)
             if gen_end > gen_start:
@@ -148,8 +145,6 @@ class MingTTSModelRunner(ModelRunner):
                 ]
                 req_parts.append(torch.stack(feedback_rows, dim=0))
 
-            # 3. SGLang consumes one embedding row per token in the current
-            # extend region.
             req_embeds = torch.cat(req_parts, dim=0)
             batch_parts.append(req_embeds)
         return torch.cat(batch_parts, dim=0)
@@ -274,7 +269,6 @@ class MingTTSModelRunner(ModelRunner):
         hidden_states: torch.Tensor,
         requests: list[Any],
     ) -> MingTTSTPStepUpdate:
-        # 1. Prepare the TP broadcast payload and autocast context.
         weight = self.model._decode_input_embedding.weight
         device = hidden_states.device
         batch_size = len(requests)
@@ -296,7 +290,6 @@ class MingTTSModelRunner(ModelRunner):
             context = nullcontext()
 
         with context:
-            # 2. Gather request-local decode state into batched tail tensors.
             decode_states = [req.data.decode_state for req in requests]
             steps = [int(req.data.generation_steps) for req in requests]
             max_steps = [int(state.max_decode_steps) for state in decode_states]
@@ -331,7 +324,6 @@ class MingTTSModelRunner(ModelRunner):
                 device=device,
             )
 
-            # 3. Run the batched FlowLoss tail and build feedback embeddings.
             tail_outputs = self.model.run_tail_step(
                 MingTTSTailInputs(
                     hidden_states=hidden_states,
@@ -344,7 +336,6 @@ class MingTTSModelRunner(ModelRunner):
             sampled = tail_outputs.sampled
             stop_prob = tail_outputs.stop_prob
             feedback_embeddings = tail_outputs.feedback_embeddings
-            # 4. Convert model stop probabilities and max-step limits into flags.
             stop_flags = (stop_prob > 0.5) & (steps_tensor > 3)
             length_flags = steps_tensor + 1 >= max_steps_tensor
 
@@ -352,7 +343,6 @@ class MingTTSModelRunner(ModelRunner):
             length_list = [
                 bool(value) for value in length_flags.detach().cpu().tolist()
             ]
-            # 5. Scatter sampled latents back to each request's recurrence state.
             for row_idx, decode_state in enumerate(decode_states):
                 step = steps[row_idx]
                 sampled_row = sampled[row_idx : row_idx + 1]
@@ -385,7 +375,6 @@ class MingTTSModelRunner(ModelRunner):
                     )
                     step_update.feedback_mask[row_idx] = True
 
-        # 6. Finalize the next AR token ids consumed by SGLang and TP followers.
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)
         )
@@ -425,8 +414,8 @@ class MingTTSModelRunner(ModelRunner):
 
     @property
     def _is_entry_rank(self) -> bool:
-        # note (yzxiao): Entry rank owns FlowLoss sampling and serialized acoustic
-        # output; TP followers keep only next-step backbone metadata.
+        # Note (yzxiao): FlowLoss is not tensor-parallel, so rank 0 owns
+        # acoustic sampling while followers only mirror the next AR input.
         return self._tp_rank == 0
 
     def _broadcast_tp_step_update(self, step_update: MingTTSTPStepUpdate) -> None:
