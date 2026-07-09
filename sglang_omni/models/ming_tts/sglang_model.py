@@ -445,8 +445,8 @@ class MingBailingMoeSparseMoeBlock(nn.Module):
 
         self.gate = MingBailingMoeGate(config)
         if self.multi_gate:
-            # note (yzxiao): Register modality gates for checkpoint coverage;
-            # TTS serving follows official generation and skips modality masks.
+            # Note (yzxiao): These modality gates are loaded for checkpoint
+            # coverage even though TTS serving does not use modality masks.
             self.image_gate = MingBailingMoeGate(config)
             self.audio_gate = MingBailingMoeGate(config)
         self.topk = TopK(
