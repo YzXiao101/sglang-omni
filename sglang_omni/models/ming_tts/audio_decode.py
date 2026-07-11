@@ -114,6 +114,7 @@ class MingAudioDecoder(torch.nn.Module):
                     use_cache=True,
                     stream_state=stream_state,
                     last_chunk=last_chunk,
+                    split_sliding_window_boundary=False,
                 )
                 wav = self._normalize_waveform_chunk(wav)
                 waveform_chunks.append(wav)

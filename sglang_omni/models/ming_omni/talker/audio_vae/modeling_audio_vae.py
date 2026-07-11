@@ -48,7 +48,7 @@ class AudioVAE(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-    def encode_latent(self, waveform, waveform_length):
+    def encode_latent(self, waveform, waveform_length, generator=None):
         """
         Encodes a raw waveform to obtain its acoustic latent representation.
         Args:
@@ -69,7 +69,7 @@ class AudioVAE(PreTrainedModel):
         h = h.transpose(1, 2)  # [B, d, T]
 
         posterior = OobleckDiagonalGaussianDistribution(h)
-        latent = posterior.sample()  # [B, d/2, T]
+        latent = posterior.sample(generator=generator)  # [B, d/2, T]
         latent = latent.transpose(1, 2)
         return latent, frame_num
 
@@ -80,6 +80,7 @@ class AudioVAE(PreTrainedModel):
         use_cache=False,
         stream_state=(None, None, None),
         last_chunk=False,
+        split_sliding_window_boundary=True,
     ):
         """
         Reconstructs the raw audio waveform from its acoustic latent representation.
@@ -95,5 +96,6 @@ class AudioVAE(PreTrainedModel):
             use_cache=use_cache,
             stream_state=stream_state,
             last_chunk=last_chunk,
+            split_sliding_window_boundary=split_sliding_window_boundary,
         )
         return waveform, stream_state, past_key_values

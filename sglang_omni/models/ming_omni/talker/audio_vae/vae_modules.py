@@ -158,6 +158,7 @@ class Decoder(nn.Module):
         use_cache=False,
         stream_state=None,
         last_chunk=False,
+        split_sliding_window_boundary=True,
     ):
         upsample_state, audio_buffer, window_buffer = stream_state
         bsz, device, dtype = x.size(0), x.device, x.dtype
@@ -181,7 +182,8 @@ class Decoder(nn.Module):
         hidden_states_list = []
 
         if (
-            use_cache
+            split_sliding_window_boundary
+            and use_cache
             and getattr(self.decoder.config, "sliding_window", None) is not None
         ):
             sw_size = self.decoder.config.sliding_window

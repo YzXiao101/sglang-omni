@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from sglang_omni.models.ming_tts.payload_types import (
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
+
+MING_TTS_REFERENCE_RANDOM_SEED = 1895
 
 
 class MingSpeakerEmbeddingExtractor:
@@ -70,8 +73,12 @@ class MingTTSReferenceEncoder:
         self.audio_vae = decoder.audio_vae
         self.sample_rate = int(decoder.sample_rate)
         self.device = decoder.device
+        self.dtype = decoder.dtype
         self.patch_size = int(patch_size)
         self.speaker_encoder = speaker_encoder
+        self.generator = torch.Generator(device=self.device).manual_seed(
+            MING_TTS_REFERENCE_RANDOM_SEED
+        )
         if self.sample_rate != MING_TTS_SAMPLE_RATE:
             raise ValueError(
                 "Ming-Omni-TTS reference encoder requires sample_rate "
@@ -119,16 +126,23 @@ class MingTTSReferenceEncoder:
         )
         prompt_waveform = self._pad_waveform(prompt_waveform)
 
-        with torch.inference_mode():
+        context = (
+            torch.autocast(device_type="cuda", dtype=self.dtype)
+            if self.device.type == "cuda"
+            and self.dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with torch.inference_mode(), context:
             waveform_length = torch.tensor(
                 [int(prompt_waveform.shape[1])],
                 dtype=torch.long,
                 device=self.device,
             )
-            prompt_waveform = self._prepare_audio_vae_waveform(prompt_waveform)
+            prompt_waveform = prompt_waveform.to(device=self.device)
             prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
                 prompt_waveform,
                 waveform_length,
+                generator=self.generator,
             )
         frames = int(prompt_latent.shape[1])
         prompt_latent_token_count = frames // self.patch_size
@@ -203,24 +217,9 @@ class MingTTSReferenceEncoder:
         padded[:, : int(waveform.shape[-1])] = waveform.clone()
         return padded
 
-    def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
-        if not isinstance(waveform, torch.Tensor):
-            waveform = torch.as_tensor(waveform)
-        # Note (yzxiao): The official monolithic path reaches AudioVAE encode
-        # under bf16 autocast, so this split stage must match weight dtype.
-        return waveform.to(
-            device=self.device,
-            dtype=self._audio_vae_floating_dtype(),
-        )
-
-    def _audio_vae_floating_dtype(self) -> Any:
-        for parameter in self.audio_vae.parameters():
-            if parameter.is_floating_point():
-                return parameter.dtype
-        return torch.float32
-
 
 __all__ = [
+    "MING_TTS_REFERENCE_RANDOM_SEED",
     "MingSpeakerEmbeddingExtractor",
     "MingTTSReferenceEncoder",
 ]
