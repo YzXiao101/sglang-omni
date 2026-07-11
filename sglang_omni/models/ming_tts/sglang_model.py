@@ -911,30 +911,22 @@ class MingTTSSGLangModel(nn.Module):
         batch_size: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        noise_rows: list[torch.Tensor] = []
-        sde_rows: list[torch.Tensor] = []
-        timesteps = None
-        for _ in range(int(batch_size)):
-            row_noise = torch.randn(
-                1,
-                int(self.latent_dim),
-                int(self.patch_size),
-                device=device,
-            )
-            row_timesteps, row_sde_random = build_cfm_sampling_schedule(
-                steps=_MING_TTS_CFM_STEPS,
-                device=device,
-                dtype=row_noise.dtype,
-                batch_size=1,
-                patch_size=int(self.patch_size),
-                latent_dim=int(self.latent_dim),
-            )
-            noise_rows.append(row_noise)
-            sde_rows.append(row_sde_random)
-            if timesteps is None:
-                timesteps = row_timesteps
-
-        return torch.cat(noise_rows, dim=0), timesteps, torch.cat(sde_rows, dim=1)
+        batch_size = int(batch_size)
+        noise = torch.randn(
+            batch_size,
+            int(self.latent_dim),
+            int(self.patch_size),
+            device=device,
+        )
+        timesteps, sde_random = build_cfm_sampling_schedule(
+            steps=_MING_TTS_CFM_STEPS,
+            device=device,
+            dtype=noise.dtype,
+            batch_size=batch_size,
+            patch_size=int(self.patch_size),
+            latent_dim=int(self.latent_dim),
+        )
+        return noise, timesteps, sde_random
 
     @torch.no_grad()
     def forward(

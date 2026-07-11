@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from sglang_omni.models.ming_tts.payload_types import MING_TTS_DEFAULT_MAX_DECODE_STEPS
+from sglang_omni.models.ming_tts.payload_types import (
+    MING_TTS_DEFAULT_MAX_DECODE_STEPS,
+    MingTTSState,
+)
+from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.request_builders import preprocess_ming_tts_payload
 from sglang_omni.models.ming_tts.tokenizer import (
+    AUDIO_PATCH_TOKEN,
     AUDIO_START_TOKEN,
+    SPK_END_TOKEN,
+    SPK_START_TOKEN,
     MingTTSSpecialTokenIds,
     MingTTSTokenizerBundle,
 )
@@ -19,8 +26,14 @@ class _FakeTokenizer:
         del add_special_tokens
         if text in ("<role>HUMAN</role>", "<role>ASSISTANT</role>"):
             return [1, 2]
+        if text == AUDIO_PATCH_TOKEN:
+            return [3]
         if text == AUDIO_START_TOKEN:
             return [4]
+        if text == SPK_START_TOKEN:
+            return [6]
+        if text == f"{SPK_END_TOKEN}\n":
+            return [7]
         if text:
             return [10]
         return []
@@ -56,6 +69,33 @@ def _payload(*, params: dict | None = None, tts_params: dict | None = None):
             metadata={"tts_params": tts_params or {}},
         ),
         data={},
+    )
+
+
+def test_ming_tts_prompt_embedding_positions_match_special_tokens() -> None:
+    tokenizer = _tokenizer()
+    prompt_latent_token_count = 3
+    plan = build_ming_tts_prompt(
+        MingTTSState(text="target text", prompt="prompt"),
+        tokenizer,
+        prompt_text="reference text",
+        speaker_count=1,
+        prompt_latent_token_count=prompt_latent_token_count,
+    )
+
+    speaker_position = plan.spk_token_positions[0]
+    injection_position = plan.spk_injection_positions[0]
+    assert plan.input_ids[speaker_position] == tokenizer.special.spk_start
+    assert injection_position == speaker_position + 1
+    assert plan.input_ids[injection_position] == tokenizer.special.audio_patch
+
+    audio_position = plan.audio_token_position
+    latent_start = plan.prompt_latent_start_position
+    assert plan.input_ids[audio_position] == tokenizer.special.audio_start
+    assert latent_start == audio_position + 1
+    assert (
+        plan.input_ids[latent_start : latent_start + prompt_latent_token_count]
+        == [tokenizer.special.audio_patch] * prompt_latent_token_count
     )
 
 

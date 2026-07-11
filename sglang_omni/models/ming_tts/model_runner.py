@@ -23,10 +23,8 @@ class MingTTSTPStepUpdate:
     only to keep their next backbone decode input aligned.
     """
 
-    next_token_ids: torch.Tensor
+    control_tensor: torch.Tensor
     feedback_embeddings: torch.Tensor
-    feedback_mask: torch.Tensor
-    stop_flags: torch.Tensor
 
     @classmethod
     def empty_for_broadcast(
@@ -38,7 +36,8 @@ class MingTTSTPStepUpdate:
         feedback_dtype: torch.dtype,
     ) -> "MingTTSTPStepUpdate":
         return cls(
-            next_token_ids=torch.zeros(
+            control_tensor=torch.zeros(
+                3,
                 int(batch_size),
                 dtype=torch.long,
                 device=device,
@@ -49,17 +48,19 @@ class MingTTSTPStepUpdate:
                 dtype=feedback_dtype,
                 device=device,
             ),
-            feedback_mask=torch.zeros(
-                int(batch_size),
-                dtype=torch.long,
-                device=device,
-            ),
-            stop_flags=torch.zeros(
-                int(batch_size),
-                dtype=torch.long,
-                device=device,
-            ),
         )
+
+    @property
+    def next_token_ids(self) -> torch.Tensor:
+        return self.control_tensor[0]
+
+    @property
+    def feedback_mask(self) -> torch.Tensor:
+        return self.control_tensor[1]
+
+    @property
+    def stop_flags(self) -> torch.Tensor:
+        return self.control_tensor[2]
 
 
 class MingTTSModelRunner(ModelRunner):
@@ -338,11 +339,11 @@ class MingTTSModelRunner(ModelRunner):
             feedback_embeddings = tail_outputs.feedback_embeddings
             stop_flags = (stop_prob > 0.5) & (steps_tensor > 3)
             length_flags = steps_tensor + 1 >= max_steps_tensor
-
-            stop_list = [bool(value) for value in stop_flags.detach().cpu().tolist()]
-            length_list = [
-                bool(value) for value in length_flags.detach().cpu().tolist()
-            ]
+            feedback_mask = ~(stop_flags | length_flags)
+            step_update.stop_flags.copy_(stop_flags)
+            step_update.feedback_mask.copy_(feedback_mask)
+            decision_rows = torch.stack((stop_flags, length_flags)).cpu().tolist()
+            stop_list, length_list = decision_rows
             for row_idx, decode_state in enumerate(decode_states):
                 step = steps[row_idx]
                 sampled_row = sampled[row_idx : row_idx + 1]
@@ -352,7 +353,6 @@ class MingTTSModelRunner(ModelRunner):
                 stop = stop_list[row_idx]
                 length = length_list[row_idx]
                 decode_state.generated_last_chunk.append(stop or length)
-                step_update.stop_flags[row_idx] = stop
                 if stop:
                     decode_state.stop_step = step
                     next_ids.append(int(decode_state.audio_eos_token_id))
@@ -373,7 +373,6 @@ class MingTTSModelRunner(ModelRunner):
                             dtype=step_update.feedback_embeddings.dtype,
                         )
                     )
-                    step_update.feedback_mask[row_idx] = True
 
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)
@@ -402,13 +401,14 @@ class MingTTSModelRunner(ModelRunner):
         step_update: MingTTSTPStepUpdate,
         requests: list[Any],
     ) -> None:
+        feedback_list, stop_list = step_update.control_tensor[1:].cpu().tolist()
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             decode_state = data.decode_state
             step = int(data.generation_steps)
-            if bool(step_update.stop_flags[row_idx].item()):
+            if stop_list[row_idx]:
                 decode_state.stop_step = step
-            if bool(step_update.feedback_mask[row_idx].item()):
+            if feedback_list[row_idx]:
                 feedback = step_update.feedback_embeddings[row_idx].detach().clone()
                 data.decode_input_embeds.append(feedback)
 
@@ -422,10 +422,8 @@ class MingTTSModelRunner(ModelRunner):
         if self._tp_size <= 1:
             return
         for tensor in (
-            step_update.next_token_ids,
+            step_update.control_tensor,
             step_update.feedback_embeddings,
-            step_update.feedback_mask,
-            step_update.stop_flags,
         ):
             self._broadcast_tensor_from_entry(tensor)
 
