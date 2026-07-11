@@ -42,7 +42,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.native_rms_norm = float(torch.__version__[:3]) >= 2.4
+        self.native_rms_norm = hasattr(F, "rms_norm")
 
     def forward(self, x):
         if self.native_rms_norm:

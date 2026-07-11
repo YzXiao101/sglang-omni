@@ -126,6 +126,7 @@ class _MingTTSTailGraph:
             self.model._make_tail_sampling_inputs(
                 batch_size=batch_size,
                 device=device,
+                generator=self.model._tail_capture_generator,
             )
         )
 
@@ -786,6 +787,13 @@ class MingTTSSGLangModel(nn.Module):
         tail_attn_backend = MING_TTS_TAIL_ATTN_BACKEND
 
         weight = self.model.word_embeddings.weight
+        random_seed = int(getattr(server_args, "random_seed", 0))
+        self._tail_runtime_generator = torch.Generator(
+            device=weight.device
+        ).manual_seed(random_seed)
+        self._tail_capture_generator = torch.Generator(
+            device=weight.device
+        ).manual_seed(random_seed + 1)
         self._decode_input_embedding = nn.Embedding(
             max_batch_size,
             self.hidden_size,
@@ -861,6 +869,7 @@ class MingTTSSGLangModel(nn.Module):
         noise, timesteps, sde_random = self._make_tail_sampling_inputs(
             batch_size=int(inputs.hidden_states.shape[0]),
             device=inputs.hidden_states.device,
+            generator=self._tail_runtime_generator,
         )
         tail_graphs = self._tail_graphs
         if tail_graphs is not None:
@@ -910,6 +919,7 @@ class MingTTSSGLangModel(nn.Module):
         *,
         batch_size: int,
         device: torch.device,
+        generator: torch.Generator,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         noise_rows: list[torch.Tensor] = []
         sde_rows: list[torch.Tensor] = []
@@ -920,6 +930,7 @@ class MingTTSSGLangModel(nn.Module):
                 int(self.latent_dim),
                 int(self.patch_size),
                 device=device,
+                generator=generator,
             )
             row_timesteps, row_sde_random = build_cfm_sampling_schedule(
                 steps=_MING_TTS_CFM_STEPS,
@@ -928,6 +939,7 @@ class MingTTSSGLangModel(nn.Module):
                 batch_size=1,
                 patch_size=int(self.patch_size),
                 latent_dim=int(self.latent_dim),
+                generator=generator,
             )
             noise_rows.append(row_noise)
             sde_rows.append(row_sde_random)

@@ -20,6 +20,7 @@ def build_cfm_sampling_schedule(
     batch_size: int,
     patch_size: int,
     latent_dim: int,
+    generator: torch.Generator,
     use_epss: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if use_epss:
@@ -28,7 +29,15 @@ def build_cfm_sampling_schedule(
         timesteps = torch.linspace(0, 1, int(steps) + 1, device=device, dtype=dtype)
     y0_shape = (int(batch_size), int(patch_size), int(latent_dim))
     sde_random = torch.stack(
-        [torch.randn(y0_shape, device=device, dtype=dtype) for _ in range(int(steps))],
+        [
+            torch.randn(
+                y0_shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            for _ in range(int(steps))
+        ],
         dim=0,
     )
     return timesteps, sde_random
