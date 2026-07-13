@@ -18,7 +18,8 @@ from torch import nn
 from sglang_omni.models.ming_omni.talker.talker_module.aggregator import Aggregator
 from sglang_omni.models.ming_tts.flow_matching import (
     FlowLoss,
-    build_cfm_sampling_schedule,
+    build_cfm_sde_random,
+    build_cfm_timesteps,
 )
 from sglang_omni.models.ming_tts.hf_config import MING_TTS_TAIL_ATTN_BACKEND
 from sglang_omni.models.ming_tts.weight_loading import (
@@ -830,6 +831,7 @@ class MingTTSSGLangModel(nn.Module):
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(192, self.hidden_size, bias=True)
         self._tail_graphs = None
+        self._cfm_timesteps: torch.Tensor | None = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
@@ -918,7 +920,15 @@ class MingTTSSGLangModel(nn.Module):
             int(self.patch_size),
             device=device,
         )
-        timesteps, sde_random = build_cfm_sampling_schedule(
+        timesteps = self._cfm_timesteps
+        if timesteps is None or timesteps.device != device:
+            timesteps = build_cfm_timesteps(
+                steps=_MING_TTS_CFM_STEPS,
+                device=device,
+                dtype=noise.dtype,
+            )
+            self._cfm_timesteps = timesteps
+        sde_random = build_cfm_sde_random(
             steps=_MING_TTS_CFM_STEPS,
             device=device,
             dtype=noise.dtype,

@@ -12,7 +12,19 @@ from sglang_omni.models.ming_omni.talker.talker_module.cfm import get_epss_times
 from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
 
 
-def build_cfm_sampling_schedule(
+def build_cfm_timesteps(
+    *,
+    steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    use_epss: bool = True,
+) -> torch.Tensor:
+    if use_epss:
+        return get_epss_timesteps(int(steps), device=device, dtype=dtype)
+    return torch.linspace(0, 1, int(steps) + 1, device=device, dtype=dtype)
+
+
+def build_cfm_sde_random(
     *,
     steps: int,
     device: torch.device,
@@ -20,18 +32,12 @@ def build_cfm_sampling_schedule(
     batch_size: int,
     patch_size: int,
     latent_dim: int,
-    use_epss: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if use_epss:
-        timesteps = get_epss_timesteps(int(steps), device=device, dtype=dtype)
-    else:
-        timesteps = torch.linspace(0, 1, int(steps) + 1, device=device, dtype=dtype)
-    y0_shape = (int(batch_size), int(patch_size), int(latent_dim))
-    sde_random = torch.stack(
-        [torch.randn(y0_shape, device=device, dtype=dtype) for _ in range(int(steps))],
-        dim=0,
+) -> torch.Tensor:
+    return torch.randn(
+        (int(steps) - 1, int(batch_size), int(patch_size), int(latent_dim)),
+        device=device,
+        dtype=dtype,
     )
-    return timesteps, sde_random
 
 
 def _expand_batch_param(
@@ -262,4 +268,4 @@ class FlowLoss(nn.Module):
         )
 
 
-__all__ = ["CFM", "FlowLoss", "Solver", "build_cfm_sampling_schedule"]
+__all__ = ["CFM", "FlowLoss", "Solver", "build_cfm_timesteps", "build_cfm_sde_random"]

@@ -249,10 +249,10 @@ def build_pipeline_config(args: argparse.Namespace) -> Any:
         if cuda_graph_max_bs is None:
             cuda_graph_max_bs = max(cuda_graph_bs)
         max_running_requests = int(args.max_running_requests or cuda_graph_max_bs)
-        if max_running_requests < int(cuda_graph_max_bs):
+        if int(cuda_graph_max_bs) < max_running_requests:
             raise ValueError(
-                "--max-running-requests must be >= --cuda-graph-max-bs "
-                f"({max_running_requests} < {cuda_graph_max_bs})"
+                "--cuda-graph-max-bs must cover --max-running-requests "
+                f"({cuda_graph_max_bs} < {max_running_requests})"
             )
     else:
         max_running_requests = int(args.max_running_requests or 1)

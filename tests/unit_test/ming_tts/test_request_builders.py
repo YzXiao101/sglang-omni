@@ -128,3 +128,33 @@ def test_ming_tts_rejects_non_finite_sampling_params(name: str, value: float) ->
             tokenizer=_tokenizer(),
             context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
         )
+
+
+def _reference_payload(reference: dict) -> StagePayload:
+    return StagePayload(
+        request_id="req-ming-tts",
+        request=OmniRequest(
+            inputs={"text": "hello", "references": [reference]},
+            params={},
+            metadata={"tts_params": {}},
+        ),
+        data={},
+    )
+
+
+def test_ming_tts_rejects_inline_reference_audio() -> None:
+    with pytest.raises(ValueError, match="local file path"):
+        preprocess_ming_tts_payload(
+            _reference_payload({"data": "AAAA", "media_type": "audio/wav"}),
+            tokenizer=_tokenizer(),
+            context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
+        )
+
+
+def test_ming_tts_rejects_reference_without_audio_path() -> None:
+    with pytest.raises(ValueError, match="local reference audio path"):
+        preprocess_ming_tts_payload(
+            _reference_payload({"speaker": "a"}),
+            tokenizer=_tokenizer(),
+            context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
+        )

@@ -163,6 +163,13 @@ def preprocess_ming_tts_payload(
         ref_audio = ref_audio.strip() or None
     elif ref_audio is not None:
         raise ValueError(_REFERENCE_CONTRACT_ERROR)
+    if reference and ref_audio is None:
+        if reference.get("data") is not None:
+            raise ValueError(
+                "Ming-Omni-TTS reference audio must be a local file path; "
+                "inline or URL reference audio is not supported"
+            )
+        raise ValueError(_REFERENCE_CONTRACT_ERROR)
 
     ref_text_value = reference.get("text") if reference else None
     if ref_text_value is None:
