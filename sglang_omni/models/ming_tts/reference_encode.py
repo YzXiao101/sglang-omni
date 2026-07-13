@@ -23,7 +23,13 @@ from sglang_omni.models.ming_tts.payload_types import (
 )
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
+from sglang_omni.preprocessing.cache_key import hash_file_sampled
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.reference_encoder import (
+    ReferenceEncodeHook,
+    ReferenceEncodeKey,
+    ReferenceEncodeService,
+)
 
 
 class MingSpeakerEmbeddingExtractor:
@@ -57,6 +63,51 @@ class MingSpeakerEmbeddingExtractor:
         return torch.as_tensor(embedding.reshape(1, -1), dtype=torch.float32)
 
 
+class _MingTTSReferenceEncodeHook(ReferenceEncodeHook[str, dict, dict]):
+    """M4a hook: cache (speaker embedding, prompt latent) per reference file.
+
+    The artifact is the text-independent conditioning bundle; prompt build
+    stays per-request in encode_payload. Keys are content-sampled file hashes
+    so a re-uploaded identical reference hits across request ids.
+    """
+
+    def __init__(self, encoder: "MingTTSReferenceEncoder", *, model_identity: str):
+        self._encoder = encoder
+        self._model_identity = str(model_identity)
+
+    def normalize_input(self, raw_input: Any) -> str:
+        return str(raw_input)
+
+    def cache_key(self, item: str) -> ReferenceEncodeKey | None:
+        try:
+            digest = hash_file_sampled(item)
+        except OSError:
+            # Unreadable input: bypass the cache and let encode_one raise the
+            # real error to the caller.
+            return None
+        encoder = self._encoder
+        return ReferenceEncodeKey(
+            model_id=self._model_identity,
+            model_revision="",
+            encoder_id="ming_audio_vae_campplus",
+            encoder_config_hash=(
+                f"sr{encoder.sample_rate}:patch{encoder.patch_size}:"
+                f"dtype{encoder._audio_vae_floating_dtype()}"
+            ),
+            artifact_kind="ref_conditioning",
+            input_key=digest,
+        )
+
+    def encode_one(self, item: str) -> dict:
+        return self._encoder._encode_reference(item)
+
+    def store_artifact(self, artifact: dict) -> dict:
+        return dict(artifact)
+
+    def load_artifact(self, stored: dict) -> dict:
+        return dict(stored)
+
+
 class MingTTSReferenceEncoder:
     """Encode a single reference audio into speaker embedding and prompt latent."""
 
@@ -66,6 +117,9 @@ class MingTTSReferenceEncoder:
         speaker_encoder: MingSpeakerEmbeddingExtractor,
         *,
         patch_size: int,
+        cache_model_identity: str | None = None,
+        cache_max_items: int | None = 256,
+        cache_max_bytes: int | None = 64 * 1024 * 1024,
     ) -> None:
         self.audio_vae = decoder.audio_vae
         self.sample_rate = int(decoder.sample_rate)
@@ -81,6 +135,14 @@ class MingTTSReferenceEncoder:
             raise ValueError(
                 f"Ming-Omni-TTS reference encoder patch_size must be > 0, got {patch_size}"
             )
+        self._service: ReferenceEncodeService[str, dict, dict] | None = None
+        if cache_model_identity is not None:
+            self._service = ReferenceEncodeService(
+                _MingTTSReferenceEncodeHook(self, model_identity=cache_model_identity),
+                max_items=cache_max_items,
+                max_bytes=cache_max_bytes,
+                log_prefix="Ming-Omni-TTS ref cache",
+            )
 
     @classmethod
     def from_config(
@@ -91,6 +153,9 @@ class MingTTSReferenceEncoder:
         device: str = "cuda:0",
         dtype: str = "bfloat16",
         patch_size: int,
+        ref_audio_cache: bool = True,
+        ref_audio_cache_max_items: int = 256,
+        ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
     ) -> "MingTTSReferenceEncoder":
         decoder = MingAudioDecoder.from_config(
             audio_config,
@@ -101,22 +166,15 @@ class MingTTSReferenceEncoder:
             decoder,
             MingSpeakerEmbeddingExtractor(str(Path(checkpoint_dir) / "campplus.onnx")),
             patch_size=patch_size,
+            cache_model_identity=str(checkpoint_dir) if ref_audio_cache else None,
+            cache_max_items=ref_audio_cache_max_items,
+            cache_max_bytes=ref_audio_cache_max_bytes,
         )
 
-    def encode_payload(
-        self,
-        payload: StagePayload,
-        *,
-        tokenizer: MingTTSTokenizerBundle,
-        context_length: int,
-    ) -> StagePayload:
-        state = load_ming_tts_state(payload)
-        if state.ref_audio is None:
-            return payload
+    def _encode_reference(self, ref_audio: str) -> dict:
+        """Text-independent conditioning bundle for one reference audio."""
 
-        prompt_waveform, speaker_waveform = self._load_reference_waveform(
-            state.ref_audio
-        )
+        prompt_waveform, speaker_waveform = self._load_reference_waveform(ref_audio)
         prompt_waveform = self._pad_waveform(prompt_waveform)
 
         with torch.inference_mode():
@@ -131,14 +189,37 @@ class MingTTSReferenceEncoder:
                 waveform_length,
             )
         frames = int(prompt_latent.shape[1])
-        prompt_latent_token_count = frames // self.patch_size
         speaker_embedding = self.speaker_encoder(speaker_waveform)
 
-        for field_name, value in encode_speaker_embedding(speaker_embedding).items():
+        artifact: dict[str, Any] = {}
+        artifact.update(encode_speaker_embedding(speaker_embedding))
+        artifact.update(encode_prompt_latent(prompt_latent))
+        artifact["prompt_latent_token_count"] = frames // self.patch_size
+        return artifact
+
+    def encode_payload(
+        self,
+        payload: StagePayload,
+        *,
+        tokenizer: MingTTSTokenizerBundle,
+        context_length: int,
+    ) -> StagePayload:
+        state = load_ming_tts_state(payload)
+        if state.ref_audio is None:
+            return payload
+
+        ref_audio = str(state.ref_audio)
+        if self._service is not None:
+            artifact = self._service.get_or_encode(ref_audio, desc=repr(ref_audio))
+        else:
+            artifact = self._encode_reference(ref_audio)
+
+        prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
+        for field_name, value in artifact.items():
+            if field_name == "prompt_latent_token_count":
+                continue
             setattr(state, field_name, value)
-        for field_name, value in encode_prompt_latent(prompt_latent).items():
-            setattr(state, field_name, value)
-        state.prompt_latent_token_count = int(prompt_latent_token_count)
+        state.prompt_latent_token_count = prompt_latent_token_count
         state.prompt_text = str(state.ref_text)
 
         plan = build_ming_tts_prompt(

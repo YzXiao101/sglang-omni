@@ -12,12 +12,14 @@ import torch
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
+    MingTTSState,
     decode_generated_latents,
     load_ming_tts_state,
     store_ming_tts_state,
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
+from sglang_omni.scheduling.vocoder_base import BatchVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 
@@ -129,6 +131,81 @@ class MingAudioDecoder(torch.nn.Module):
         return wav.detach()
 
 
+class MingTTSBatchVocoder(BatchVocoderBase):
+    """Terminal AudioVAE decode stage on the shared batch-vocoder base.
+
+    AudioVAE chunk decode carries streaming KV state across the chunks of a
+    single request, so decode_batch stays a per-item loop; the base provides
+    the shared scheduler/batching shell.
+    """
+
+    def __init__(
+        self,
+        decoder: MingAudioDecoder,
+        *,
+        decode_mode: str = "chunked",
+        keep_latents: bool = False,
+    ) -> None:
+        self._decoder = decoder
+        self._decode_mode = str(decode_mode)
+        self._keep_latents = bool(keep_latents)
+
+    def prepare_item(self, payload: StagePayload) -> tuple[MingTTSState, torch.Tensor]:
+        state = load_ming_tts_state(payload)
+        latents = decode_generated_latents(
+            state,
+            device=self._decoder.device,
+            dtype=self._decoder.dtype,
+        )
+        return state, latents
+
+    def _decode_item(
+        self, state: MingTTSState, latents: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        started = time.perf_counter()
+        waveform = self._decoder.decode_chunks(
+            latents,
+            state.generated_last_chunk,
+            decode_mode=self._decode_mode,
+        )
+        state.audio_decode_time_s = time.perf_counter() - started
+        waveform = MingAudioDecoder._normalize_waveform_chunk(waveform)
+        return waveform, int(self._decoder.sample_rate)
+
+    async def decode_batch(
+        self, items: list[tuple[MingTTSState, torch.Tensor]]
+    ) -> list[tuple[torch.Tensor, int]]:
+        return [self._decode_item(state, latents) for state, latents in items]
+
+    def store_result(
+        self,
+        payload: StagePayload,
+        state: MingTTSState,
+        wav: torch.Tensor,
+        sample_rate: int,
+    ) -> StagePayload:
+        state.sample_rate = int(sample_rate)
+        state.duration_s = float(wav.numel() / int(sample_rate))
+        if not self._keep_latents:
+            state.generated_latents_bytes = None
+            state.generated_latents_shape = None
+            state.generated_latents_dtype = None
+
+        payload = store_ming_tts_state(payload, state)
+        payload.data.update(
+            audio_waveform_payload(
+                wav,
+                sample_rate=int(sample_rate),
+                modality="audio",
+                source_hint="Ming-Omni-TTS",
+            )
+        )
+        usage = build_usage(state)
+        if usage is not None:
+            payload.data["usage"] = usage
+        return payload
+
+
 def decode_ming_tts_audio_payload(
     payload: StagePayload,
     decoder: MingAudioDecoder,
@@ -138,48 +215,18 @@ def decode_ming_tts_audio_payload(
 ) -> StagePayload:
     """Decode generated acoustic latents into the terminal waveform payload."""
 
-    started = time.perf_counter()
-    state = load_ming_tts_state(payload)
-
-    latents = decode_generated_latents(
-        state,
-        device=decoder.device,
-        dtype=decoder.dtype,
-    )
-
-    waveform = decoder.decode_chunks(
-        latents,
-        state.generated_last_chunk,
+    vocoder = MingTTSBatchVocoder(
+        decoder,
         decode_mode=decode_mode,
+        keep_latents=keep_latents,
     )
-    state.audio_decode_time_s = time.perf_counter() - started
-    sample_rate = decoder.sample_rate
-
-    waveform = MingAudioDecoder._normalize_waveform_chunk(waveform)
-
-    state.sample_rate = int(sample_rate)
-    state.duration_s = float(waveform.numel() / int(sample_rate))
-    if not keep_latents:
-        state.generated_latents_bytes = None
-        state.generated_latents_shape = None
-        state.generated_latents_dtype = None
-
-    payload = store_ming_tts_state(payload, state)
-    payload.data.update(
-        audio_waveform_payload(
-            waveform,
-            sample_rate=int(sample_rate),
-            modality="audio",
-            source_hint="Ming-Omni-TTS",
-        )
-    )
-    usage = build_usage(state)
-    if usage is not None:
-        payload.data["usage"] = usage
-    return payload
+    state, latents = vocoder.prepare_item(payload)
+    wav, sample_rate = vocoder._decode_item(state, latents)
+    return vocoder.store_result(payload, state, wav, sample_rate)
 
 
 __all__ = [
     "MingAudioDecoder",
+    "MingTTSBatchVocoder",
     "decode_ming_tts_audio_payload",
 ]

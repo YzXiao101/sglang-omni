@@ -48,17 +48,12 @@ def decode_generated_latents(
         raw = data.get("generated_latents_bytes")
         shape = data.get("generated_latents_shape")
 
-    if raw is None or shape is None:
-        return None
-
-    tensor = torch.frombuffer(
-        bytes(raw),
-        dtype=torch.float32,
-    ).clone()
-    tensor = tensor.reshape([int(dim) for dim in shape])
-    if device is not None or dtype is not None:
-        tensor = tensor.to(device=device, dtype=dtype)
-    return tensor
+    return _decode_float_tensor(
+        raw,
+        shape,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def encode_speaker_embedding(spk_emb: Any) -> dict[str, Any]:
@@ -142,8 +137,14 @@ def _decode_float_tensor(
 ) -> Any | None:
     if raw is None or shape is None:
         return None
-    tensor = torch.frombuffer(bytes(raw), dtype=torch.float32).clone()
-    tensor = tensor.reshape([int(dim) for dim in shape])
+    raw = bytes(raw)
+    dims = [int(dim) for dim in shape]
+    if len(raw) == 0:
+        # torch.frombuffer rejects empty buffers on torch >= 2.12; an empty
+        # latent stream (finish-before-first-chunk) is a supported payload.
+        tensor = torch.empty(dims, dtype=torch.float32)
+    else:
+        tensor = torch.frombuffer(raw, dtype=torch.float32).clone().reshape(dims)
     if device is not None or dtype is not None:
         tensor = tensor.to(device=device, dtype=dtype)
     return tensor
