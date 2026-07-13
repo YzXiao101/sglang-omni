@@ -23,7 +23,7 @@ from sglang_omni.models.ming_tts.payload_types import (
 )
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
-from sglang_omni.preprocessing.cache_key import hash_file_sampled
+from sglang_omni.preprocessing.cache_key import reference_path_cache_key
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.reference_encoder import (
     ReferenceEncodeHook,
@@ -78,10 +78,14 @@ class _MingTTSReferenceEncodeHook(ReferenceEncodeHook[str, dict, dict]):
     def normalize_input(self, raw_input: Any) -> str:
         return str(raw_input)
 
+    def _input_key(self, item: str) -> str | None:
+        # Full-content memoized hash; the sampled variant can collide for
+        # same-size files that differ only in the middle (review on #858).
+        return reference_path_cache_key(item, trust_stat=False)
+
     def cache_key(self, item: str) -> ReferenceEncodeKey | None:
-        try:
-            digest = hash_file_sampled(item)
-        except OSError:
+        input_key = self._input_key(item)
+        if input_key is None:
             # Unreadable input: bypass the cache and let encode_one raise the
             # real error to the caller.
             return None
@@ -95,8 +99,11 @@ class _MingTTSReferenceEncodeHook(ReferenceEncodeHook[str, dict, dict]):
                 f"dtype{encoder._audio_vae_floating_dtype()}"
             ),
             artifact_kind="ref_conditioning",
-            input_key=digest,
+            input_key=input_key,
         )
+
+    def revalidate(self, item: str, key: ReferenceEncodeKey) -> bool:
+        return self._input_key(item) == key.input_key
 
     def encode_one(self, item: str) -> dict:
         return self._encoder._encode_reference(item)

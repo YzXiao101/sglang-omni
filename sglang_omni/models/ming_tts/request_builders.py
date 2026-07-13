@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from sglang_omni.models.ming_tts.payload_types import (
@@ -94,9 +95,14 @@ def preprocess_ming_tts_payload(
         if isinstance(value, bool):
             raise ValueError(f"Ming-Omni-TTS {name} must be a number")
         try:
-            return float(value)
+            result = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Ming-Omni-TTS {name} must be a number") from exc
+        # NaN slips through the range checks below (every comparison is
+        # False) and non-finite values reach CFM as invalid latent scales.
+        if not math.isfinite(result):
+            raise ValueError(f"Ming-Omni-TTS {name} must be a finite number")
+        return result
 
     params = payload.request.params or {}
     metadata = payload.request.metadata or {}

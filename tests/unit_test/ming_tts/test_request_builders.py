@@ -117,3 +117,14 @@ def test_ming_tts_rejects_seed_until_fl_rng_contract_exists(
             tokenizer=_tokenizer(),
             context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
         )
+
+
+@pytest.mark.parametrize("name", ["cfg", "sigma", "temperature"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_ming_tts_rejects_non_finite_sampling_params(name: str, value: float) -> None:
+    with pytest.raises(ValueError, match=f"{name} must be a finite number"):
+        preprocess_ming_tts_payload(
+            _payload(tts_params={name: value}),
+            tokenizer=_tokenizer(),
+            context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
+        )
