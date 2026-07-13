@@ -67,7 +67,7 @@ class _MingTTSReferenceEncodeHook(ReferenceEncodeHook[str, dict, dict]):
     """M4a hook: cache (speaker embedding, prompt latent) per reference file.
 
     The artifact is the text-independent conditioning bundle; prompt build
-    stays per-request in encode_payload. Keys are content-sampled file hashes
+    stays per-request in encode_payload. Keys are full-content file hashes
     so a re-uploaded identical reference hits across request ids.
     """
 
