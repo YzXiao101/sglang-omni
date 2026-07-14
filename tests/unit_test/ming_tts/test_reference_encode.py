@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cache-key contract for the Ming-Omni-TTS reference-encode hook (#858 review)."""
+"""Cache-key contract for the Ming-Omni-TTS reference encoder."""
 
 from __future__ import annotations
 

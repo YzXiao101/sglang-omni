@@ -72,6 +72,8 @@ tests/
     ├── ming_tts/
     │   ├── test_audio_decode.py
     │   ├── test_engine_io.py
+    │   ├── test_model_runner.py
+    │   ├── test_reference_encode.py
     │   └── test_request_builders.py
     ├── qwen3_asr/
     │   ├── test_pipeline.py
@@ -387,7 +389,10 @@ that happened to contain an older version of the test.
   - request builder rejection for unsupported seed inputs until the FlowLoss RNG
     contract is exposed
   - request/result adapter finish semantics for empty latent output, stop-head
-    finish, SGLang length finish, and max-step length finish
+    finish, SGLang length finish, max-step length finish, and terminal cleanup
+  - TP tail-failure propagation and idempotent abort cleanup without loading a
+    model checkpoint
+  - reference-audio content-cache identity and invalidation
   - audio decode behavior for zero generated latents without invoking AudioVAE.
 
 - `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
