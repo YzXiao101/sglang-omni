@@ -244,10 +244,10 @@ def preprocess_ming_tts_payload(
             "Ming-Omni-TTS speed control is currently unsupported; " f"got {speed!r}"
         )
 
-    if params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
+    if tts_params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
         raise ValueError(
-            "Ming-Omni-TTS currently generates final waveform only; "
-            f"{INITIAL_CODEC_CHUNK_FRAMES_PARAM!r} is currently unsupported"
+            "Ming-Omni-TTS does not support initial_codec_chunk_frames because "
+            "audio chunks follow the acoustic latent patch size"
         )
 
     explicit_fields = explicit_generation_fields(tts_params)
@@ -365,9 +365,7 @@ def preprocess_ming_tts_payload(
         state.prompt = plan.effective_prompt
         state.input_ids = plan.input_ids
         state.prompt_tokens = plan.prompt_tokens
-        state.spk_token_positions = plan.spk_token_positions
         state.spk_injection_positions = plan.spk_injection_positions
-        state.audio_token_position = plan.audio_token_position
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
     return store_ming_tts_state(payload, state)

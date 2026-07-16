@@ -11,20 +11,6 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 logger = logging.getLogger(__name__)
 
 
-def _coerce_bool(value: Any, *, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "y", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "n", "off"}:
-            return False
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    raise ValueError(f"{name} must be a boolean value, got {value!r}")
-
-
 class MingTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Ming-Omni-TTS"
     context_length = 0  # resolved from the checkpoint config in pre_infra_setup
@@ -92,12 +78,10 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         overrides.pop("context_length", None)
         overrides["tp_size"] = self.tp_size
 
-        if "disable_radix_cache" in overrides and not _coerce_bool(
-            overrides["disable_radix_cache"],
-            name="server_args_overrides.disable_radix_cache",
-        ):
+        if overrides["disable_radix_cache"] is not True:
             raise ValueError(
-                "Ming-Omni-TTS prefix/radix cache is not currently supported"
+                "Ming-Omni-TTS requires disable_radix_cache=true because "
+                "prefix/radix cache is not currently supported"
             )
         overrides["disable_radix_cache"] = True
 
@@ -181,6 +165,13 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             reset_request=self._model_runner.reset_request,
             owns_acoustic_result=self.tp_rank == 0,
         )
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        if self.tp_rank != 0:
+            return {}
+        from sglang_omni.models.ming_tts.engine_io import build_ming_tts_stream_output
+
+        return {"stream_output_builder": build_ming_tts_stream_output}
 
     def make_abort_callback(self) -> Any | None:
         return self._model_runner.reset_request

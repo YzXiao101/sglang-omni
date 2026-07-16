@@ -89,6 +89,23 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 `ref_audio` and `ref_text` are accepted as shorthand for the single `references` item.
 
+### Streaming
+
+Streaming responses use raw 44.1 kHz PCM and emit audio as acoustic latent patches are decoded.
+The chunk size follows the model's latent patch size and is not configurable.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ming-omni-tts",
+    "input": "SGLang-Omni supports streaming speech generation.",
+    "stream": true,
+    "response_format": "pcm"
+  }' \
+  --output output.pcm
+```
+
 ## Generation Parameters
 
 | Parameter | Default | Notes |
@@ -98,7 +115,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 | `ref_audio` / `ref_text` | `null` | Shorthand for the reference clip and transcript |
 | `max_new_tokens` | `200` | Maximum acoustic generation steps; the provided config caps this at `256` |
 | `temperature` | `0.0` | Non-negative SDE temperature used by the FlowLoss sampler |
-| `response_format` | `wav` | Audio response format; `wav` is used by the reference benchmark |
+| `response_format` | `wav` | Use `pcm` when `stream` is enabled; `wav` is used by the reference benchmark |
+| `stream` | `false` | Streams raw PCM audio when enabled |
 | `voice` | `default` | Only the default voice selector is accepted |
 | `speed` | `1.0` | Other speed values are not supported |
 
@@ -184,9 +202,8 @@ deployment.
 
 ## Known Limitations
 
-- **Serving optimizations.** Prefix/radix cache and streaming output are follow-up features not yet
-  implemented in the current SGLang-Omni integration. `torch.compile` has not yet been validated
-  and remains disabled in the provided configuration.
+- **Serving optimizations.** Prefix/radix cache is not yet implemented. `torch.compile` has not yet
+  been validated and remains disabled in the provided configuration.
 - **Reference inputs.** The current request adapter accepts one local reference audio file with a
   non-empty transcript; remote URLs, data URLs, precomputed prompt latents, and speaker embeddings
   are not yet exposed.

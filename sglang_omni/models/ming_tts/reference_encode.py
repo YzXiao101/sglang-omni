@@ -233,9 +233,7 @@ class MingTTSReferenceEncoder:
         state.prompt = plan.effective_prompt
         state.input_ids = plan.input_ids
         state.prompt_tokens = plan.prompt_tokens
-        state.spk_token_positions = plan.spk_token_positions
         state.spk_injection_positions = plan.spk_injection_positions
-        state.audio_token_position = plan.audio_token_position
         state.prompt_latent_start_position = plan.prompt_latent_start_position
         state.prompt_latent_token_count = plan.prompt_latent_token_count
 

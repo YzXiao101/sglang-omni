@@ -45,6 +45,7 @@ stages:
         cuda_graph_max_bs: 8
     gpu: [0, 1]
     tp_size: 2
+    stream_to: [audio_decode]
     runtime:
       resources:
         total_gpu_memory_fraction: 0.72
@@ -55,11 +56,9 @@ stages:
     factory: sglang_omni.models.ming_tts.stages.create_audio_decode_executor
     factory_args:
       dtype: bfloat16
-      decode_mode: chunked
-      max_batch_size: 1
-      max_batch_wait_ms: 0
     gpu: 0
     runtime:
       resources:
         total_gpu_memory_fraction: 0.12
     terminal: true
+    can_accept_stream_before_payload: true

@@ -285,7 +285,6 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
                 engine_time_s=0.125,
                 sample_rate=44100,
                 duration_s=0.5,
-                audio_decode_time_s=0.25,
             ),
             {},
         ),

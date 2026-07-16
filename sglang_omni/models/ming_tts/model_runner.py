@@ -11,6 +11,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.ming_tts.engine_io import MingTTSLatentPatch
 from sglang_omni.models.ming_tts.sglang_model import MingTTSTailInputs
 
 
@@ -78,9 +79,8 @@ class MingTTSModelRunner(ModelRunner):
 
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
-        server_args = getattr(tp_worker, "server_args", None)
-        self._tp_rank = int(getattr(tp_worker, "tp_rank", 0) or 0)
-        self._tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        self._tp_rank = int(tp_worker.tp_rank)
+        self._tp_size = int(tp_worker.server_args.tp_size)
         self._request_states: dict[str, _MingTTSRequestState] = {}
 
     def reset_request(self, request_id: str) -> None:
@@ -123,22 +123,14 @@ class MingTTSModelRunner(ModelRunner):
                 ).to(dtype=dtype)
 
                 if speaker_embedding is not None:
-                    positions = state.spk_injection_positions
-                    if positions is None:
-                        positions = [
-                            int(position) + 1
-                            for position in (state.spk_token_positions or [])
-                        ]
                     projected_speaker = self.model.spk_head(speaker_embedding)
-                    for row, position in enumerate(positions):
+                    for row, position in enumerate(state.spk_injection_positions):
                         prefill_input_embeds[int(position)] = projected_speaker[row].to(
                             dtype=prefill_input_embeds.dtype
                         )
 
                 if prompt_latent is not None:
                     start = state.prompt_latent_start_position
-                    if start is None:
-                        start = int(state.audio_token_position) + 1
                     token_count = int(state.prompt_latent_token_count)
                     projected_prompt = self.model.linear_proj_audio(
                         prompt_latent.to(dtype=dtype).reshape(
@@ -429,11 +421,18 @@ class MingTTSModelRunner(ModelRunner):
                 step = steps[row_idx]
                 sampled_row = sampled[row_idx : row_idx + 1]
                 sampled_chunk = sampled_row.squeeze(0).detach()
-                request_state.generated_latents.append(sampled_chunk)
 
                 stop = stop_list[row_idx]
                 length = length_list[row_idx]
-                request_state.generated_last_chunk.append(stop or length)
+                is_last = stop or length
+                if data.is_streaming:
+                    data.pending_stream_patch = MingTTSLatentPatch(
+                        latent=sampled_chunk,
+                        is_last=is_last,
+                    )
+                else:
+                    request_state.generated_latents.append(sampled_chunk)
+                    request_state.generated_last_chunk.append(is_last)
                 if stop:
                     request_state.stop_step = step
                     next_ids.append(int(data.audio_eos_token_id))
@@ -459,12 +458,14 @@ class MingTTSModelRunner(ModelRunner):
                     continue
                 request_state = request_states[row_idx]
                 data = requests[row_idx].data
+                data.stop_step = request_state.stop_step
+                if data.is_streaming:
+                    continue
                 data.generated_latents = torch.stack(
                     request_state.generated_latents,
                     dim=0,
                 ).to(device="cpu", dtype=torch.float32)
                 data.generated_last_chunk = list(request_state.generated_last_chunk)
-                data.stop_step = request_state.stop_step
 
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)
@@ -519,19 +520,9 @@ class MingTTSModelRunner(ModelRunner):
     def _broadcast_tensor_from_entry(self, tensor: torch.Tensor) -> None:
         import torch.distributed as dist
 
-        tp_group = self._get_tp_group()
-        if tp_group is None:
-            raise RuntimeError("Ming TTS TP broadcast requires a TP group")
-        ranks = getattr(tp_group, "ranks", None)
-        src_rank = int(ranks[0]) if ranks else int(getattr(tp_group, "first_rank", 0))
-        dist_group = getattr(tp_group, "device_group", None)
-        if dist_group is None:
-            dist_group = getattr(tp_group, "group", None)
-        dist.broadcast(tensor, src=src_rank, group=dist_group)
-
-    def _get_tp_group(self) -> Any:
-        getter = getattr(self.tp_worker, "get_tp_group", None)
-        if callable(getter):
-            return getter()
-        model_runner = getattr(self.tp_worker, "model_runner", None)
-        return getattr(model_runner, "tp_group", None)
+        tp_group = self.tp_worker.get_tp_group()
+        dist.broadcast(
+            tensor,
+            src=int(tp_group.ranks[0]),
+            group=tp_group.device_group,
+        )
