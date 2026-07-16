@@ -138,10 +138,6 @@ def create_sglang_tts_engine_executor(
     )
 
 
-def create_tts_engine_executor(*args, **kwargs) -> Any:
-    return create_sglang_tts_engine_executor(*args, **kwargs)
-
-
 def create_reference_encode_executor(
     model_path: str,
     *,
@@ -199,17 +195,11 @@ def create_audio_decode_executor(
     device: str = "cuda:0",
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
-    decode_mode: str = "chunked",
     keep_latents: bool = False,
-    max_batch_size: int = 1,
-    max_batch_wait_ms: int = 0,
-) -> SimpleScheduler:
-    if decode_mode != "chunked":
-        raise ValueError("Ming-Omni-TTS currently supports only decode_mode='chunked'")
-
+) -> Any:
     from sglang_omni.models.ming_tts.audio_decode import (
         MingAudioDecoder,
-        MingTTSBatchVocoder,
+        MingTTSStreamingVocoderScheduler,
     )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
@@ -229,14 +219,11 @@ def create_audio_decode_executor(
     report = load_ming_tts_audio_vae_weights(checkpoint_dir, decoder.audio_vae)
     logger.info("%s", report.summary())
 
-    vocoder = MingTTSBatchVocoder(
+    return MingTTSStreamingVocoderScheduler(
         decoder,
-        decode_mode=decode_mode,
+        patch_size=int(config.audio_patch_size),
+        latent_dim=int(config.latent_dim),
         keep_latents=keep_latents,
-    )
-    return vocoder.build_scheduler(
-        max_batch_size=max_batch_size,
-        max_batch_wait_ms=max_batch_wait_ms,
     )
 
 
@@ -260,5 +247,4 @@ __all__ = [
     "create_preprocessing_executor",
     "create_reference_encode_executor",
     "create_sglang_tts_engine_executor",
-    "create_tts_engine_executor",
 ]
