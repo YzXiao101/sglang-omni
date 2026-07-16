@@ -58,7 +58,6 @@ class MingTTSState(DeclarativeStateBase):
 
     # -- From audio decode -------------------------------------------------
     duration_s: float | None = None
-    audio_decode_time_s: float = wire(0.0, emit="truthy", codec="float")
 
 
 def load_ming_tts_state(payload: StagePayload) -> MingTTSState:
