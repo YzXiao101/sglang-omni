@@ -17,12 +17,19 @@ from sglang_omni.models.ming_tts.payload_types import (
 )
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 
 @dataclass
+class MingTTSLatentPatch:
+    latent: torch.Tensor
+    is_last: bool
+
+
+@dataclass
 class MingTTSSGLangRequestData(SGLangARRequestData):
-    """CPU scheduler state; recurrent GPU tensors live in the model runner."""
+    """Per-request scheduler state for Ming-Omni-TTS."""
 
     enforce_request_limits: bool = True
     state: MingTTSState | None = None
@@ -32,6 +39,8 @@ class MingTTSSGLangRequestData(SGLangARRequestData):
     generated_latents: torch.Tensor | None = None
     generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
+    is_streaming: bool = False
+    committed_latent_patch: MingTTSLatentPatch | None = None
 
 
 def make_ming_tts_scheduler_adapters(
@@ -114,6 +123,7 @@ def make_ming_tts_scheduler_adapters(
             audio_patch_token_id=int(tokenizer.special.audio_patch),
             audio_eos_token_id=int(tokenizer.special.end_of_audio),
             engine_start_s=time.perf_counter(),
+            is_streaming=bool((payload.request.params or {}).get("stream", False)),
         )
         data.stage_payload = payload
         return data
@@ -126,11 +136,16 @@ def make_ming_tts_scheduler_adapters(
             payload = data.stage_payload
             state = data.state
             generated = data.generated_latents
-            if generated is None:
+            if generated is None and not data.is_streaming:
                 generated = torch.empty(
                     (0, int(model.patch_size), int(model.latent_dim)),
                     dtype=torch.float32,
                 )
+            completion_tokens = (
+                int(data.generation_steps)
+                if data.is_streaming
+                else int(generated.shape[0])
+            )
 
             raw = data.finish_reason
             if raw is None and data.req is not None:
@@ -152,31 +167,67 @@ def make_ming_tts_scheduler_adapters(
                     finish_reason = "error"
                 else:
                     finish_reason = str(raw)
-            elif int(generated.shape[0]) >= int(data.max_new_tokens):
+            elif completion_tokens >= int(data.max_new_tokens):
                 finish_reason = "length"
             else:
                 finish_reason = "stop"
 
-            state.generated_last_chunk = [
-                bool(item) for item in data.generated_last_chunk
-            ]
+            state.generated_last_chunk = (
+                None
+                if data.is_streaming
+                else [bool(item) for item in data.generated_last_chunk]
+            )
             state.stop_step = data.stop_step
             state.finish_reason = finish_reason
             state.prompt_tokens = len(data.input_ids)
-            state.completion_tokens = int(generated.shape[0])
+            state.completion_tokens = completion_tokens
             state.engine_time_s = time.perf_counter() - data.engine_start_s
 
-            for field_name, value in encode_generated_latents(generated).items():
-                setattr(state, field_name, value)
+            if data.is_streaming:
+                state.generated_latents_bytes = None
+                state.generated_latents_shape = None
+                state.generated_latents_dtype = None
+            else:
+                for field_name, value in encode_generated_latents(generated).items():
+                    setattr(state, field_name, value)
 
             return store_ming_tts_state(payload, state)
         finally:
             reset_request(request_id)
 
-    return request_builder, result_adapter
+    def stream_output_builder(
+        request_id: str,
+        data: MingTTSSGLangRequestData,
+        req_output: Any,
+    ) -> list[OutgoingMessage]:
+        del req_output
+        if not data.is_streaming or data.committed_latent_patch is None:
+            return []
+
+        patch = data.committed_latent_patch
+        latent = (
+            patch.latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        )
+        data.committed_latent_patch = None
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=latent,
+                target="audio_decode",
+                metadata={
+                    "modality": "audio_codes",
+                    "stream": True,
+                    "is_last": bool(patch.is_last),
+                },
+            )
+        ]
+
+    return request_builder, result_adapter, stream_output_builder
 
 
 __all__ = [
+    "MingTTSLatentPatch",
     "MingTTSSGLangRequestData",
     "make_ming_tts_scheduler_adapters",
 ]

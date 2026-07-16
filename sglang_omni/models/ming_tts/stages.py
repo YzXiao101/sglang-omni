@@ -203,13 +203,13 @@ def create_audio_decode_executor(
     keep_latents: bool = False,
     max_batch_size: int = 1,
     max_batch_wait_ms: int = 0,
-) -> SimpleScheduler:
+) -> Any:
     if decode_mode != "chunked":
         raise ValueError("Ming-Omni-TTS currently supports only decode_mode='chunked'")
 
     from sglang_omni.models.ming_tts.audio_decode import (
         MingAudioDecoder,
-        MingTTSBatchVocoder,
+        MingTTSStreamingVocoderScheduler,
     )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
@@ -229,12 +229,12 @@ def create_audio_decode_executor(
     report = load_ming_tts_audio_vae_weights(checkpoint_dir, decoder.audio_vae)
     logger.info("%s", report.summary())
 
-    vocoder = MingTTSBatchVocoder(
+    return MingTTSStreamingVocoderScheduler(
         decoder,
+        patch_size=int(config.audio_patch_size),
+        latent_dim=int(config.latent_dim),
         decode_mode=decode_mode,
         keep_latents=keep_latents,
-    )
-    return vocoder.build_scheduler(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )

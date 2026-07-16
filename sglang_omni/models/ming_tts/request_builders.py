@@ -14,7 +14,6 @@ from sglang_omni.models.ming_tts.payload_types import (
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 _REFERENCE_CONTRACT_ERROR = (
     "Ming-Omni-TTS currently supports only one local reference audio path "
@@ -242,12 +241,6 @@ def preprocess_ming_tts_payload(
     if speed is not None and float(speed) != 1.0:
         raise ValueError(
             "Ming-Omni-TTS speed control is currently unsupported; " f"got {speed!r}"
-        )
-
-    if params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
-        raise ValueError(
-            "Ming-Omni-TTS currently generates final waveform only; "
-            f"{INITIAL_CODEC_CHUNK_FRAMES_PARAM!r} is currently unsupported"
         )
 
     explicit_fields = explicit_generation_fields(tts_params)

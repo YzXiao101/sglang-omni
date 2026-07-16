@@ -63,6 +63,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         self.config: Any = None
         self.tokenizer: Any = None
         self._model_runner: Any = None
+        self._stream_output_builder: Any = None
 
     def resolve_checkpoint(self, model_path: str) -> str:
         from sglang_omni.models.ming_tts import stages as ming_stages
@@ -180,12 +181,20 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             make_ming_tts_scheduler_adapters,
         )
 
-        return make_ming_tts_scheduler_adapters(
-            model=model,
-            tokenizer=self.tokenizer,
-            reset_request=self._model_runner.reset_request,
-            owns_acoustic_result=self.tp_rank == 0,
+        request_builder, result_adapter, self._stream_output_builder = (
+            make_ming_tts_scheduler_adapters(
+                model=model,
+                tokenizer=self.tokenizer,
+                reset_request=self._model_runner.reset_request,
+                owns_acoustic_result=self.tp_rank == 0,
+            )
         )
+        return request_builder, result_adapter
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        if self.tp_rank != 0:
+            return {}
+        return {"stream_output_builder": self._stream_output_builder}
 
     def make_abort_callback(self) -> Any | None:
         return self._model_runner.reset_request

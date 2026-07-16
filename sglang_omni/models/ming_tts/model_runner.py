@@ -11,6 +11,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.ming_tts.engine_io import MingTTSLatentPatch
 from sglang_omni.models.ming_tts.payload_types import (
     decode_prompt_latent,
     decode_speaker_embedding,
@@ -437,11 +438,18 @@ class MingTTSModelRunner(ModelRunner):
                 step = steps[row_idx]
                 sampled_row = sampled[row_idx : row_idx + 1]
                 sampled_chunk = sampled_row.squeeze(0).detach()
-                request_state.generated_latents.append(sampled_chunk)
 
                 stop = stop_list[row_idx]
                 length = length_list[row_idx]
-                request_state.generated_last_chunk.append(stop or length)
+                is_last = stop or length
+                if data.is_streaming:
+                    data.committed_latent_patch = MingTTSLatentPatch(
+                        latent=sampled_chunk,
+                        is_last=is_last,
+                    )
+                else:
+                    request_state.generated_latents.append(sampled_chunk)
+                    request_state.generated_last_chunk.append(is_last)
                 if stop:
                     request_state.stop_step = step
                     next_ids.append(int(data.audio_eos_token_id))
@@ -467,12 +475,14 @@ class MingTTSModelRunner(ModelRunner):
                     continue
                 request_state = request_states[row_idx]
                 data = requests[row_idx].data
+                data.stop_step = request_state.stop_step
+                if data.is_streaming:
+                    continue
                 data.generated_latents = torch.stack(
                     request_state.generated_latents,
                     dim=0,
                 ).to(device="cpu", dtype=torch.float32)
                 data.generated_last_chunk = list(request_state.generated_last_chunk)
-                data.stop_step = request_state.stop_step
 
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)

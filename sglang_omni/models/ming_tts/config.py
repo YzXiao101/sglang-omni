@@ -62,6 +62,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory_args={"dtype": "bfloat16"},
             gpu=0,
             next=AUDIO_DECODE_STAGE,
+            stream_to=[AUDIO_DECODE_STAGE],
         ),
         StageConfig(
             name=AUDIO_DECODE_STAGE,
@@ -73,6 +74,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             },
             gpu=0,
             terminal=True,
+            can_accept_stream_before_payload=True,
         ),
     ]
 
