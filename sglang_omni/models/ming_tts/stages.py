@@ -199,14 +199,8 @@ def create_audio_decode_executor(
     device: str = "cuda:0",
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
-    decode_mode: str = "chunked",
     keep_latents: bool = False,
-    max_batch_size: int = 1,
-    max_batch_wait_ms: int = 0,
 ) -> Any:
-    if decode_mode != "chunked":
-        raise ValueError("Ming-Omni-TTS currently supports only decode_mode='chunked'")
-
     from sglang_omni.models.ming_tts.audio_decode import (
         MingAudioDecoder,
         MingTTSStreamingVocoderScheduler,
@@ -233,10 +227,7 @@ def create_audio_decode_executor(
         decoder,
         patch_size=int(config.audio_patch_size),
         latent_dim=int(config.latent_dim),
-        decode_mode=decode_mode,
         keep_latents=keep_latents,
-        max_batch_size=max_batch_size,
-        max_batch_wait_ms=max_batch_wait_ms,
     )
 
 

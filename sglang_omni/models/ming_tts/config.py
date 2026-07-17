@@ -68,10 +68,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             name=AUDIO_DECODE_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_audio_decode_executor",
-            factory_args={
-                "dtype": "bfloat16",
-                "decode_mode": "chunked",
-            },
+            factory_args={"dtype": "bfloat16"},
             gpu=0,
             terminal=True,
             can_accept_stream_before_payload=True,

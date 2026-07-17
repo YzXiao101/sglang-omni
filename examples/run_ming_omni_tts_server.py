@@ -142,8 +142,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="runtime.resources.total_gpu_memory_fraction for audio_decode.",
     )
-    parser.add_argument("--audio-decode-max-batch-size", type=int, default=1)
-    parser.add_argument("--audio-decode-max-batch-wait-ms", type=int, default=0)
     parser.add_argument(
         "--disable-cuda-graph",
         action=argparse.BooleanOptionalAction,
@@ -353,14 +351,7 @@ def build_pipeline_config(args: argparse.Namespace) -> Any:
         audio_decode,
         args.audio_decode_total_gpu_memory_fraction,
     )
-    audio_decode.factory_args.update(
-        {
-            "dtype": args.dtype,
-            "decode_mode": "chunked",
-            "max_batch_size": args.audio_decode_max_batch_size,
-            "max_batch_wait_ms": args.audio_decode_max_batch_wait_ms,
-        }
-    )
+    audio_decode.factory_args["dtype"] = args.dtype
 
     return MingTTSPipelineConfig.model_validate(config.model_dump(mode="python"))
 

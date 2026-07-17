@@ -90,21 +90,26 @@ class MingAudioDecoder(torch.nn.Module):
         latents: torch.Tensor,
         last_chunks: list[bool],
         *,
-        decode_mode: str = "chunked",
         state: _MingAudioDecodeState | None = None,
     ) -> torch.Tensor:
-        if decode_mode != "chunked":
-            raise NotImplementedError(
-                "Ming-Omni-TTS currently supports only chunked AudioVAE decode"
-            )
-
         if not isinstance(latents, torch.Tensor):
             latents = torch.as_tensor(latents)
         latents = latents.to(device=self.device, dtype=self.dtype)
 
         last_chunks = [bool(item) for item in last_chunks]
-        if int(latents.shape[0]) == 0:
+        chunk_count = int(latents.shape[0])
+        if len(last_chunks) != chunk_count:
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE decode requires one last_chunk flag per "
+                f"latent chunk; got {len(last_chunks)} flags for {chunk_count} chunks"
+            )
+        if chunk_count == 0:
             return torch.empty((0,), device=self.device, dtype=torch.float32)
+        if state is None and (not last_chunks[-1] or any(last_chunks[:-1])):
+            raise ValueError(
+                "Ming-Omni-TTS full AudioVAE decode requires exactly one terminal "
+                "flag on the final latent chunk"
+            )
 
         if state is None:
             state = _MingAudioDecodeState()
@@ -130,6 +135,10 @@ class MingAudioDecoder(torch.nn.Module):
                 state.stream_state = stream_state
                 state.past_key_values = past_key_values
                 wav = self._normalize_waveform_chunk(wav)
+                if last_chunk and wav.numel() == 0:
+                    raise RuntimeError(
+                        "Ming-Omni-TTS AudioVAE terminal chunk produced no audio"
+                    )
                 waveform_chunks.append(wav)
 
         return torch.cat(waveform_chunks, dim=0)
@@ -163,29 +172,20 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         *,
         patch_size: int,
         latent_dim: int,
-        decode_mode: str = "chunked",
         keep_latents: bool = False,
-        max_batch_size: int = 1,
-        max_batch_wait_ms: int = 0,
     ) -> None:
         self._decoder = decoder
         self._patch_size = int(patch_size)
         self._latent_dim = int(latent_dim)
-        self._decode_mode = str(decode_mode)
         self._keep_latents = bool(keep_latents)
-        decode_payload = partial(
-            decode_ming_tts_audio_payload,
-            decoder=decoder,
-            decode_mode=self._decode_mode,
-            keep_latents=self._keep_latents,
-        )
         super().__init__(
-            decode_payload,
-            batch_compute_fn=self._decode_payload_batch,
+            partial(
+                decode_ming_tts_audio_payload,
+                decoder=decoder,
+                keep_latents=self._keep_latents,
+            ),
             sample_rate=decoder.sample_rate,
             stream_source_hint="Ming-Omni-TTS",
-            max_batch_size=max_batch_size,
-            max_batch_wait_ms=max_batch_wait_ms,
         )
 
     def create_stream_state(self, request_id: str) -> _MingTTSStreamState:
@@ -269,10 +269,6 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
                     f"Ming-Omni-TTS stream for {request_id!r} ended without a "
                     "terminal latent patch"
                 )
-            if state.emitted_samples == 0:
-                raise RuntimeError(
-                    f"Ming-Omni-TTS stream for {request_id!r} produced no audio"
-                )
             return None
 
         patch = state.pending_patch
@@ -283,7 +279,6 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         waveform = self._decoder.decode_chunks(
             patch.unsqueeze(0),
             [is_last],
-            decode_mode=self._decode_mode,
             state=state.decoder_state,
         )
         state.decode_time_s += time.perf_counter() - started
@@ -316,26 +311,11 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
             data["usage"] = usage
         return data
 
-    def _decode_payload_batch(
-        self,
-        payloads: list[StagePayload],
-    ) -> list[StagePayload]:
-        return [
-            decode_ming_tts_audio_payload(
-                payload,
-                self._decoder,
-                decode_mode=self._decode_mode,
-                keep_latents=self._keep_latents,
-            )
-            for payload in payloads
-        ]
-
 
 def decode_ming_tts_audio_payload(
     payload: StagePayload,
     decoder: MingAudioDecoder,
     *,
-    decode_mode: str = "chunked",
     keep_latents: bool = False,
 ) -> StagePayload:
     """Decode generated acoustic latents into the terminal waveform payload."""
@@ -350,7 +330,6 @@ def decode_ming_tts_audio_payload(
     waveform = decoder.decode_chunks(
         latents,
         state.generated_last_chunk,
-        decode_mode=decode_mode,
     )
     state.audio_decode_time_s = time.perf_counter() - started
     state.sample_rate = int(decoder.sample_rate)
