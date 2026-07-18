@@ -13,6 +13,12 @@ import torch
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
+from sglang_omni.models.ming_tts.debug_trace import (
+    is_enabled,
+    matches_text,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.payload_types import (
     decode_generated_latents,
     load_ming_tts_state,
@@ -161,6 +167,7 @@ class _MingTTSStreamState:
     terminal_patch_seen: bool = False
     emitted_samples: int = 0
     decode_time_s: float = 0.0
+    trace_enabled: bool = False
 
 
 class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState, None]):
@@ -191,6 +198,29 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
     def create_stream_state(self, request_id: str) -> _MingTTSStreamState:
         del request_id
         return _MingTTSStreamState()
+
+    def latch_stream_contract(
+        self,
+        request_id: str,
+        state: _MingTTSStreamState,
+        source: StagePayload | dict[str, Any],
+        *,
+        origin: str,
+    ) -> None:
+        if origin != "payload" or not is_enabled():
+            return
+        stream_payload = source
+        if not isinstance(stream_payload, StagePayload):
+            return
+        request_state = load_ming_tts_state(stream_payload)
+        state.trace_enabled = matches_text(request_state.text)
+        if state.trace_enabled:
+            write_event(
+                "audio_decode",
+                "stream_started",
+                request_id=request_id,
+                text=request_state.text,
+            )
 
     def on_stream_chunk(
         self,
@@ -286,6 +316,16 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         state.pending_is_last = False
         if is_last:
             state.terminal_patch_seen = True
+        if state.trace_enabled:
+            write_event(
+                "audio_decode",
+                "chunk_decoded",
+                request_id=request_id,
+                chunk_id=state.expected_chunk_id,
+                is_last=is_last,
+                latent=tensor_stats(patch),
+                waveform=tensor_stats(waveform),
+            )
         if waveform.numel() == 0:
             return None
         state.emitted_samples += int(waveform.numel())
@@ -297,7 +337,6 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         payload: StagePayload,
         state: _MingTTSStreamState,
     ) -> dict[str, Any]:
-        del request_id
         final_state = load_ming_tts_state(payload)
         final_state.sample_rate = int(self._decoder.sample_rate)
         final_state.duration_s = float(
@@ -309,6 +348,17 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         usage = build_usage(final_state)
         if usage is not None:
             data["usage"] = usage
+        if state.trace_enabled:
+            write_event(
+                "audio_decode",
+                "stream_finished",
+                request_id=request_id,
+                completion_tokens=int(final_state.completion_tokens),
+                stop_step=final_state.stop_step,
+                finish_reason=final_state.finish_reason,
+                emitted_samples=state.emitted_samples,
+                duration_s=final_state.duration_s,
+            )
         return data
 
 
@@ -334,6 +384,17 @@ def decode_ming_tts_audio_payload(
     state.audio_decode_time_s = time.perf_counter() - started
     state.sample_rate = int(decoder.sample_rate)
     state.duration_s = float(waveform.numel() / int(decoder.sample_rate))
+    if matches_text(state.text):
+        write_event(
+            "audio_decode",
+            "full_decode_finished",
+            request_id=payload.request_id,
+            completion_tokens=int(state.completion_tokens),
+            stop_step=state.stop_step,
+            finish_reason=state.finish_reason,
+            latents=tensor_stats(latents),
+            waveform=tensor_stats(waveform),
+        )
     if not keep_latents:
         state.generated_latents_bytes = None
         state.generated_latents_shape = None

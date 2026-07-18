@@ -11,6 +11,12 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.ming_tts.debug_trace import (
+    matches_text,
+    rng_fingerprint,
+    tensor_stats,
+    write_event,
+)
 from sglang_omni.models.ming_tts.engine_io import MingTTSLatentPatch
 from sglang_omni.models.ming_tts.payload_types import (
     decode_prompt_latent,
@@ -76,6 +82,7 @@ class _MingTTSRequestState:
     generated_latents: list[torch.Tensor] = field(default_factory=list)
     generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
+    trace_enabled: bool = False
 
 
 class MingTTSModelRunner(ModelRunner):
@@ -183,10 +190,24 @@ class MingTTSModelRunner(ModelRunner):
                 else:
                     latent_history[:, -prompt_len:, :].copy_(prompt_latent)
 
-        self._request_states[request_id] = _MingTTSRequestState(
+        request_state = _MingTTSRequestState(
             prefill_input_embeds=prefill_input_embeds,
             latent_history=latent_history,
+            trace_enabled=matches_text(state.text),
         )
+        self._request_states[request_id] = request_state
+        if request_state.trace_enabled and self._is_entry_rank:
+            write_event(
+                "tts_engine",
+                "request_materialized",
+                request_id=request_id,
+                text=state.text,
+                prompt_tokens=int(data.input_ids.shape[0]),
+                prompt_latent=tensor_stats(prompt_latent),
+                speaker_embedding=tensor_stats(speaker_embedding),
+                prefill_input_embeds=tensor_stats(prefill_input_embeds),
+                latent_history=tensor_stats(latent_history),
+            )
 
     def custom_prefill_forward(
         self,
@@ -244,6 +265,18 @@ class MingTTSModelRunner(ModelRunner):
 
             req_embeds = torch.cat(req_parts, dim=0)
             batch_parts.append(req_embeds)
+            if request_state.trace_enabled and self._is_entry_rank:
+                write_event(
+                    "tts_engine",
+                    "prefill_rows",
+                    request_id=sched_req.request_id,
+                    prefix_len=prefix_len,
+                    extend_len=extend_len,
+                    prompt_len=prompt_len,
+                    output_ids_len=len(req.output_ids),
+                    feedback_rows=len(request_state.feedback_embeddings),
+                    input_embeds=tensor_stats(req_embeds),
+                )
         return torch.cat(batch_parts, dim=0)
 
     def _forward_with_input_embeds(
@@ -415,6 +448,13 @@ class MingTTSModelRunner(ModelRunner):
                 device=device,
             )
 
+            trace_rows = [
+                row_idx
+                for row_idx, request_state in enumerate(request_states)
+                if request_state.trace_enabled
+            ]
+            tail_rng = rng_fingerprint(device) if trace_rows else None
+
             tail_outputs = self.model.run_tail_step(
                 MingTTSTailInputs(
                     hidden_states=hidden_states,
@@ -450,6 +490,30 @@ class MingTTSModelRunner(ModelRunner):
                 else:
                     request_state.generated_latents.append(sampled_chunk)
                     request_state.generated_last_chunk.append(is_last)
+
+                if request_state.trace_enabled:
+                    previous_feedback = (
+                        request_state.feedback_embeddings[-1]
+                        if request_state.feedback_embeddings
+                        else None
+                    )
+                    write_event(
+                        "tts_engine",
+                        "tail_step",
+                        request_id=requests[row_idx].request_id,
+                        row=row_idx,
+                        batch_size=len(requests),
+                        step=step,
+                        rng=tail_rng,
+                        hidden_state=tensor_stats(hidden_states[row_idx]),
+                        latent_history=tensor_stats(request_state.latent_history),
+                        previous_feedback=tensor_stats(previous_feedback),
+                        sampled=tensor_stats(sampled_chunk),
+                        feedback=tensor_stats(feedback_embeddings[row_idx]),
+                        stop_probability=float(stop_prob[row_idx].item()),
+                        stopped=bool(stop),
+                        length_finished=bool(length),
+                    )
                 if stop:
                     request_state.stop_step = step
                     next_ids.append(int(data.audio_eos_token_id))
