@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -184,13 +185,20 @@ class MingTTSReferenceEncoder:
         prompt_waveform, speaker_waveform = self._load_reference_waveform(ref_audio)
         prompt_waveform = self._pad_waveform(prompt_waveform)
 
-        with torch.inference_mode():
+        autocast_dtype = self._audio_vae_floating_dtype()
+        context = (
+            torch.autocast(device_type="cuda", dtype=autocast_dtype)
+            if self.device.type == "cuda"
+            and autocast_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with torch.inference_mode(), context:
             waveform_length = torch.tensor(
                 [int(prompt_waveform.shape[1])],
                 dtype=torch.long,
                 device=self.device,
             )
-            prompt_waveform = self._prepare_audio_vae_waveform(prompt_waveform)
+            prompt_waveform = prompt_waveform.to(device=self.device)
             prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
                 prompt_waveform,
                 waveform_length,
@@ -290,16 +298,6 @@ class MingTTSReferenceEncoder:
         )
         padded[:, : int(waveform.shape[-1])] = waveform.clone()
         return padded
-
-    def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
-        if not isinstance(waveform, torch.Tensor):
-            waveform = torch.as_tensor(waveform)
-        # Note (yzxiao): The official monolithic path reaches AudioVAE encode
-        # under bf16 autocast, so this split stage must match weight dtype.
-        return waveform.to(
-            device=self.device,
-            dtype=self._audio_vae_floating_dtype(),
-        )
 
     def _audio_vae_floating_dtype(self) -> Any:
         for parameter in self.audio_vae.parameters():

@@ -51,7 +51,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             name=REFERENCE_ENCODE_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_reference_encode_executor",
-            factory_args={"dtype": "bfloat16"},
+            factory_args={"dtype": "bfloat16", "ref_audio_cache": False},
             gpu=0,
             next=TTS_ENGINE_STAGE,
         ),
