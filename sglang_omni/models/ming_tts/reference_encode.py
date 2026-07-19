@@ -15,6 +15,7 @@ import torchaudio.functional as F
 
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
+from sglang_omni.models.ming_tts.debug_trace import fixed_reference_seed, matches_text
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
     encode_prompt_latent,
@@ -179,7 +180,12 @@ class MingTTSReferenceEncoder:
             cache_max_bytes=ref_audio_cache_max_bytes,
         )
 
-    def _encode_reference(self, ref_audio: str) -> dict:
+    def _encode_reference(
+        self,
+        ref_audio: str,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> dict:
         """Text-independent conditioning bundle for one reference audio."""
 
         prompt_waveform, speaker_waveform = self._load_reference_waveform(ref_audio)
@@ -202,6 +208,7 @@ class MingTTSReferenceEncoder:
             prompt_latent, _prompt_latent_length = self.audio_vae.encode_latent(
                 prompt_waveform,
                 waveform_length,
+                generator=generator,
             )
         frames = int(prompt_latent.shape[1])
         speaker_embedding = self.speaker_encoder(speaker_waveform)
@@ -224,10 +231,14 @@ class MingTTSReferenceEncoder:
             return payload
 
         ref_audio = str(state.ref_audio)
-        if self._service is not None:
+        seed = fixed_reference_seed() if matches_text(state.text) else None
+        if self._service is not None and seed is None:
             artifact = self._service.get_or_encode(ref_audio, desc=repr(ref_audio))
         else:
-            artifact = self._encode_reference(ref_audio)
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(seed)
+            artifact = self._encode_reference(ref_audio, generator=generator)
 
         prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
         for field_name, value in artifact.items():
