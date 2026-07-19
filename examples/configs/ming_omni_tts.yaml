@@ -1,7 +1,6 @@
 config_cls: MingTTSPipelineConfig
 model_path: inclusionAI/Ming-omni-tts-16.8B-A3B
 name: ming-omni-tts
-relay_backend: shm
 stages:
   - name: preprocessing
     process: preprocessing
