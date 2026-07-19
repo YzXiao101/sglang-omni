@@ -19,6 +19,7 @@ _TRACE_TEXT_ENV = "MING_TTS_DEBUG_TEXT"
 _TRACE_DIR_ENV = "MING_TTS_DEBUG_DIR"
 _FIXED_REFERENCE_SEED_ENV = "MING_TTS_DEBUG_FIXED_REFERENCE_SEED"
 _FIXED_TAIL_SEED_ENV = "MING_TTS_DEBUG_FIXED_TAIL_SEED"
+_TAIL_SEED_SEQUENCE_ENV = "MING_TTS_DEBUG_TAIL_SEEDS"
 _DEFAULT_TRACE_DIR = "/tmp/ming_tts_debug_trace"
 
 _LOCK = threading.Lock()
@@ -42,7 +43,19 @@ def fixed_reference_seed() -> int | None:
 
 def fixed_tail_seed() -> int | None:
     value = os.environ.get(_FIXED_TAIL_SEED_ENV)
-    return int(value) if value is not None else None
+    return int(value) if value else None
+
+
+def tail_seed_sequence() -> tuple[int, ...]:
+    value = os.environ.get(_TAIL_SEED_SEQUENCE_ENV)
+    if not value:
+        return ()
+    seeds = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not seeds or any(seed < 0 for seed in seeds):
+        raise ValueError(
+            f"{_TAIL_SEED_SEQUENCE_ENV} must contain non-negative integers"
+        )
+    return seeds
 
 
 def tensor_stats(tensor: Any) -> dict[str, Any] | None:
@@ -122,6 +135,7 @@ __all__ = [
     "is_enabled",
     "matches_text",
     "rng_fingerprint",
+    "tail_seed_sequence",
     "tensor_stats",
     "write_event",
 ]

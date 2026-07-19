@@ -15,6 +15,7 @@ from sglang_omni.models.ming_tts.debug_trace import (
     fixed_tail_seed,
     matches_text,
     rng_fingerprint,
+    tail_seed_sequence,
     tensor_stats,
     write_event,
 )
@@ -96,6 +97,14 @@ class MingTTSModelRunner(ModelRunner):
         self._tp_rank = int(getattr(tp_worker, "tp_rank", 0) or 0)
         self._tp_size = int(getattr(server_args, "tp_size", 1) or 1)
         self._request_states: dict[str, _MingTTSRequestState] = {}
+        self._debug_fixed_tail_seed = fixed_tail_seed()
+        self._debug_tail_seeds = tail_seed_sequence()
+        self._debug_tail_seed_index = 0
+        if self._debug_fixed_tail_seed is not None and self._debug_tail_seeds:
+            raise ValueError(
+                "MING_TTS_DEBUG_FIXED_TAIL_SEED and MING_TTS_DEBUG_TAIL_SEEDS "
+                "cannot be set together"
+            )
 
     def reset_request(self, request_id: str) -> None:
         self._request_states.pop(request_id, None)
@@ -193,11 +202,21 @@ class MingTTSModelRunner(ModelRunner):
                     latent_history[:, -prompt_len:, :].copy_(prompt_latent)
 
         trace_enabled = matches_text(state.text)
-        tail_seed = fixed_tail_seed() if trace_enabled else None
+        tail_seed = None
         debug_tail_generator = None
-        if self._is_entry_rank and tail_seed is not None:
-            debug_tail_generator = torch.Generator(device=device)
-            debug_tail_generator.manual_seed(tail_seed)
+        if self._is_entry_rank and trace_enabled:
+            tail_seed = self._debug_fixed_tail_seed
+            if self._debug_tail_seeds:
+                if self._debug_tail_seed_index >= len(self._debug_tail_seeds):
+                    raise ValueError(
+                        "MING_TTS_DEBUG_TAIL_SEEDS has fewer entries than matched "
+                        "debug requests"
+                    )
+                tail_seed = self._debug_tail_seeds[self._debug_tail_seed_index]
+                self._debug_tail_seed_index += 1
+            if tail_seed is not None:
+                debug_tail_generator = torch.Generator(device=device)
+                debug_tail_generator.manual_seed(tail_seed)
 
         request_state = _MingTTSRequestState(
             prefill_input_embeds=prefill_input_embeds,
