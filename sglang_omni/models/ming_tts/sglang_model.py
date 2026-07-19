@@ -81,6 +81,13 @@ class MingTTSTailInputs:
 
 
 @dataclass
+class MingTTSTailSamplingInputs:
+    noise: torch.Tensor
+    timesteps: torch.Tensor
+    sde_random: torch.Tensor
+
+
+@dataclass
 class MingTTSTailOutputs:
     sampled: torch.Tensor
     feedback_embeddings: torch.Tensor
@@ -123,12 +130,13 @@ class _MingTTSTailGraph:
             sigma=torch.full((batch_size,), 0.25, device=device, dtype=float_dtype),
             temperature=torch.zeros(batch_size, device=device, dtype=float_dtype),
         )
-        self.noise, self.timesteps, self.sde_random = (
-            self.model._make_tail_sampling_inputs(
-                batch_size=batch_size,
-                device=device,
-            )
+        sampling_inputs = self.model.make_tail_sampling_inputs(
+            batch_size=batch_size,
+            device=device,
         )
+        self.noise = sampling_inputs.noise
+        self.timesteps = sampling_inputs.timesteps
+        self.sde_random = sampling_inputs.sde_random
 
         context = (
             torch.autocast(device_type="cuda", dtype=hidden_dtype)
@@ -163,8 +171,7 @@ class _MingTTSTailGraph:
         self,
         inputs: MingTTSTailInputs,
         *,
-        noise: torch.Tensor,
-        sde_random: torch.Tensor,
+        sampling_inputs: MingTTSTailSamplingInputs,
     ) -> MingTTSTailOutputs:
         batch_size = int(inputs.hidden_states.shape[0])
         self.inputs.hidden_states[:batch_size].copy_(inputs.hidden_states)
@@ -177,9 +184,10 @@ class _MingTTSTailGraph:
         self.inputs.sigma[batch_size:].zero_()
         self.inputs.temperature[:batch_size].copy_(inputs.temperature)
         self.inputs.temperature[batch_size:].zero_()
-        self.noise[:batch_size].copy_(noise)
+        self.noise[:batch_size].copy_(sampling_inputs.noise)
         self.noise[batch_size:].zero_()
-        self.sde_random[:, :batch_size].copy_(sde_random)
+        self.timesteps.copy_(sampling_inputs.timesteps)
+        self.sde_random[:, :batch_size].copy_(sampling_inputs.sde_random)
         self.sde_random[:, batch_size:].zero_()
         self.graph.replay()
         return MingTTSTailOutputs(
@@ -206,14 +214,13 @@ class _MingTTSTailGraphCache:
         self,
         inputs: MingTTSTailInputs,
         *,
-        noise: torch.Tensor,
-        sde_random: torch.Tensor,
+        sampling_inputs: MingTTSTailSamplingInputs,
     ) -> MingTTSTailOutputs:
         batch_size = int(inputs.hidden_states.shape[0])
         for bucket in self.buckets:
             if bucket >= batch_size:
                 graph = self.graphs[bucket]
-                return graph.replay(inputs, noise=noise, sde_random=sde_random)
+                return graph.replay(inputs, sampling_inputs=sampling_inputs)
         raise RuntimeError(
             "Ming TTS tail CUDA graph bucket does not cover active batch "
             f"{batch_size}; captured={list(self.buckets)}"
@@ -859,23 +866,28 @@ class MingTTSSGLangModel(nn.Module):
         )
 
     @torch.no_grad()
-    def run_tail_step(self, inputs: MingTTSTailInputs) -> MingTTSTailOutputs:
-        noise, timesteps, sde_random = self._make_tail_sampling_inputs(
-            batch_size=int(inputs.hidden_states.shape[0]),
-            device=inputs.hidden_states.device,
-        )
+    def run_tail_step(
+        self,
+        inputs: MingTTSTailInputs,
+        *,
+        sampling_inputs: MingTTSTailSamplingInputs | None = None,
+    ) -> MingTTSTailOutputs:
+        if sampling_inputs is None:
+            sampling_inputs = self.make_tail_sampling_inputs(
+                batch_size=int(inputs.hidden_states.shape[0]),
+                device=inputs.hidden_states.device,
+            )
         tail_graphs = self._tail_graphs
         if tail_graphs is not None:
             return tail_graphs.replay(
                 inputs,
-                noise=noise,
-                sde_random=sde_random,
+                sampling_inputs=sampling_inputs,
             )
         return self._compute_tail_step(
             inputs,
-            noise=noise,
-            timesteps=timesteps,
-            sde_random=sde_random,
+            noise=sampling_inputs.noise,
+            timesteps=sampling_inputs.timesteps,
+            sde_random=sampling_inputs.sde_random,
         )
 
     def _compute_tail_step(
@@ -907,18 +919,20 @@ class MingTTSSGLangModel(nn.Module):
             stop_prob=stop_prob,
         )
 
-    def _make_tail_sampling_inputs(
+    def make_tail_sampling_inputs(
         self,
         *,
         batch_size: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        generator: torch.Generator | None = None,
+    ) -> MingTTSTailSamplingInputs:
         batch_size = int(batch_size)
         noise = torch.randn(
             batch_size,
             int(self.latent_dim),
             int(self.patch_size),
             device=device,
+            generator=generator,
         )
         timesteps = self._cfm_timesteps
         if timesteps is None or timesteps.device != device:
@@ -935,8 +949,13 @@ class MingTTSSGLangModel(nn.Module):
             batch_size=batch_size,
             patch_size=int(self.patch_size),
             latent_dim=int(self.latent_dim),
+            generator=generator,
         )
-        return noise, timesteps, sde_random
+        return MingTTSTailSamplingInputs(
+            noise=noise,
+            timesteps=timesteps,
+            sde_random=sde_random,
+        )
 
     @torch.no_grad()
     def forward(

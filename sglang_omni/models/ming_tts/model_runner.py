@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.ming_tts.debug_trace import (
+    fixed_tail_seed,
     matches_text,
     rng_fingerprint,
     tensor_stats,
@@ -83,6 +84,7 @@ class _MingTTSRequestState:
     generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
     trace_enabled: bool = False
+    debug_tail_generator: torch.Generator | None = None
 
 
 class MingTTSModelRunner(ModelRunner):
@@ -190,10 +192,18 @@ class MingTTSModelRunner(ModelRunner):
                 else:
                     latent_history[:, -prompt_len:, :].copy_(prompt_latent)
 
+        trace_enabled = matches_text(state.text)
+        tail_seed = fixed_tail_seed() if trace_enabled else None
+        debug_tail_generator = None
+        if self._is_entry_rank and tail_seed is not None:
+            debug_tail_generator = torch.Generator(device=device)
+            debug_tail_generator.manual_seed(tail_seed)
+
         request_state = _MingTTSRequestState(
             prefill_input_embeds=prefill_input_embeds,
             latent_history=latent_history,
-            trace_enabled=matches_text(state.text),
+            trace_enabled=trace_enabled,
+            debug_tail_generator=debug_tail_generator,
         )
         self._request_states[request_id] = request_state
         if request_state.trace_enabled and self._is_entry_rank:
@@ -207,6 +217,7 @@ class MingTTSModelRunner(ModelRunner):
                 speaker_embedding=tensor_stats(speaker_embedding),
                 prefill_input_embeds=tensor_stats(prefill_input_embeds),
                 latent_history=tensor_stats(latent_history),
+                fixed_tail_seed=tail_seed,
             )
 
     def custom_prefill_forward(
@@ -455,14 +466,36 @@ class MingTTSModelRunner(ModelRunner):
             ]
             tail_rng = rng_fingerprint(device) if trace_rows else None
 
-            tail_outputs = self.model.run_tail_step(
-                MingTTSTailInputs(
-                    hidden_states=hidden_states,
-                    latent_history=history_batch,
-                    cfg=cfg_tensor,
-                    sigma=sigma_tensor,
-                    temperature=temperature_tensor,
+            tail_inputs = MingTTSTailInputs(
+                hidden_states=hidden_states,
+                latent_history=history_batch,
+                cfg=cfg_tensor,
+                sigma=sigma_tensor,
+                temperature=temperature_tensor,
+            )
+            sampling_inputs = None
+            if any(state.debug_tail_generator is not None for state in request_states):
+                sampling_inputs = self.model.make_tail_sampling_inputs(
+                    batch_size=len(requests),
+                    device=device,
                 )
+                for row_idx, request_state in enumerate(request_states):
+                    generator = request_state.debug_tail_generator
+                    if generator is None:
+                        continue
+                    request_sampling = self.model.make_tail_sampling_inputs(
+                        batch_size=1,
+                        device=device,
+                        generator=generator,
+                    )
+                    sampling_inputs.noise[row_idx].copy_(request_sampling.noise[0])
+                    sampling_inputs.sde_random[:, row_idx].copy_(
+                        request_sampling.sde_random[:, 0]
+                    )
+
+            tail_outputs = self.model.run_tail_step(
+                tail_inputs,
+                sampling_inputs=sampling_inputs,
             )
             sampled = tail_outputs.sampled
             stop_prob = tail_outputs.stop_prob
@@ -508,6 +541,16 @@ class MingTTSModelRunner(ModelRunner):
                         hidden_state=tensor_stats(hidden_states[row_idx]),
                         latent_history=tensor_stats(request_state.latent_history),
                         previous_feedback=tensor_stats(previous_feedback),
+                        tail_noise=tensor_stats(
+                            sampling_inputs.noise[row_idx]
+                            if sampling_inputs is not None
+                            else None
+                        ),
+                        tail_sde_random=tensor_stats(
+                            sampling_inputs.sde_random[:, row_idx]
+                            if sampling_inputs is not None
+                            else None
+                        ),
                         sampled=tensor_stats(sampled_chunk),
                         feedback=tensor_stats(feedback_embeddings[row_idx]),
                         stop_probability=float(stop_prob[row_idx].item()),

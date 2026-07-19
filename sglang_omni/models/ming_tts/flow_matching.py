@@ -32,11 +32,13 @@ def build_cfm_sde_random(
     batch_size: int,
     patch_size: int,
     latent_dim: int,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     return torch.randn(
         (int(steps) - 1, int(batch_size), int(patch_size), int(latent_dim)),
         device=device,
         dtype=dtype,
+        generator=generator,
     )
 
 

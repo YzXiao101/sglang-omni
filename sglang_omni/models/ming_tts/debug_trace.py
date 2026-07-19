@@ -18,6 +18,7 @@ _TRACE_ENABLED_ENV = "MING_TTS_DEBUG_TRACE"
 _TRACE_TEXT_ENV = "MING_TTS_DEBUG_TEXT"
 _TRACE_DIR_ENV = "MING_TTS_DEBUG_DIR"
 _FIXED_REFERENCE_SEED_ENV = "MING_TTS_DEBUG_FIXED_REFERENCE_SEED"
+_FIXED_TAIL_SEED_ENV = "MING_TTS_DEBUG_FIXED_TAIL_SEED"
 _DEFAULT_TRACE_DIR = "/tmp/ming_tts_debug_trace"
 
 _LOCK = threading.Lock()
@@ -36,6 +37,11 @@ def matches_text(text: str | None) -> bool:
 
 def fixed_reference_seed() -> int | None:
     value = os.environ.get(_FIXED_REFERENCE_SEED_ENV)
+    return int(value) if value is not None else None
+
+
+def fixed_tail_seed() -> int | None:
+    value = os.environ.get(_FIXED_TAIL_SEED_ENV)
     return int(value) if value is not None else None
 
 
@@ -112,6 +118,7 @@ def _trace_path(stage: str) -> Path:
 
 __all__ = [
     "fixed_reference_seed",
+    "fixed_tail_seed",
     "is_enabled",
     "matches_text",
     "rng_fingerprint",
