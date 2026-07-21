@@ -728,7 +728,7 @@ def test_generate_emits_final_true_when_stop_token_fires(monkeypatch):
     _stub_for_generate(talker, num_steps_before_stop=4)
 
     monkeypatch.setattr(
-        "sglang_omni.models.ming_omni.talker.modeling_ming_omni_talker." "StaticCache",
+        "sglang_omni.models.ming_omni.talker.modeling_ming_omni_talker.StaticCache",
         lambda **kw: object(),
     )
 
@@ -760,7 +760,7 @@ def test_generate_emits_final_true_when_duration_cap_hits(monkeypatch):
     _stub_for_generate(talker, num_steps_before_stop=None)
 
     monkeypatch.setattr(
-        "sglang_omni.models.ming_omni.talker.modeling_ming_omni_talker." "StaticCache",
+        "sglang_omni.models.ming_omni.talker.modeling_ming_omni_talker.StaticCache",
         lambda **kw: object(),
     )
 
@@ -779,3 +779,69 @@ def test_generate_emits_final_true_when_duration_cap_hits(monkeypatch):
     assert len(yields) == 3
     flags = [bool(flag) for _, flag in yields]
     assert flags == [False, False, True]
+
+
+def test_executor_validate_resolves_absolute_authoring_path_via_suffix(tmp_path: Path):
+    """Checkpoint manifests can ship absolute paths from the authoring rig;
+    a path suffix that exists under the talker dir must still resolve."""
+    talker_dir = tmp_path / "talker"
+    wav_rel = "spks/DB30.wav"
+    abs_authoring = "/workspace/authoring-rig/checkout/spks/DB30.wav"
+    manifest = _write_voice_manifest(
+        talker_dir,
+        {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}},
+        {wav_rel: b"\x00" * 16},
+    )
+    voice_dict = {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}}
+    executor = MingTalkerExecutor(
+        model_path=str(tmp_path / "model"),
+        talker_model_path=str(talker_dir),
+        voice="DB30",
+    )
+    executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))
+    assert voice_dict["DB30"]["prompt_wav_path"] == str(talker_dir / wav_rel)
+
+
+def test_executor_validate_resolves_via_fallback_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """DB30 in inclusionAI/Ming-flash-omni-2.0 points at the authoring
+    checkout's tests/data asset; the repo-root fallback must recover it."""
+    from sglang_omni.models.ming_omni.components import voice_presets
+
+    talker_dir = tmp_path / "talker"
+    repo_root = tmp_path / "checkout"
+    wav = repo_root / "tests" / "data" / "query_to_cars.wav"
+    wav.parent.mkdir(parents=True)
+    wav.write_bytes(b"\x00" * 16)
+    abs_authoring = "/workspace/authoring-rig-fallback/tests/data/query_to_cars.wav"
+    manifest = _write_voice_manifest(
+        talker_dir,
+        {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}},
+    )
+    monkeypatch.setattr(voice_presets, "_fallback_roots", lambda: [str(repo_root)])
+    voice_dict = {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}}
+    executor = MingTalkerExecutor(
+        model_path=str(tmp_path / "model"),
+        talker_model_path=str(talker_dir),
+        voice="DB30",
+    )
+    executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))
+    assert voice_dict["DB30"]["prompt_wav_path"] == str(wav)
+
+
+def test_executor_validate_still_raises_when_no_candidate_exists(tmp_path: Path):
+    talker_dir = tmp_path / "talker"
+    abs_authoring = "/workspace/nowhere/spks/MISSING.wav"
+    manifest = _write_voice_manifest(
+        talker_dir,
+        {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}},
+    )
+    voice_dict = {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}}
+    executor = MingTalkerExecutor(
+        model_path=str(tmp_path / "model"),
+        talker_model_path=str(talker_dir),
+        voice="DB30",
+    )
+    with pytest.raises(FileNotFoundError):
+        executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))

@@ -28,6 +28,10 @@ from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
+from sglang_omni.models.ming_omni.components.voice_presets import (
+    resolve_prompt_wav_path,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_VOICE = "DB30"
@@ -392,11 +396,20 @@ class MingStreamingTalkerScheduler:
                     f"[TALKER_STREAM] voice preset {name!r} in "
                     f"{manifest_path} is missing prompt_wav_path"
                 )
-            resolved = os.path.join(talker_dir, rel_path)
-            if not os.path.isfile(resolved):
+            resolved = resolve_prompt_wav_path(rel_path, talker_dir)
+            if resolved is None:
                 raise FileNotFoundError(
                     f"[TALKER_STREAM] voice preset {name!r} references "
-                    f"missing prompt wav {resolved}"
+                    f"missing prompt wav {rel_path} (tried the talker dir "
+                    f"and the checkout-root suffix fallback)"
+                )
+            if resolved != os.path.join(talker_dir, rel_path):
+                logger.warning(
+                    "[TALKER_STREAM] voice preset %r prompt wav %s resolved "
+                    "via suffix fallback to %s",
+                    name,
+                    rel_path,
+                    resolved,
                 )
             entry["prompt_wav_path"] = resolved
 
