@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -18,6 +20,8 @@ from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+
+_PROMPT_CACHE_SCHEMA = "ming-tts:prompt:v1"
 
 
 @dataclass
@@ -40,6 +44,32 @@ class MingTTSSGLangRequestData(SGLangARRequestData):
     stop_step: int | None = None
     is_streaming: bool = False
     pending_stream_patch: MingTTSLatentPatch | None = None
+
+
+def _prompt_cache_extra_key(state: MingTTSState) -> str:
+    speaker = state.spk_emb
+    prompt_latent = state.prompt_latent
+    if speaker is None and prompt_latent is None:
+        return f"{_PROMPT_CACHE_SCHEMA}:text"
+
+    metadata = {
+        "speaker_positions": state.spk_injection_positions,
+        "latent_start": state.prompt_latent_start_position,
+        "latent_tokens": state.prompt_latent_token_count,
+    }
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    for tag, tensor in ((b"speaker", speaker), (b"latent", prompt_latent)):
+        digest.update(tag)
+        if tensor is None:
+            digest.update(b":none")
+            continue
+        value = tensor.detach().contiguous()
+        digest.update(f":{value.dtype}:{tuple(value.shape)}:".encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return f"{_PROMPT_CACHE_SCHEMA}:reference:{digest.hexdigest()}"
 
 
 def make_ming_tts_scheduler_adapters(
@@ -71,21 +101,19 @@ def make_ming_tts_scheduler_adapters(
             state.spk_emb is not None or state.prompt_latent is not None
         )
 
-        req_input_ids_list = input_ids_list
-        req_extra_key = f"ming_tts:{payload.request_id}"
         req = Req(
             rid=payload.request_id,
             origin_input_text="",
-            origin_input_ids=req_input_ids_list,
+            origin_input_ids=input_ids_list,
             sampling_params=sampling_params,
             eos_token_ids={int(tokenizer.special.end_of_audio)},
             vocab_size=vocab_size,
-            extra_key=req_extra_key,
+            extra_key=_prompt_cache_extra_key(state),
         )
         req.tokenizer = None
         req._input_embeds_are_projected = requires_projected_prefill
 
-        input_ids = torch.tensor(req_input_ids_list, dtype=torch.long)
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
         data = MingTTSSGLangRequestData(
             input_ids=input_ids,
             max_new_tokens=int(state.max_decode_steps),

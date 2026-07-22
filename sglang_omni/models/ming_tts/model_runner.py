@@ -94,6 +94,11 @@ class MingTTSModelRunner(ModelRunner):
     ) -> None:
         del forward_batch, schedule_batch
         for sched_req in requests:
+            req = sched_req.data.req
+            if req.retracted_stain:
+                # note (yzxiao): Re-prefill includes generated feedback rows, which
+                # must never extend the prompt-only radix tree.
+                req.skip_radix_cache_insert = True
             self._materialize_request_state(sched_req)
 
     def _materialize_request_state(self, sched_req: Any) -> None:
@@ -196,32 +201,37 @@ class MingTTSModelRunner(ModelRunner):
             req = data.req
             prefix_len = len(req.prefix_indices)
             extend_len = int(req.extend_input_len)
-            end = prefix_len + extend_len
             prompt_ids = data.input_ids
             prompt_len = int(prompt_ids.shape[0])
+            if prefix_len > prompt_len:
+                raise RuntimeError(
+                    "Ming-Omni-TTS radix prefix crossed the prompt boundary: "
+                    f"request_id={sched_req.request_id}, "
+                    f"prefix_len={prefix_len}, prompt_len={prompt_len}"
+                )
+
+            extend_end = prefix_len + extend_len
             req_parts = []
 
-            prompt_start = min(prefix_len, prompt_len)
-            prompt_stop = min(end, prompt_len)
-            if prompt_stop > prompt_start:
+            prompt_stop = min(extend_end, prompt_len)
+            if prompt_stop > prefix_len:
                 if request_state.prefill_input_embeds is None:
                     prompt_rows = embedding(
-                        prompt_ids[prompt_start:prompt_stop].to(device=device)
+                        prompt_ids[prefix_len:prompt_stop].to(device=device)
                     ).to(dtype=dtype)
                 else:
                     prompt_rows = request_state.prefill_input_embeds[
-                        prompt_start:prompt_stop
+                        prefix_len:prompt_stop
                     ].to(device=device, dtype=dtype)
                 req_parts.append(prompt_rows)
 
-            # Note (yzxiao): Retraction may re-prefill generated audio tokens,
+            # note (yzxiao): Retraction may re-prefill generated audio tokens,
             # whose rows live in feedback embeddings rather than token embeds.
-            gen_start = max(prefix_len, prompt_len) - prompt_len
-            gen_end = max(end - prompt_len, 0)
-            if gen_end > gen_start:
+            generated_count = max(extend_end - prompt_len, 0)
+            if generated_count:
                 feedback_rows = [
                     feedback.to(device=device, dtype=dtype)
-                    for feedback in request_state.feedback_embeddings[gen_start:gen_end]
+                    for feedback in request_state.feedback_embeddings[:generated_count]
                 ]
                 req_parts.append(torch.stack(feedback_rows, dim=0))
 

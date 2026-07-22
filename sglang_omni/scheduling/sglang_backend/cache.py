@@ -11,6 +11,8 @@ def create_tree_cache(
     req_to_token_pool,
     token_to_kv_pool_allocator,
     page_size: int,
+    *,
+    disable_finished_insert: bool = False,
 ):
     """Create a tree cache based on server_args.
 
@@ -23,6 +25,7 @@ def create_tree_cache(
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
         chunked_prefill_size=server_args.chunked_prefill_size,
+        disable_finished_insert=disable_finished_insert,
     )
 
     if server_args.disable_radix_cache:
