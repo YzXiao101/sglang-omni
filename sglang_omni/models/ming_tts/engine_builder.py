@@ -66,7 +66,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             "dtype": dtype,
             "disable_cuda_graph": True,
             "disable_overlap_schedule": True,
-            "disable_radix_cache": True,
+            "disable_radix_cache": False,
             "enable_torch_compile": False,
             "max_prefill_tokens": min(int(self.context_length), 8192),
             "sampling_backend": "pytorch",
@@ -77,13 +77,6 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         # context_length is supplied by build_sglang_server_args directly.
         overrides.pop("context_length", None)
         overrides["tp_size"] = self.tp_size
-
-        if overrides["disable_radix_cache"] is not True:
-            raise ValueError(
-                "Ming-Omni-TTS requires disable_radix_cache=true because "
-                "prefix/radix cache is not currently supported"
-            )
-        overrides["disable_radix_cache"] = True
 
         if (
             "chunked_prefill_size" in overrides
@@ -102,6 +95,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             "tp_rank": self.tp_rank,
             "nccl_port": self.nccl_port,
             "total_gpu_memory_fraction": self.total_gpu_memory_fraction,
+            "disable_finished_insert": True,
         }
 
     def setup_model(
@@ -124,7 +118,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         logger.info(
             "Ming AR SGLang startup: gpu_id=%s tp_rank=%s/%s "
             "total_gpu_memory_fraction=%s disable_cuda_graph=%s cuda_graph_bs=%s "
-            "radix_cache=%s nccl_port=%s",
+            "prompt_radix_cache=%s nccl_port=%s",
             gpu_id,
             self.tp_rank,
             self.tp_size,

@@ -202,8 +202,9 @@ deployment.
 
 ## Known Limitations
 
-- **Serving optimizations.** Prefix/radix cache is not yet implemented. `torch.compile` has not yet
-  been validated and remains disabled in the provided configuration.
+- **Serving optimizations.** Radix reuse is limited to the original prompt; generated acoustic
+  history is not inserted into the cache. `torch.compile` has not yet been validated and remains
+  disabled in the provided configuration.
 - **Reference inputs.** The current request adapter accepts one local reference audio file with a
   non-empty transcript; remote URLs, data URLs, precomputed prompt latents, and speaker embeddings
   are not yet exposed.
