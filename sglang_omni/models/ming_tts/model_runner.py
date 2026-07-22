@@ -95,6 +95,11 @@ class MingTTSModelRunner(ModelRunner):
     ) -> None:
         del forward_batch, schedule_batch
         for sched_req in requests:
+            req = sched_req.data.req
+            if req.retracted_stain:
+                # note (yzxiao): Re-prefill includes generated feedback rows, which
+                # must never extend the prompt-only radix tree.
+                req.skip_radix_cache_insert = True
             self._materialize_request_state(sched_req)
 
     def _materialize_request_state(self, sched_req: Any) -> None:

@@ -51,6 +51,7 @@ def create_sglang_infrastructure(
     capture_hidden_layers: list[int] | None = None,
     total_gpu_memory_fraction: float | None = None,
     defer_cuda_graph_capture: bool = False,
+    disable_finished_insert: bool = False,
 ):
     """Create SGLang worker, memory pools, tree cache, and prefill/decode managers."""
     from sglang_omni.model_runner.model_worker import ModelWorker, ModelWorkerConfig
@@ -103,6 +104,7 @@ def create_sglang_infrastructure(
         req_to_token_pool,
         token_to_kv_pool_allocator,
         server_args.page_size,
+        disable_finished_insert=disable_finished_insert,
     )
 
     enable_overlap = not server_args.disable_overlap_schedule
