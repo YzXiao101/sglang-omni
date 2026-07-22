@@ -845,3 +845,69 @@ def test_executor_validate_still_raises_when_no_candidate_exists(tmp_path: Path)
     )
     with pytest.raises(FileNotFoundError):
         executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))
+
+
+def test_env_asset_root_resolves_for_wheel_installs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Wheel installs have no checkout; SGLANG_OMNI_VOICE_ASSET_ROOT is the
+    documented escape hatch."""
+    talker_dir = tmp_path / "talker"
+    asset_root = tmp_path / "assets"
+    wav = asset_root / "tests" / "data" / "query_to_cars.wav"
+    wav.parent.mkdir(parents=True)
+    wav.write_bytes(b"\x00" * 16)
+    monkeypatch.setenv("SGLANG_OMNI_VOICE_ASSET_ROOT", str(asset_root))
+    abs_authoring = "/workspace/authoring-rig/tests/data/query_to_cars.wav"
+    manifest = _write_voice_manifest(
+        talker_dir,
+        {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}},
+    )
+    voice_dict = {"DB30": {"prompt_text": "x", "prompt_wav_path": abs_authoring}}
+    executor = MingTalkerExecutor(
+        model_path=str(tmp_path / "model"),
+        talker_model_path=str(talker_dir),
+        voice="DB30",
+    )
+    executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))
+    assert voice_dict["DB30"]["prompt_wav_path"] == str(wav)
+
+
+def test_parent_traversal_in_manifest_path_fails_closed(tmp_path: Path):
+    talker_dir = tmp_path / "talker"
+    outside = tmp_path / "secret.wav"
+    outside.write_bytes(b"\x00" * 16)
+    rel = "../secret.wav"
+    manifest = _write_voice_manifest(
+        talker_dir,
+        {"DB30": {"prompt_text": "x", "prompt_wav_path": rel}},
+    )
+    voice_dict = {"DB30": {"prompt_text": "x", "prompt_wav_path": rel}}
+    executor = MingTalkerExecutor(
+        model_path=str(tmp_path / "model"),
+        talker_model_path=str(talker_dir),
+        voice="DB30",
+    )
+    with pytest.raises(FileNotFoundError):
+        executor._validate_voice_presets(voice_dict, str(manifest), str(talker_dir))
+
+
+def test_bare_basename_not_resolved_under_fallback_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A lone filename may match inside the checkpoint's talker dir, but the
+    wider fallback roots require at least parent/name to avoid same-name
+    shadowing."""
+    from sglang_omni.models.ming_omni.components import voice_presets
+
+    talker_dir = tmp_path / "talker"
+    talker_dir.mkdir(parents=True)
+    root = tmp_path / "checkout"
+    (root / "somewhere").mkdir(parents=True)
+    shadow = root / "somewhere" / "voice.wav"
+    shadow.write_bytes(b"\x00" * 16)
+    monkeypatch.setattr(voice_presets, "_fallback_roots", lambda: [str(root)])
+    assert (
+        voice_presets.resolve_prompt_wav_path("/authoring/voice.wav", str(talker_dir))
+        is None
+    )

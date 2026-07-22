@@ -23,12 +23,11 @@ from pathlib import Path
 
 import torch
 
-from sglang_omni.models.ming_omni.pipeline.usage import build_text_usage
-from sglang_omni.proto import StagePayload
-
 from sglang_omni.models.ming_omni.components.voice_presets import (
     resolve_prompt_wav_path,
 )
+from sglang_omni.models.ming_omni.pipeline.usage import build_text_usage
+from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
 

@@ -23,14 +23,13 @@ import numpy as np
 import torch
 
 from sglang_omni.models.ming_omni.components.streaming_text import uint8_tensor_to_text
+from sglang_omni.models.ming_omni.components.voice_presets import (
+    resolve_prompt_wav_path,
+)
 from sglang_omni.models.ming_omni.pipeline.next_stage import TALKER_STREAM_STAGE
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-
-from sglang_omni.models.ming_omni.components.voice_presets import (
-    resolve_prompt_wav_path,
-)
 
 logger = logging.getLogger(__name__)
 
