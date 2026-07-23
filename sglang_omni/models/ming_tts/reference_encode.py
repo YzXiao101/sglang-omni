@@ -19,6 +19,7 @@ from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
     store_ming_tts_state,
 )
+from sglang_omni.models.ming_tts.profile_ranges import profile_nvtx_range
 from sglang_omni.models.ming_tts.prompt_builder import build_ming_tts_prompt
 from sglang_omni.models.ming_tts.tokenizer import MingTTSTokenizerBundle
 from sglang_omni.preprocessing.cache_key import reference_path_cache_key
@@ -205,10 +206,11 @@ class MingTTSReferenceEncoder:
             return payload
 
         ref_audio = str(state.ref_audio)
-        if self._service is not None:
-            artifact = self._service.get_or_encode(ref_audio, desc=repr(ref_audio))
-        else:
-            artifact = self._encode_reference(ref_audio)
+        with profile_nvtx_range("ming_tts.reference_encode"):
+            if self._service is not None:
+                artifact = self._service.get_or_encode(ref_audio, desc=repr(ref_audio))
+            else:
+                artifact = self._encode_reference(ref_audio)
 
         state.spk_emb = artifact["spk_emb"]
         state.prompt_latent = artifact["prompt_latent"]

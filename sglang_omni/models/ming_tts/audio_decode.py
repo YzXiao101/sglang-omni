@@ -16,6 +16,7 @@ from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
     store_ming_tts_state,
 )
+from sglang_omni.models.ming_tts.profile_ranges import profile_nvtx_range
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
@@ -110,7 +111,7 @@ class MingAudioDecoder(torch.nn.Module):
             if self.device.type == "cuda"
             else nullcontext()
         )
-        with context:
+        with profile_nvtx_range("ming_tts.audio_decode"), context:
             for step, last_chunk in enumerate(last_chunks):
                 chunk = latents[step : step + 1]
                 wav, stream_state, past_key_values = self.audio_vae.decode(
