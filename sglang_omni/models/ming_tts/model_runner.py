@@ -12,6 +12,10 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.ming_tts.engine_io import MingTTSLatentPatch
+from sglang_omni.models.ming_tts.profile_ranges import (
+    profile_nvtx_enabled,
+    profile_nvtx_range,
+)
 from sglang_omni.models.ming_tts.sglang_model import MingTTSTailInputs
 
 
@@ -254,16 +258,29 @@ class MingTTSModelRunner(ModelRunner):
         positions = forward_batch.positions
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
-        logits_output = self.model(
-            input_ids=forward_batch.input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-        )
+        with profile_nvtx_range("ming_tts.ar_backbone"):
+            logits_output = self.model(
+                input_ids=forward_batch.input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=False,
         )
+
+    def custom_decode_forward(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> GenerationBatchResult | None:
+        del schedule_batch, requests
+        if not profile_nvtx_enabled():
+            return None
+        with profile_nvtx_range("ming_tts.ar_backbone"):
+            return self.tp_worker.forward_batch_generation(forward_batch)
 
     def before_decode(
         self,
@@ -408,15 +425,16 @@ class MingTTSModelRunner(ModelRunner):
                 device=device,
             )
 
-            tail_outputs = self.model.run_tail_step(
-                MingTTSTailInputs(
-                    hidden_states=hidden_states,
-                    latent_history=history_batch,
-                    cfg=cfg_tensor,
-                    sigma=sigma_tensor,
-                    temperature=temperature_tensor,
+            with profile_nvtx_range("ming_tts.acoustic_tail"):
+                tail_outputs = self.model.run_tail_step(
+                    MingTTSTailInputs(
+                        hidden_states=hidden_states,
+                        latent_history=history_batch,
+                        cfg=cfg_tensor,
+                        sigma=sigma_tensor,
+                        temperature=temperature_tensor,
+                    )
                 )
-            )
             sampled = tail_outputs.sampled
             stop_prob = tail_outputs.stop_prob
             feedback_embeddings = tail_outputs.feedback_embeddings

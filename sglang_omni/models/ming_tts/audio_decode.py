@@ -23,6 +23,7 @@ from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
     store_ming_tts_state,
 )
+from sglang_omni.models.ming_tts.profile_ranges import profile_nvtx_range
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -213,7 +214,7 @@ class MingAudioDecoder(torch.nn.Module):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        with context:
+        with profile_nvtx_range("ming_tts.audio_decode"), context:
             next_dynamic_caches = [state.dynamic_cache for state in states]
             next_fixed_states = [state.fixed_kv_state for state in states]
             if phase is _MingAudioVAEStepPhase.STEADY:
@@ -351,7 +352,7 @@ class MingAudioDecoder(torch.nn.Module):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        with context:
+        with profile_nvtx_range("ming_tts.audio_decode"), context:
             if self._graph_runner is None:
                 for request_index, sequence in sequences.items():
                     waveform, _, _ = self.audio_vae.decode(
