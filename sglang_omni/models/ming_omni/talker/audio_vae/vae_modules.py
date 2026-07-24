@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from transformers import Qwen2Config, Qwen2Model
 
 from .istft import ISTFTHead
+from .profile_ranges import audio_vae_nvtx_range
 
 
 class StreamingLinearUpsample(nn.Module):
@@ -161,13 +162,15 @@ class Decoder(nn.Module):
     ):
         upsample_state, audio_buffer, window_buffer = stream_state
         bsz, device, dtype = x.size(0), x.device, x.dtype
-        x = self.fc1(x)
+        with audio_vae_nvtx_range("audio_vae.latent_projection"):
+            x = self.fc1(x)
         if self.patch_size != -1:
             if use_cache:
                 # streaming
-                x, upsample_state = self.upsampling(
-                    x, state=upsample_state, is_last=last_chunk
-                )
+                with audio_vae_nvtx_range("audio_vae.linear_upsample"):
+                    x, upsample_state = self.upsampling(
+                        x, state=upsample_state, is_last=last_chunk
+                    )
                 if x is None:
                     stream_state = (upsample_state, audio_buffer, window_buffer)
                     return (
@@ -176,44 +179,48 @@ class Decoder(nn.Module):
                         past_key_values,
                     )
             else:
-                x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
+                with audio_vae_nvtx_range("audio_vae.linear_upsample"):
+                    x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
 
         hidden_states_list = []
 
-        if (
-            use_cache
-            and getattr(self.decoder.config, "sliding_window", None) is not None
-        ):
-            sw_size = self.decoder.config.sliding_window
-            target_len = sw_size - 1
-            if past_key_values is None:
-                past_len = 0
-            elif hasattr(past_key_values, "get_seq_length"):
-                past_len = past_key_values.get_seq_length()
-            elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
-                past_len = past_key_values[0][0].shape[-2]
-            else:
-                past_len = 0
+        with audio_vae_nvtx_range("audio_vae.transformer"):
+            if (
+                use_cache
+                and getattr(self.decoder.config, "sliding_window", None) is not None
+            ):
+                sw_size = self.decoder.config.sliding_window
+                target_len = sw_size - 1
+                if past_key_values is None:
+                    past_len = 0
+                elif hasattr(past_key_values, "get_seq_length"):
+                    past_len = past_key_values.get_seq_length()
+                elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
+                    past_len = past_key_values[0][0].shape[-2]
+                else:
+                    past_len = 0
 
-            curr_len = x.shape[1]
+                curr_len = x.shape[1]
 
-            if past_len < target_len and (past_len + curr_len) >= sw_size:
-                fill_len = target_len - past_len
-                x_fill = x[:, :fill_len, :]
-                outputs = self.decoder(
-                    inputs_embeds=x_fill,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                )
+                if past_len < target_len and (past_len + curr_len) >= sw_size:
+                    fill_len = target_len - past_len
+                    x_fill = x[:, :fill_len, :]
+                    outputs = self.decoder(
+                        inputs_embeds=x_fill,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                    )
 
-                hidden_states_list.append(outputs.last_hidden_state)
-                past_key_values = outputs.past_key_values
+                    hidden_states_list.append(outputs.last_hidden_state)
+                    past_key_values = outputs.past_key_values
 
-                x = x[:, fill_len:, :]
+                    x = x[:, fill_len:, :]
 
-        outputs = self.decoder(
-            inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache
-        )
+            outputs = self.decoder(
+                inputs_embeds=x,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
 
         hidden_states_list.append(outputs.last_hidden_state)
         past_key_values = outputs.past_key_values

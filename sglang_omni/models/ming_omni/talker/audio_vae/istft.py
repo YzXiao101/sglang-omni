@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from .profile_ranges import audio_vae_nvtx_range
+
 
 class ISTFT(nn.Module):
     """
@@ -94,47 +96,51 @@ class ISTFT(nn.Module):
         B, N, T = spec.shape
 
         # Inverse FFT
-        ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
-        ifft = ifft * self.window[None, :, None]
+        with audio_vae_nvtx_range("audio_vae.inverse_fft"):
+            ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+            ifft = ifft * self.window[None, :, None]
 
         # Overlap and Add
-        output_size = (T - 1) * self.hop_length + self.win_length
-        y = torch.nn.functional.fold(
-            ifft,
-            output_size=(1, output_size),
-            kernel_size=(1, self.win_length),
-            stride=(1, self.hop_length),
-        )[:, 0, 0, :]
-
-        y, audio_buffer = self.__buffer_process(
-            y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming
-        )
-
-        # Window envelope
-        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
-        window_envelope = (
-            torch.nn.functional.fold(
-                window_sq,
+        with audio_vae_nvtx_range("audio_vae.overlap_add"):
+            output_size = (T - 1) * self.hop_length + self.win_length
+            y = torch.nn.functional.fold(
+                ifft,
                 output_size=(1, output_size),
                 kernel_size=(1, self.win_length),
                 stride=(1, self.hop_length),
-            )
-            .squeeze(0)
-            .squeeze(0)
-        )
+            )[:, 0, 0, :]
 
-        window_envelope, window_buffer = self.__buffer_process(
-            window_envelope,
-            window_buffer,
-            pad,
-            last_chunk=last_chunk,
-            streaming=streaming,
-        )
-        window_envelope = window_envelope.squeeze()
+            y, audio_buffer = self.__buffer_process(
+                y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming
+            )
+
+        # Window envelope
+        with audio_vae_nvtx_range("audio_vae.window_envelope"):
+            window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
+            window_envelope = (
+                torch.nn.functional.fold(
+                    window_sq,
+                    output_size=(1, output_size),
+                    kernel_size=(1, self.win_length),
+                    stride=(1, self.hop_length),
+                )
+                .squeeze(0)
+                .squeeze(0)
+            )
+
+            window_envelope, window_buffer = self.__buffer_process(
+                window_envelope,
+                window_buffer,
+                pad,
+                last_chunk=last_chunk,
+                streaming=streaming,
+            )
+            window_envelope = window_envelope.squeeze()
 
         # Normalize
-        assert (window_envelope > 1e-11).all()
-        y = y / window_envelope
+        with audio_vae_nvtx_range("audio_vae.normalization"):
+            assert (window_envelope > 1e-11).all()
+            y = y / window_envelope
 
         return y, audio_buffer, window_buffer
 
@@ -192,23 +198,24 @@ class ISTFTHead(FourierHead):
         Returns:
             Tensor: Reconstructed time-domain audio signal of shape (B, T), where T is the length of the output signal.
         """
-        x_pred = self.out(x)
-        # x_pred = x
-        x_pred = x_pred.transpose(1, 2)
-        mag, p = x_pred.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(
-            mag, max=1e2
-        )  # safeguard to prevent excessively large magnitudes
-        # wrapping happens here. These two lines produce real and imaginary value
-        x = torch.cos(p)
-        y = torch.sin(p)
-        # recalculating phase here does not produce anything new
-        # only costs time
-        # phase = torch.atan2(y, x)
-        # S = mag * torch.exp(phase * 1j)
-        # better directly produce the complex value
-        S = mag * (x + 1j * y)
+        with audio_vae_nvtx_range("audio_vae.spectral_projection"):
+            x_pred = self.out(x)
+            # x_pred = x
+            x_pred = x_pred.transpose(1, 2)
+            mag, p = x_pred.chunk(2, dim=1)
+            mag = torch.exp(mag)
+            mag = torch.clip(
+                mag, max=1e2
+            )  # safeguard to prevent excessively large magnitudes
+            # wrapping happens here. These two lines produce real and imaginary value
+            x = torch.cos(p)
+            y = torch.sin(p)
+            # recalculating phase here does not produce anything new
+            # only costs time
+            # phase = torch.atan2(y, x)
+            # S = mag * torch.exp(phase * 1j)
+            # better directly produce the complex value
+            S = mag * (x + 1j * y)
         audio, audio_buffer, window_buffer = self.istft(
             S,
             audio_buffer=audio_buffer,

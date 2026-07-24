@@ -11,6 +11,9 @@ from typing import Any
 import torch
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
+from sglang_omni.models.ming_omni.talker.audio_vae.profile_ranges import (
+    audio_vae_nvtx_range,
+)
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
@@ -114,13 +117,19 @@ class MingAudioDecoder(torch.nn.Module):
         with profile_nvtx_range("ming_tts.audio_decode"), context:
             for step, last_chunk in enumerate(last_chunks):
                 chunk = latents[step : step + 1]
-                wav, stream_state, past_key_values = self.audio_vae.decode(
-                    chunk,
-                    past_key_values=state.past_key_values,
-                    use_cache=True,
-                    stream_state=state.stream_state,
-                    last_chunk=last_chunk,
+                range_name = (
+                    "ming_tts.audio_vae.terminal_chunk"
+                    if last_chunk
+                    else "ming_tts.audio_vae.regular_chunk"
                 )
+                with audio_vae_nvtx_range(range_name):
+                    wav, stream_state, past_key_values = self.audio_vae.decode(
+                        chunk,
+                        past_key_values=state.past_key_values,
+                        use_cache=True,
+                        stream_state=state.stream_state,
+                        last_chunk=last_chunk,
+                    )
                 state.stream_state = stream_state
                 state.past_key_values = past_key_values
                 wav = wav[0, 0].detach()
