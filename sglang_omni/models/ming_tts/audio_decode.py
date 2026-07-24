@@ -13,6 +13,9 @@ import torch
 from transformers.cache_utils import Cache
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
+from sglang_omni.models.ming_omni.talker.audio_vae.profile_ranges import (
+    audio_vae_nvtx_range,
+)
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.audio_vae_graph import (
     MingAudioVAEGraphRunner,
@@ -214,7 +217,16 @@ class MingAudioDecoder(torch.nn.Module):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        with profile_nvtx_range("ming_tts.audio_decode"), context:
+        range_name = (
+            "ming_tts.audio_vae.terminal_chunk"
+            if any(last_chunks)
+            else "ming_tts.audio_vae.regular_chunk"
+        )
+        with (
+            profile_nvtx_range("ming_tts.audio_decode"),
+            audio_vae_nvtx_range(range_name),
+            context,
+        ):
             next_dynamic_caches = [state.dynamic_cache for state in states]
             next_fixed_states = [state.fixed_kv_state for state in states]
             if phase is _MingAudioVAEStepPhase.STEADY:
@@ -352,7 +364,11 @@ class MingAudioDecoder(torch.nn.Module):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        with profile_nvtx_range("ming_tts.audio_decode"), context:
+        with (
+            profile_nvtx_range("ming_tts.audio_decode"),
+            audio_vae_nvtx_range("ming_tts.audio_vae.nonstreaming_batch"),
+            context,
+        ):
             if self._graph_runner is None:
                 for request_index, sequence in sequences.items():
                     waveform, _, _ = self.audio_vae.decode(

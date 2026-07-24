@@ -5,6 +5,7 @@ from transformers import Qwen2Config, Qwen2Model
 from transformers.cache_utils import Cache
 
 from .istft import ISTFTHead
+from .profile_ranges import audio_vae_nvtx_range
 
 
 class StreamingLinearUpsample(nn.Module):
@@ -160,17 +161,20 @@ class Decoder(nn.Module):
         upsample_state,
         is_last,
     ):
-        inputs = self.fc1(latent)
+        with audio_vae_nvtx_range("audio_vae.latent_projection"):
+            inputs = self.fc1(latent)
         if self.patch_size == -1:
             return inputs, upsample_state
         if streaming:
-            return self.upsampling(
-                inputs,
-                state=upsample_state,
-                is_last=is_last,
-            )
-        inputs = self.upsampling.upsampler(inputs.transpose(1, 2))
-        inputs = inputs.transpose(1, 2)
+            with audio_vae_nvtx_range("audio_vae.linear_upsample"):
+                return self.upsampling(
+                    inputs,
+                    state=upsample_state,
+                    is_last=is_last,
+                )
+        with audio_vae_nvtx_range("audio_vae.linear_upsample"):
+            inputs = self.upsampling.upsampler(inputs.transpose(1, 2))
+            inputs = inputs.transpose(1, 2)
         return inputs, upsample_state
 
     def decode_hidden_states(
@@ -180,41 +184,43 @@ class Decoder(nn.Module):
         past_key_values: Cache | None,
         use_cache: bool,
     ):
-        hidden_state_parts = []
-        sliding_window = getattr(self.decoder.config, "sliding_window", None)
+        with audio_vae_nvtx_range("audio_vae.transformer"):
+            hidden_state_parts = []
+            sliding_window = getattr(self.decoder.config, "sliding_window", None)
 
-        if use_cache and sliding_window is not None:
-            target_len = sliding_window - 1
-            past_len = (
-                0 if past_key_values is None else past_key_values.get_seq_length()
-            )
-
-            current_len = inputs.shape[1]
-            crosses_boundary = (
-                past_len < target_len and past_len + current_len >= sliding_window
-            )
-            if crosses_boundary:
-                fill_len = target_len - past_len
-                outputs = self.decoder(
-                    inputs_embeds=inputs[:, :fill_len, :],
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
+            if use_cache and sliding_window is not None:
+                target_len = sliding_window - 1
+                past_len = (
+                    0 if past_key_values is None else past_key_values.get_seq_length()
                 )
-                hidden_state_parts.append(outputs.last_hidden_state)
-                past_key_values = outputs.past_key_values
-                inputs = inputs[:, fill_len:, :]
 
-        outputs = self.decoder(
-            inputs_embeds=inputs,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-        )
-        hidden_state_parts.append(outputs.last_hidden_state)
-        past_key_values = outputs.past_key_values
+                current_len = inputs.shape[1]
+                crosses_boundary = (
+                    past_len < target_len
+                    and past_len + current_len >= sliding_window
+                )
+                if crosses_boundary:
+                    fill_len = target_len - past_len
+                    outputs = self.decoder(
+                        inputs_embeds=inputs[:, :fill_len, :],
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                    )
+                    hidden_state_parts.append(outputs.last_hidden_state)
+                    past_key_values = outputs.past_key_values
+                    inputs = inputs[:, fill_len:, :]
 
-        if len(hidden_state_parts) == 1:
-            return hidden_state_parts[0], past_key_values
-        return torch.cat(hidden_state_parts, dim=1), past_key_values
+            outputs = self.decoder(
+                inputs_embeds=inputs,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+            hidden_state_parts.append(outputs.last_hidden_state)
+            past_key_values = outputs.past_key_values
+
+            if len(hidden_state_parts) == 1:
+                return hidden_state_parts[0], past_key_values
+            return torch.cat(hidden_state_parts, dim=1), past_key_values
 
     def synthesize_waveform(
         self,
