@@ -31,7 +31,7 @@ class _MingAudioDecodeState:
 
 
 class MingAudioDecoder(torch.nn.Module):
-    """Chunked official-path AudioVAE decoder wrapper."""
+    """Official-path AudioVAE decoder wrapper."""
 
     def __init__(self, audio_vae: AudioVAE, *, sample_rate: int) -> None:
         super().__init__()
@@ -99,9 +99,6 @@ class MingAudioDecoder(torch.nn.Module):
             )
 
         latents = latents.to(device=self.device, dtype=self.dtype)
-        if state is None:
-            state = _MingAudioDecodeState()
-        waveform_chunks = []
         autocast_dtype = self.dtype
         if autocast_dtype not in (torch.float16, torch.bfloat16):
             autocast_dtype = torch.bfloat16
@@ -111,6 +108,23 @@ class MingAudioDecoder(torch.nn.Module):
             else nullcontext()
         )
         with context:
+            if state is None:
+                sequence = latents.reshape(1, -1, latents.shape[-1])
+                wav, _, _ = self.audio_vae.decode(
+                    sequence,
+                    past_key_values=None,
+                    use_cache=False,
+                    stream_state=(None, None, None),
+                    last_chunk=True,
+                )
+                wav = wav[0, 0].detach()
+                if wav.numel() == 0:
+                    raise RuntimeError(
+                        "Ming-Omni-TTS AudioVAE terminal chunk produced no audio"
+                    )
+                return wav
+
+            waveform_chunks = []
             for step, last_chunk in enumerate(last_chunks):
                 chunk = latents[step : step + 1]
                 wav, stream_state, past_key_values = self.audio_vae.decode(
