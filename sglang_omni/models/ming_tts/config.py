@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from sglang_omni.config import PipelineConfig, StageConfig
 
 _PKG = "sglang_omni.models.ming_tts"
@@ -13,6 +15,39 @@ PREPROCESSING_STAGE = "preprocessing"
 REFERENCE_ENCODE_STAGE = "reference_encode"
 TTS_ENGINE_STAGE = "tts_engine"
 AUDIO_DECODE_STAGE = "audio_decode"
+
+
+class MingAudioVAECudaGraphConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    batch_sizes: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
+    nonstream_token_sizes: list[int] | None = None
+
+    def model_post_init(self, __context: Any = None) -> None:
+        if not self.batch_sizes:
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE graph batch_sizes must not be empty"
+            )
+        if any(batch_size <= 0 for batch_size in self.batch_sizes):
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE graph batch_sizes must contain only "
+                f"positive values; got {self.batch_sizes!r}"
+            )
+        self.batch_sizes = sorted(set(self.batch_sizes))
+
+        if self.nonstream_token_sizes is None:
+            return
+        if not self.nonstream_token_sizes:
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE graph nonstream_token_sizes must not be empty"
+            )
+        if any(token_size <= 0 for token_size in self.nonstream_token_sizes):
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE graph nonstream_token_sizes must contain "
+                f"only positive values; got {self.nonstream_token_sizes!r}"
+            )
+        self.nonstream_token_sizes = sorted(set(self.nonstream_token_sizes))
 
 
 class MingTTSPipelineConfig(PipelineConfig):
@@ -39,6 +74,10 @@ class MingTTSPipelineConfig(PipelineConfig):
         return {"generation": TTS_ENGINE_STAGE}
 
     model_path: str
+    max_decode_steps_cap: int | None = None
+    audio_vae_cuda_graph: MingAudioVAECudaGraphConfig = Field(
+        default_factory=MingAudioVAECudaGraphConfig
+    )
     entry_stage: str = PREPROCESSING_STAGE
     stages: list[StageConfig] = [
         StageConfig(
@@ -77,6 +116,54 @@ class MingTTSPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
+        if self.max_decode_steps_cap is not None and self.max_decode_steps_cap <= 0:
+            raise ValueError("Ming-Omni-TTS max_decode_steps_cap must be positive")
+        if self.audio_vae_cuda_graph.enabled and self.max_decode_steps_cap is None:
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE CUDA graph requires max_decode_steps_cap"
+            )
+
+        stages = {stage.name: stage for stage in self.stages}
+        required_stages = {PREPROCESSING_STAGE, AUDIO_DECODE_STAGE}
+        missing_stages = required_stages - stages.keys()
+        if missing_stages:
+            raise ValueError(
+                "Ming-Omni-TTS pipeline is missing required stages: "
+                f"{sorted(missing_stages)}"
+            )
+        preprocessing = stages[PREPROCESSING_STAGE]
+        audio_decode = stages[AUDIO_DECODE_STAGE]
+        graph_factory_config = self.audio_vae_cuda_graph.model_dump(mode="python")
+        for stage, expected_args in (
+            (
+                preprocessing,
+                {"max_decode_steps_cap": self.max_decode_steps_cap},
+            ),
+            (
+                audio_decode,
+                {
+                    "max_decode_steps_cap": self.max_decode_steps_cap,
+                    "audio_vae_cuda_graph": graph_factory_config,
+                },
+            ),
+        ):
+            runtime_overrides = self.runtime_overrides.get(stage.name, {})
+            for arg, expected_value in expected_args.items():
+                if arg in runtime_overrides:
+                    raise ValueError(
+                        f"Ming-Omni-TTS {arg!r} is owned by the pipeline config, "
+                        f"not stage {stage.name!r}"
+                    )
+                if (
+                    arg in stage.factory_args
+                    and stage.factory_args[arg] != expected_value
+                ):
+                    raise ValueError(
+                        f"Ming-Omni-TTS stage {stage.name!r} {arg!r} conflicts "
+                        "with the pipeline config"
+                    )
+                stage.factory_args[arg] = expected_value
+
         for stage in self.stages:
             if stage.name != TTS_ENGINE_STAGE:
                 if stage.tp_size != 1:
