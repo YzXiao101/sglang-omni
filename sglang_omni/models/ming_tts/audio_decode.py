@@ -5,20 +5,26 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import torch
+from transformers.cache_utils import Cache
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
+from sglang_omni.models.ming_tts.audio_vae_graph import (
+    MingAudioVAEGraphRunner,
+    MingAudioVAEKVState,
+)
 from sglang_omni.models.ming_tts.payload_types import (
+    MingTTSState,
     load_ming_tts_state,
     store_ming_tts_state,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -26,8 +32,14 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 @dataclass
 class _MingAudioDecodeState:
-    past_key_values: Any = None
+    dynamic_cache: Cache | None = None
+    fixed_kv_state: MingAudioVAEKVState | None = None
     stream_state: tuple[Any, Any, Any] = (None, None, None)
+
+
+class _MingAudioVAEStepPhase(Enum):
+    EAGER = "eager"
+    STEADY = "steady"
 
 
 class MingAudioDecoder(torch.nn.Module):
@@ -37,6 +49,7 @@ class MingAudioDecoder(torch.nn.Module):
         super().__init__()
         self.audio_vae = audio_vae
         self.sample_rate = int(sample_rate)
+        self._graph_runner: MingAudioVAEGraphRunner | None = None
 
     @classmethod
     def from_config(
@@ -76,6 +89,53 @@ class MingAudioDecoder(torch.nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.audio_vae.parameters()).dtype
 
+    @property
+    def cuda_graph_enabled(self) -> bool:
+        return self._graph_runner is not None
+
+    @property
+    def max_graph_batch_size(self) -> int:
+        if self._graph_runner is None:
+            return 1
+        return self._graph_runner.max_batch_size
+
+    @torch.inference_mode()
+    def capture_cuda_graphs(
+        self,
+        *,
+        batch_sizes: list[int],
+        token_sizes: list[int],
+        streaming_token_size: int,
+    ) -> None:
+        runner = MingAudioVAEGraphRunner(
+            self.audio_vae.decoder,
+            batch_sizes=batch_sizes,
+            token_sizes=token_sizes,
+            streaming_token_size=streaming_token_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        runner.capture()
+        self._graph_runner = runner
+
+    def log_cuda_graph_stats(self) -> None:
+        if self._graph_runner is not None:
+            self._graph_runner.log_stats()
+
+    def streaming_phase(
+        self,
+        state: _MingAudioDecodeState,
+        *,
+        is_last: bool,
+    ) -> _MingAudioVAEStepPhase:
+        if (
+            self._graph_runner is not None
+            and state.fixed_kv_state is not None
+            and not is_last
+        ):
+            return _MingAudioVAEStepPhase.STEADY
+        return _MingAudioVAEStepPhase.EAGER
+
     @torch.inference_mode()
     def decode_chunks(
         self,
@@ -84,6 +144,9 @@ class MingAudioDecoder(torch.nn.Module):
         *,
         state: _MingAudioDecodeState | None = None,
     ) -> torch.Tensor:
+        if state is None:
+            return self.decode_nonstreaming_batch([latents], [last_chunks])[0]
+
         chunk_count = int(latents.shape[0])
         if len(last_chunks) != chunk_count:
             raise ValueError(
@@ -92,58 +155,259 @@ class MingAudioDecoder(torch.nn.Module):
             )
         if chunk_count == 0:
             return latents.new_empty((0,), dtype=torch.float32)
-        if state is None and (not last_chunks[-1] or any(last_chunks[:-1])):
+
+        waveform_chunks = []
+        for step, last_chunk in enumerate(last_chunks):
+            waveform = self.decode_streaming_step(
+                [latents[step]],
+                [last_chunk],
+                [state],
+                phase=self.streaming_phase(state, is_last=last_chunk),
+            )[0]
+            waveform_chunks.append(waveform)
+
+        return torch.cat(waveform_chunks, dim=0)
+
+    @torch.inference_mode()
+    def decode_streaming_step(
+        self,
+        latent_patches: list[torch.Tensor],
+        last_chunks: list[bool],
+        states: list[_MingAudioDecodeState],
+        *,
+        phase: _MingAudioVAEStepPhase,
+    ) -> list[torch.Tensor]:
+        if not latent_patches or not (
+            len(latent_patches) == len(last_chunks) == len(states)
+        ):
             raise ValueError(
-                "Ming-Omni-TTS full AudioVAE decode requires exactly one terminal "
-                "flag on the final latent chunk"
+                "Ming-Omni-TTS streaming AudioVAE step requires aligned "
+                "latent, terminal-flag, and decoder-state rows"
             )
 
-        latents = latents.to(device=self.device, dtype=self.dtype)
-        autocast_dtype = self.dtype
-        if autocast_dtype not in (torch.float16, torch.bfloat16):
-            autocast_dtype = torch.bfloat16
+        decoder = self.audio_vae.decoder
+        prepared_inputs: list[torch.Tensor | None] = []
+        next_upsample_states = []
+        for latent_patch, is_last, state in zip(
+            latent_patches,
+            last_chunks,
+            states,
+        ):
+            latent_patch = latent_patch.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0)
+            upsample_state, _, _ = state.stream_state
+            inputs, upsample_state = decoder.prepare_inputs(
+                latent_patch,
+                streaming=True,
+                upsample_state=upsample_state,
+                is_last=is_last,
+            )
+            prepared_inputs.append(inputs)
+            next_upsample_states.append(upsample_state)
+
         context = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype)
+            torch.autocast(device_type="cuda", dtype=self.dtype)
             if self.device.type == "cuda"
+            and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
         with context:
-            if state is None:
-                sequence = latents.reshape(1, -1, latents.shape[-1])
-                wav, _, _ = self.audio_vae.decode(
-                    sequence,
-                    past_key_values=None,
-                    use_cache=False,
-                    stream_state=(None, None, None),
-                    last_chunk=True,
+            next_dynamic_caches = [state.dynamic_cache for state in states]
+            next_fixed_states = [state.fixed_kv_state for state in states]
+            if phase is _MingAudioVAEStepPhase.STEADY:
+                graph_runner = cast(MingAudioVAEGraphRunner, self._graph_runner)
+                graph_inputs: list[torch.Tensor] = []
+                fixed_states: list[MingAudioVAEKVState] = []
+                for inputs, state in zip(prepared_inputs, states):
+                    graph_inputs.append(cast(torch.Tensor, inputs))
+                    fixed_states.append(cast(MingAudioVAEKVState, state.fixed_kv_state))
+                result = graph_runner.replay_streaming(
+                    graph_inputs,
+                    fixed_states,
                 )
-                wav = wav[0, 0].detach()
-                if wav.numel() == 0:
+                hidden_states = [
+                    value.unsqueeze(0) for value in result.hidden_states.unbind(dim=0)
+                ]
+                next_fixed_states = list(result.states)
+            else:
+                if len(states) != 1:
+                    raise RuntimeError(
+                        "Ming-Omni-TTS eager AudioVAE phase requires one request"
+                    )
+                inputs = prepared_inputs[0]
+                if inputs is None:
+                    hidden_states = [None]
+                elif states[0].fixed_kv_state is not None:
+                    graph_runner = cast(MingAudioVAEGraphRunner, self._graph_runner)
+                    hidden_states_value, next_fixed_state = (
+                        graph_runner.forward_streaming_eager(
+                            inputs,
+                            states[0].fixed_kv_state,
+                        )
+                    )
+                    hidden_states = [hidden_states_value]
+                    next_fixed_states[0] = next_fixed_state
+                else:
+                    hidden_states_value, next_dynamic_cache = (
+                        decoder.decode_hidden_states(
+                            inputs,
+                            past_key_values=states[0].dynamic_cache,
+                            use_cache=True,
+                        )
+                    )
+                    hidden_states = [hidden_states_value]
+                    next_dynamic_caches[0] = next_dynamic_cache
+                    if self._graph_runner is not None and not last_chunks[0]:
+                        fixed_state = self._graph_runner.promote_dynamic_cache(
+                            next_dynamic_cache
+                        )
+                        if fixed_state is not None:
+                            next_dynamic_caches[0] = None
+                            next_fixed_states[0] = fixed_state
+
+            waveforms = []
+            next_stream_states = []
+            for row, hidden_states_value in enumerate(hidden_states):
+                _, audio_buffer, window_buffer = states[row].stream_state
+                if hidden_states_value is None:
+                    waveform = torch.empty(
+                        (0,),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                else:
+                    waveform, audio_buffer, window_buffer = decoder.synthesize_waveform(
+                        hidden_states_value,
+                        streaming=True,
+                        audio_buffer=audio_buffer,
+                        window_buffer=window_buffer,
+                        is_last=last_chunks[row],
+                    )
+                    waveform = waveform[0, 0].detach()
+                if last_chunks[row] and waveform.numel() == 0:
                     raise RuntimeError(
                         "Ming-Omni-TTS AudioVAE terminal chunk produced no audio"
                     )
-                return wav
-
-            waveform_chunks = []
-            for step, last_chunk in enumerate(last_chunks):
-                chunk = latents[step : step + 1]
-                wav, stream_state, past_key_values = self.audio_vae.decode(
-                    chunk,
-                    past_key_values=state.past_key_values,
-                    use_cache=True,
-                    stream_state=state.stream_state,
-                    last_chunk=last_chunk,
-                )
-                state.stream_state = stream_state
-                state.past_key_values = past_key_values
-                wav = wav[0, 0].detach()
-                if last_chunk and wav.numel() == 0:
-                    raise RuntimeError(
-                        "Ming-Omni-TTS AudioVAE terminal chunk produced no audio"
+                waveforms.append(waveform)
+                next_stream_states.append(
+                    (
+                        next_upsample_states[row],
+                        audio_buffer,
+                        window_buffer,
                     )
-                waveform_chunks.append(wav)
+                )
 
-        return torch.cat(waveform_chunks, dim=0)
+        for row, state in enumerate(states):
+            state.dynamic_cache = next_dynamic_caches[row]
+            state.fixed_kv_state = next_fixed_states[row]
+            state.stream_state = next_stream_states[row]
+        return waveforms
+
+    @torch.inference_mode()
+    def decode_nonstreaming_batch(
+        self,
+        latent_batches: list[torch.Tensor],
+        last_chunk_batches: list[list[bool]],
+    ) -> list[torch.Tensor]:
+        if len(latent_batches) != len(last_chunk_batches):
+            raise ValueError(
+                "Ming-Omni-TTS AudioVAE batch requires one terminal-flag list "
+                "per latent sequence"
+            )
+        if not latent_batches:
+            return []
+
+        waveforms: dict[int, torch.Tensor] = {}
+        sequences: dict[int, torch.Tensor] = {}
+        for request_index, (latents, last_chunks) in enumerate(
+            zip(latent_batches, last_chunk_batches)
+        ):
+            chunk_count = int(latents.shape[0])
+            if len(last_chunks) != chunk_count:
+                raise ValueError(
+                    "Ming-Omni-TTS AudioVAE decode requires one last_chunk flag "
+                    f"per latent chunk; got {len(last_chunks)} flags for "
+                    f"{chunk_count} chunks"
+                )
+            if chunk_count == 0:
+                waveforms[request_index] = latents.new_empty((0,), dtype=torch.float32)
+                continue
+            if not last_chunks[-1] or any(last_chunks[:-1]):
+                raise ValueError(
+                    "Ming-Omni-TTS full AudioVAE decode requires exactly one "
+                    "terminal flag on the final latent chunk"
+                )
+            latents = latents.to(device=self.device, dtype=self.dtype)
+            sequences[request_index] = latents.reshape(1, -1, latents.shape[-1])
+
+        if not sequences:
+            return [waveforms[index] for index in range(len(latent_batches))]
+
+        context = (
+            torch.autocast(device_type="cuda", dtype=self.dtype)
+            if self.device.type == "cuda"
+            and self.dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with context:
+            if self._graph_runner is None:
+                for request_index, sequence in sequences.items():
+                    waveform, _, _ = self.audio_vae.decode(
+                        sequence,
+                        past_key_values=None,
+                        use_cache=False,
+                        stream_state=(None, None, None),
+                        last_chunk=True,
+                    )
+                    waveform = waveform[0, 0].detach()
+                    if waveform.numel() == 0:
+                        raise RuntimeError(
+                            "Ming-Omni-TTS AudioVAE terminal chunk produced no audio"
+                        )
+                    waveforms[request_index] = waveform
+            else:
+                groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
+                for request_index, sequence in sequences.items():
+                    inputs, _ = self.audio_vae.decoder.prepare_inputs(
+                        sequence,
+                        streaming=False,
+                        upsample_state=None,
+                        is_last=True,
+                    )
+                    token_size = self._graph_runner.select_token_size(
+                        int(inputs.shape[1])
+                    )
+                    groups.setdefault(token_size, []).append((request_index, inputs))
+
+                for token_size in sorted(groups):
+                    group = groups[token_size]
+                    result = self._graph_runner.replay(
+                        [inputs for _, inputs in group],
+                        token_size=token_size,
+                    )
+                    for row, (request_index, _) in enumerate(group):
+                        true_length = result.true_lengths[row]
+                        hidden_states = result.hidden_states[
+                            row : row + 1, :true_length
+                        ]
+                        waveform, _, _ = self.audio_vae.decoder.synthesize_waveform(
+                            hidden_states,
+                            streaming=False,
+                            audio_buffer=None,
+                            window_buffer=None,
+                            is_last=True,
+                        )
+                        waveform = waveform[0, 0].detach()
+                        if waveform.numel() == 0:
+                            raise RuntimeError(
+                                "Ming-Omni-TTS AudioVAE terminal chunk produced "
+                                "no audio"
+                            )
+                        waveforms[request_index] = waveform
+
+        return [waveforms[index] for index in range(len(latent_batches))]
 
 
 @dataclass
@@ -156,8 +420,12 @@ class _MingTTSStreamState:
     emitted_samples: int = 0
 
 
-class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState, None]):
+class MingTTSStreamingVocoderScheduler(
+    StreamingVocoderBase[_MingTTSStreamState, _MingAudioVAEStepPhase]
+):
     """Decode Ming acoustic latents with request-local AudioVAE state."""
+
+    _stream_chunk_batch_distinct_requests = True
 
     def __init__(
         self,
@@ -170,6 +438,15 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         self._decoder = decoder
         self._patch_size = int(patch_size)
         self._latent_dim = int(latent_dim)
+        self._can_batch_stream_chunks = decoder.cuda_graph_enabled
+        self._stream_chunk_batch_max = decoder.max_graph_batch_size
+        batch_compute_fn = None
+        if decoder.cuda_graph_enabled:
+            batch_compute_fn = partial(
+                decode_ming_tts_audio_payload_batch,
+                decoder=decoder,
+                keep_latents=bool(keep_latents),
+            )
         super().__init__(
             partial(
                 decode_ming_tts_audio_payload,
@@ -178,23 +455,31 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
             ),
             sample_rate=decoder.sample_rate,
             stream_source_hint="Ming-Omni-TTS",
+            batch_compute_fn=batch_compute_fn,
+            max_batch_size=decoder.max_graph_batch_size,
         )
 
     def create_stream_state(self, request_id: str) -> _MingTTSStreamState:
         del request_id
         return _MingTTSStreamState()
 
-    def on_stream_chunk(
+    def on_serving_stop(self) -> None:
+        self._decoder.log_cuda_graph_stats()
+
+    def _ingest_stream_item(
         self,
         request_id: str,
         item: StreamItem,
-    ) -> list[OutgoingMessage]:
+    ) -> _MingTTSStreamState | None:
         state = self._get_or_create_stream_state(request_id)
         if state is None:
-            return []
+            return None
         metadata = item.metadata
         if not isinstance(metadata, dict):
-            return super().on_stream_chunk(request_id, item)
+            raise TypeError(
+                f"Ming-Omni-TTS stream chunk for {request_id!r} must include "
+                "metadata"
+            )
         if item.chunk_id != state.expected_chunk_id:
             raise ValueError(
                 f"Ming-Omni-TTS stream chunk for {request_id!r} has "
@@ -212,9 +497,9 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
                 "boolean metadata['is_last']"
             )
         state.pending_is_last = is_last
-        messages = super().on_stream_chunk(request_id, item)
+        super()._ingest_stream_item(request_id, item)
         state.expected_chunk_id += 1
-        return messages
+        return state
 
     def validate_chunk(
         self,
@@ -246,7 +531,69 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         codes: torch.Tensor,
     ) -> None:
         del request_id
+        if state.pending_patch is not None:
+            raise RuntimeError(
+                "Ming-Omni-TTS stream received a latent patch before the "
+                "previous patch was decoded"
+            )
         state.pending_patch = codes
+
+    def select_step_participants(self) -> list[tuple[str, _MingTTSStreamState]]:
+        participants = [
+            (request_id, state)
+            for request_id, state in self._stream_state_items()
+            if state.pending_patch is not None
+        ]
+        for participant in participants:
+            _, state = participant
+            phase = self._decoder.streaming_phase(
+                state.decoder_state,
+                is_last=state.pending_is_last,
+            )
+            if phase is _MingAudioVAEStepPhase.EAGER:
+                return [participant]
+        return participants[: self._decoder.max_graph_batch_size]
+
+    def build_step_plan(
+        self,
+        participants: list[tuple[str, _MingTTSStreamState]],
+    ) -> _MingAudioVAEStepPhase:
+        _, state = participants[0]
+        return self._decoder.streaming_phase(
+            state.decoder_state,
+            is_last=state.pending_is_last,
+        )
+
+    def run_step(
+        self,
+        participants: list[tuple[str, _MingTTSStreamState]],
+        plan: _MingAudioVAEStepPhase,
+    ) -> dict[str, torch.Tensor]:
+        latent_patches = [
+            cast(torch.Tensor, state.pending_patch) for _, state in participants
+        ]
+        last_chunks = [state.pending_is_last for _, state in participants]
+
+        waveforms = self._decoder.decode_streaming_step(
+            latent_patches,
+            last_chunks,
+            [state.decoder_state for _, state in participants],
+            phase=plan,
+        )
+        decoded = {}
+        for (request_id, state), waveform, is_last in zip(
+            participants,
+            waveforms,
+            last_chunks,
+        ):
+            state.pending_patch = None
+            state.pending_is_last = False
+            if is_last:
+                state.terminal_patch_seen = True
+            if waveform.numel() > 0:
+                state.emitted_samples += int(waveform.numel())
+                decoded[request_id] = waveform
+        return decoded
 
     def decode_delta(
         self,
@@ -255,6 +602,10 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
         *,
         is_final: bool,
     ) -> torch.Tensor | None:
+        if self._can_batch_stream_chunks and not is_final:
+            raise RuntimeError(
+                "Ming-Omni-TTS coalesced streaming decode must use run_step"
+            )
         if is_final:
             if not state.terminal_patch_seen:
                 raise RuntimeError(
@@ -264,6 +615,8 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_MingTTSStreamState,
             return None
 
         patch = state.pending_patch
+        if patch is None:
+            return None
         is_last = state.pending_is_last
         waveform = self._decoder.decode_chunks(
             patch.unsqueeze(0),
@@ -308,13 +661,54 @@ def decode_ming_tts_audio_payload(
     """Decode generated acoustic latents into the terminal waveform payload."""
 
     state = load_ming_tts_state(payload)
-    latents = state.generated_latents
-    if latents is not None:
-        latents = latents.to(device=decoder.device, dtype=decoder.dtype)
     waveform = decoder.decode_chunks(
-        latents,
+        state.generated_latents,
         state.generated_last_chunk,
     )
+    return _store_decoded_waveform(
+        payload,
+        state,
+        waveform,
+        decoder=decoder,
+        keep_latents=keep_latents,
+    )
+
+
+def decode_ming_tts_audio_payload_batch(
+    payloads: list[StagePayload],
+    decoder: MingAudioDecoder,
+    *,
+    keep_latents: bool = False,
+) -> list[StagePayload]:
+    """Decode a non-streaming scheduler wave without changing payload order."""
+
+    states = [load_ming_tts_state(payload) for payload in payloads]
+    waveforms = decoder.decode_nonstreaming_batch(
+        [state.generated_latents for state in states],
+        [state.generated_last_chunk for state in states],
+    )
+    results = []
+    for payload, state, waveform in zip(payloads, states, waveforms):
+        results.append(
+            _store_decoded_waveform(
+                payload,
+                state,
+                waveform,
+                decoder=decoder,
+                keep_latents=keep_latents,
+            )
+        )
+    return results
+
+
+def _store_decoded_waveform(
+    payload: StagePayload,
+    state: MingTTSState,
+    waveform: torch.Tensor,
+    *,
+    decoder: MingAudioDecoder,
+    keep_latents: bool,
+) -> StagePayload:
     state.sample_rate = int(decoder.sample_rate)
     state.duration_s = float(waveform.numel() / int(decoder.sample_rate))
     if not keep_latents:
@@ -339,4 +733,5 @@ __all__ = [
     "MingAudioDecoder",
     "MingTTSStreamingVocoderScheduler",
     "decode_ming_tts_audio_payload",
+    "decode_ming_tts_audio_payload_batch",
 ]
