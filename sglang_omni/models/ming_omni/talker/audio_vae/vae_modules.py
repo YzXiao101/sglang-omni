@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen2Config, Qwen2Model
+from transformers.cache_utils import Cache
 
 from .istft import ISTFTHead
 
@@ -151,85 +152,124 @@ class Decoder(nn.Module):
         if self.patch_size != -1:
             self.upsampling = StreamingLinearUpsample(scale_factor=patch_size)
 
+    def prepare_inputs(
+        self,
+        latent,
+        *,
+        streaming,
+        upsample_state,
+        is_last,
+    ):
+        inputs = self.fc1(latent)
+        if self.patch_size == -1:
+            return inputs, upsample_state
+        if streaming:
+            return self.upsampling(
+                inputs,
+                state=upsample_state,
+                is_last=is_last,
+            )
+        inputs = self.upsampling.upsampler(inputs.transpose(1, 2))
+        inputs = inputs.transpose(1, 2)
+        return inputs, upsample_state
+
+    def decode_hidden_states(
+        self,
+        inputs,
+        *,
+        past_key_values: Cache | None,
+        use_cache: bool,
+    ):
+        hidden_state_parts = []
+        sliding_window = getattr(self.decoder.config, "sliding_window", None)
+
+        if use_cache and sliding_window is not None:
+            target_len = sliding_window - 1
+            past_len = (
+                0 if past_key_values is None else past_key_values.get_seq_length()
+            )
+
+            current_len = inputs.shape[1]
+            crosses_boundary = (
+                past_len < target_len and past_len + current_len >= sliding_window
+            )
+            if crosses_boundary:
+                fill_len = target_len - past_len
+                outputs = self.decoder(
+                    inputs_embeds=inputs[:, :fill_len, :],
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
+                hidden_state_parts.append(outputs.last_hidden_state)
+                past_key_values = outputs.past_key_values
+                inputs = inputs[:, fill_len:, :]
+
+        outputs = self.decoder(
+            inputs_embeds=inputs,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        hidden_state_parts.append(outputs.last_hidden_state)
+        past_key_values = outputs.past_key_values
+
+        if len(hidden_state_parts) == 1:
+            return hidden_state_parts[0], past_key_values
+        return torch.cat(hidden_state_parts, dim=1), past_key_values
+
+    def synthesize_waveform(
+        self,
+        hidden_states,
+        *,
+        streaming,
+        audio_buffer,
+        window_buffer,
+        is_last,
+    ):
+        waveform, _, audio_buffer, window_buffer = self.head(
+            hidden_states,
+            streaming=streaming,
+            audio_buffer=audio_buffer,
+            window_buffer=window_buffer,
+            last_chunk=is_last,
+        )
+        return waveform, audio_buffer, window_buffer
+
     def low_level_reconstruct(
         self,
         x,
-        past_key_values=None,
+        past_key_values: Cache | None = None,
         use_cache=False,
         stream_state=None,
         last_chunk=False,
     ):
         upsample_state, audio_buffer, window_buffer = stream_state
-        bsz, device, dtype = x.size(0), x.device, x.dtype
-        x = self.fc1(x)
-        if self.patch_size != -1:
-            if use_cache:
-                # streaming
-                x, upsample_state = self.upsampling(
-                    x, state=upsample_state, is_last=last_chunk
-                )
-                if x is None:
-                    stream_state = (upsample_state, audio_buffer, window_buffer)
-                    return (
-                        torch.empty(bsz, 1, 0, device=device, dtype=dtype),
-                        stream_state,
-                        past_key_values,
-                    )
-            else:
-                x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
-
-        hidden_states_list = []
-
-        if (
-            use_cache
-            and getattr(self.decoder.config, "sliding_window", None) is not None
-        ):
-            sw_size = self.decoder.config.sliding_window
-            target_len = sw_size - 1
-            if past_key_values is None:
-                past_len = 0
-            elif hasattr(past_key_values, "get_seq_length"):
-                past_len = past_key_values.get_seq_length()
-            elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
-                past_len = past_key_values[0][0].shape[-2]
-            else:
-                past_len = 0
-
-            curr_len = x.shape[1]
-
-            if past_len < target_len and (past_len + curr_len) >= sw_size:
-                fill_len = target_len - past_len
-                x_fill = x[:, :fill_len, :]
-                outputs = self.decoder(
-                    inputs_embeds=x_fill,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                )
-
-                hidden_states_list.append(outputs.last_hidden_state)
-                past_key_values = outputs.past_key_values
-
-                x = x[:, fill_len:, :]
-
-        outputs = self.decoder(
-            inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache
+        batch_size, device, dtype = x.size(0), x.device, x.dtype
+        inputs, upsample_state = self.prepare_inputs(
+            x,
+            streaming=use_cache,
+            upsample_state=upsample_state,
+            is_last=last_chunk,
         )
+        if inputs is None:
+            stream_state = (upsample_state, audio_buffer, window_buffer)
+            return (
+                torch.empty(batch_size, 1, 0, device=device, dtype=dtype),
+                stream_state,
+                past_key_values,
+            )
 
-        hidden_states_list.append(outputs.last_hidden_state)
-        past_key_values = outputs.past_key_values
-
-        if len(hidden_states_list) > 1:
-            full_hidden_state = torch.cat(hidden_states_list, dim=1)
-        else:
-            full_hidden_state = hidden_states_list[0]
-
-        x_out, _, audio_buffer, window_buffer = self.head(
-            full_hidden_state,
+        hidden_states, past_key_values = self.decode_hidden_states(
+            inputs,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        waveform, audio_buffer, window_buffer = self.synthesize_waveform(
+            hidden_states,
             streaming=use_cache,
             audio_buffer=audio_buffer,
             window_buffer=window_buffer,
-            last_chunk=last_chunk,
+            is_last=last_chunk,
         )
 
         stream_state = (upsample_state, audio_buffer, window_buffer)
-        return x_out, stream_state, past_key_values
+        return waveform, stream_state, past_key_values
