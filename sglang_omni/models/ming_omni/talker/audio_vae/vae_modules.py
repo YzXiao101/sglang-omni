@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -152,14 +154,14 @@ class Decoder(nn.Module):
         if self.patch_size != -1:
             self.upsampling = StreamingLinearUpsample(scale_factor=patch_size)
 
-    def prepare_inputs(
+    def project_and_upsample_latents(
         self,
-        latent,
+        latent: torch.Tensor,
         *,
-        streaming,
-        upsample_state,
-        is_last,
-    ):
+        streaming: bool,
+        upsample_state: dict[str, Any] | None,
+        is_last: bool,
+    ) -> tuple[torch.Tensor | None, dict[str, Any] | None]:
         inputs = self.fc1(latent)
         if self.patch_size == -1:
             return inputs, upsample_state
@@ -173,13 +175,13 @@ class Decoder(nn.Module):
         inputs = inputs.transpose(1, 2)
         return inputs, upsample_state
 
-    def decode_hidden_states(
+    def decode_qwen_hidden_states(
         self,
-        inputs,
+        inputs: torch.Tensor,
         *,
         past_key_values: Cache | None,
         use_cache: bool,
-    ):
+    ) -> tuple[torch.Tensor, Cache | None]:
         hidden_state_parts = []
         sliding_window = getattr(self.decoder.config, "sliding_window", None)
 
@@ -218,13 +220,13 @@ class Decoder(nn.Module):
 
     def synthesize_waveform(
         self,
-        hidden_states,
+        hidden_states: torch.Tensor,
         *,
-        streaming,
-        audio_buffer,
-        window_buffer,
-        is_last,
-    ):
+        streaming: bool,
+        audio_buffer: torch.Tensor | None,
+        window_buffer: torch.Tensor | None,
+        is_last: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         waveform, _, audio_buffer, window_buffer = self.head(
             hidden_states,
             streaming=streaming,
@@ -244,7 +246,7 @@ class Decoder(nn.Module):
     ):
         upsample_state, audio_buffer, window_buffer = stream_state
         batch_size, device, dtype = x.size(0), x.device, x.dtype
-        inputs, upsample_state = self.prepare_inputs(
+        inputs, upsample_state = self.project_and_upsample_latents(
             x,
             streaming=use_cache,
             upsample_state=upsample_state,
@@ -258,7 +260,7 @@ class Decoder(nn.Module):
                 past_key_values,
             )
 
-        hidden_states, past_key_values = self.decode_hidden_states(
+        hidden_states, past_key_values = self.decode_qwen_hidden_states(
             inputs,
             past_key_values=past_key_values,
             use_cache=use_cache,

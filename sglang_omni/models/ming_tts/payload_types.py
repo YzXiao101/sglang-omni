@@ -52,7 +52,6 @@ class MingTTSState(DeclarativeStateBase):
 
     # -- From TTS engine ---------------------------------------------------
     generated_latents: Any | None = wire(None, codec="typed_tensor")
-    generated_last_chunk: list[bool] | None = wire(None, codec="list")
     stop_step: int | None = wire(None, codec="opt_int")
     finish_reason: str | None = None
 

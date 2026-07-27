@@ -201,8 +201,8 @@ def create_audio_decode_executor(
     audio_vae_steady_chunk_patches: int = 2,
     audio_vae_cuda_graph: dict[str, Any] | None = None,
 ) -> Any:
-    from sglang_omni.models.ming_tts.audio_decode import (
-        MingAudioDecoder,
+    from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
+    from sglang_omni.models.ming_tts.streaming_vocoder import (
         MingTTSStreamingVocoderScheduler,
     )
 
