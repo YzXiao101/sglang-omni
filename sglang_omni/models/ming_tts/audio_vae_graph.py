@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
@@ -17,16 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _MingAudioVAEGraphKey:
-    mode: str
-    phase: str
+class _GraphKey:
     batch_size: int
     token_size: int
-    dtype: torch.dtype
 
 
 @dataclass
-class _MingAudioVAECapturedGraph:
+class _CapturedGraph:
     graph: torch.cuda.CUDAGraph
     inputs: torch.Tensor
     attention_mask: torch.Tensor
@@ -35,7 +32,7 @@ class _MingAudioVAECapturedGraph:
 
 
 @dataclass
-class _MingAudioVAEStreamingCapturedGraph:
+class _StreamingCapturedGraph:
     graph: torch.cuda.CUDAGraph
     inputs: torch.Tensor
     attention_mask: dict[str, torch.Tensor]
@@ -46,27 +43,25 @@ class _MingAudioVAEStreamingCapturedGraph:
 
 
 @dataclass(frozen=True)
-class MingAudioVAEKVState:
+class MingAudioVAEFixedKVState:
     keys: tuple[torch.Tensor, ...]
     values: tuple[torch.Tensor, ...]
     absolute_position: int
 
 
 @dataclass(frozen=True)
-class _MingAudioVAEReplayResult:
-    key: _MingAudioVAEGraphKey
+class _ReplayResult:
     hidden_states: torch.Tensor
     true_lengths: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class _MingAudioVAEStreamingReplayResult:
-    key: _MingAudioVAEGraphKey
+class _StreamingReplayResult:
     hidden_states: torch.Tensor
-    states: tuple[MingAudioVAEKVState, ...]
+    states: tuple[MingAudioVAEFixedKVState, ...]
 
 
-class _MingAudioVAEFixedKVLayer(CacheLayerMixin):
+class _FixedKVLayer(CacheLayerMixin):
     is_sliding = True
 
     def __init__(
@@ -175,13 +170,8 @@ class MingAudioVAEGraphRunner:
                 f"layer to use sliding attention; got {layer_types!r}"
             )
 
-        self._nonstreaming_graphs: dict[
-            _MingAudioVAEGraphKey, _MingAudioVAECapturedGraph
-        ] = {}
-        self._streaming_graphs: dict[
-            _MingAudioVAEGraphKey, _MingAudioVAEStreamingCapturedGraph
-        ] = {}
-        self._observed_keys: set[tuple[int, int, _MingAudioVAEGraphKey]] = set()
+        self._nonstreaming_graphs: dict[_GraphKey, _CapturedGraph] = {}
+        self._streaming_graphs: dict[_GraphKey, _StreamingCapturedGraph] = {}
         self._replay_count = 0
         self._streaming_replay_count = 0
         self._active_rows = 0
@@ -189,39 +179,24 @@ class MingAudioVAEGraphRunner:
         self._true_tokens = 0
         self._captured_tokens = 0
         self._handoff_count = 0
-        self._streaming_gather_bytes = 0
-        self._streaming_scatter_bytes = 0
 
     @property
     def max_batch_size(self) -> int:
         return self._batch_sizes[-1]
 
-    @property
-    def token_sizes(self) -> tuple[int, ...]:
-        return self._token_sizes
-
     def capture(self) -> None:
-        if self._nonstreaming_graphs or self._streaming_graphs:
-            raise RuntimeError("Ming-Omni-TTS AudioVAE graphs are already captured")
-
         nonstreaming_keys = [
-            _MingAudioVAEGraphKey(
-                mode="nonstreaming",
-                phase="full",
+            _GraphKey(
                 batch_size=batch_size,
                 token_size=token_size,
-                dtype=self._dtype,
             )
             for batch_size in self._batch_sizes
             for token_size in self._token_sizes
         ]
         streaming_keys = [
-            _MingAudioVAEGraphKey(
-                mode="streaming",
-                phase="steady",
+            _GraphKey(
                 batch_size=batch_size,
                 token_size=self._streaming_token_size,
-                dtype=self._dtype,
             )
             for batch_size in self._batch_sizes
         ]
@@ -260,30 +235,20 @@ class MingAudioVAEGraphRunner:
         inputs: list[torch.Tensor],
         *,
         token_size: int,
-    ) -> _MingAudioVAEReplayResult:
-        if not inputs:
-            raise ValueError("Ming-Omni-TTS AudioVAE graph replay requires input rows")
+    ) -> _ReplayResult:
         true_batch_size = len(inputs)
         batch_size = self._select_batch_size(true_batch_size)
-        key = _MingAudioVAEGraphKey(
-            mode="nonstreaming",
-            phase="full",
+        key = _GraphKey(
             batch_size=batch_size,
             token_size=token_size,
-            dtype=self._dtype,
         )
-        captured = self._nonstreaming_graphs.get(key)
-        if captured is None:
-            raise RuntimeError(
-                f"Ming-Omni-TTS AudioVAE graph key was not captured: {key}"
-            )
+        captured = self._nonstreaming_graphs[key]
 
         true_lengths = tuple(int(value.shape[1]) for value in inputs)
         captured.inputs.zero_()
         captured.attention_mask.zero_()
         for row, value in enumerate(inputs):
             true_length = true_lengths[row]
-            self._check_input(value)
             if true_length > token_size:
                 raise ValueError(
                     "Ming-Omni-TTS AudioVAE graph input exceeds its selected "
@@ -298,13 +263,12 @@ class MingAudioVAEGraphRunner:
         with torch.cuda.device(self._device):
             captured.graph.replay()
         self._record_replay(key, true_batch_size, true_lengths)
-        return _MingAudioVAEReplayResult(
-            key=key,
+        return _ReplayResult(
             hidden_states=captured.hidden_states,
             true_lengths=true_lengths,
         )
 
-    def promote_dynamic_cache(self, cache: Cache) -> MingAudioVAEKVState | None:
+    def promote_dynamic_cache(self, cache: Cache) -> MingAudioVAEFixedKVState | None:
         absolute_position = int(cache.get_seq_length())
         if absolute_position < self._sliding_window:
             return None
@@ -330,7 +294,7 @@ class MingAudioVAEGraphRunner:
                 )
             keys.append(layer.keys.detach())
             values.append(layer.values.detach())
-        state = MingAudioVAEKVState(
+        state = MingAudioVAEFixedKVState(
             keys=tuple(keys),
             values=tuple(values),
             absolute_position=absolute_position,
@@ -341,9 +305,8 @@ class MingAudioVAEGraphRunner:
     def forward_streaming_eager(
         self,
         inputs: torch.Tensor,
-        state: MingAudioVAEKVState,
-    ) -> tuple[torch.Tensor, MingAudioVAEKVState]:
-        self._check_input(inputs)
+        state: MingAudioVAEFixedKVState,
+    ) -> tuple[torch.Tensor, MingAudioVAEFixedKVState]:
         cache = self._fixed_cache_from_state(state)
         token_size = int(inputs.shape[1])
         position_ids = torch.arange(
@@ -369,27 +332,15 @@ class MingAudioVAEGraphRunner:
     def replay_streaming(
         self,
         inputs: list[torch.Tensor],
-        states: list[MingAudioVAEKVState],
-    ) -> _MingAudioVAEStreamingReplayResult:
-        if not inputs or len(inputs) != len(states):
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE streaming replay requires aligned "
-                "input and fixed-KV rows"
-            )
+        states: list[MingAudioVAEFixedKVState],
+    ) -> _StreamingReplayResult:
         true_batch_size = len(inputs)
         batch_size = self._select_batch_size(true_batch_size)
-        key = _MingAudioVAEGraphKey(
-            mode="streaming",
-            phase="steady",
+        key = _GraphKey(
             batch_size=batch_size,
             token_size=self._streaming_token_size,
-            dtype=self._dtype,
         )
-        captured = self._streaming_graphs.get(key)
-        if captured is None:
-            raise RuntimeError(
-                f"Ming-Omni-TTS AudioVAE streaming graph key was not captured: {key}"
-            )
+        captured = self._streaming_graphs[key]
 
         captured.inputs.zero_()
         captured.position_ids.zero_()
@@ -398,7 +349,6 @@ class MingAudioVAEGraphRunner:
             layer.values.zero_()
 
         for row, (value, state) in enumerate(zip(inputs, states)):
-            self._check_input(value)
             if int(value.shape[1]) != self._streaming_token_size:
                 raise ValueError(
                     "Ming-Omni-TTS AudioVAE steady streaming graph requires "
@@ -414,11 +364,6 @@ class MingAudioVAEGraphRunner:
                 layer.keys[row].copy_(state.keys[layer_index][0])
                 layer.values[row].copy_(state.values[layer_index][0])
 
-        state_bytes = sum(
-            tensor.numel() * tensor.element_size()
-            for state in states
-            for tensor in (*state.keys, *state.values)
-        )
         with torch.cuda.device(self._device):
             captured.graph.replay()
         next_states = tuple(
@@ -432,15 +377,12 @@ class MingAudioVAEGraphRunner:
             for row in range(true_batch_size)
         )
         self._streaming_replay_count += 1
-        self._streaming_gather_bytes += state_bytes
-        self._streaming_scatter_bytes += state_bytes
         self._record_replay(
             key,
             true_batch_size,
             (self._streaming_token_size,) * true_batch_size,
         )
-        return _MingAudioVAEStreamingReplayResult(
-            key=key,
+        return _StreamingReplayResult(
             hidden_states=captured.hidden_states[:true_batch_size],
             states=next_states,
         )
@@ -457,24 +399,18 @@ class MingAudioVAEGraphRunner:
         logger.info(
             "Ming-Omni-TTS AudioVAE graph summary: replays=%d "
             "streaming_replays=%d active_row_ratio=%.4f true_token_ratio=%.4f "
-            "handoffs=%d gather_bytes=%d scatter_bytes=%d observed_keys=%d",
+            "handoffs=%d",
             self._replay_count,
             self._streaming_replay_count,
             active_row_ratio,
             true_token_ratio,
             self._handoff_count,
-            self._streaming_gather_bytes,
-            self._streaming_scatter_bytes,
-            len(self._observed_keys),
         )
 
     def _capture_nonstreaming_graph(
         self,
-        key: _MingAudioVAEGraphKey,
-    ) -> _MingAudioVAECapturedGraph:
-        allocated_before, reserved_before, free_before, started_at = (
-            self._capture_metrics()
-        )
+        key: _GraphKey,
+    ) -> _CapturedGraph:
         inputs = torch.zeros(
             (key.batch_size, key.token_size, self._hidden_size),
             device=self._device,
@@ -513,14 +449,7 @@ class MingAudioVAEGraphRunner:
                 position_ids,
             )
         torch.cuda.synchronize(self._device)
-        self._log_capture(
-            key,
-            allocated_before,
-            reserved_before,
-            free_before,
-            started_at,
-        )
-        return _MingAudioVAECapturedGraph(
+        return _CapturedGraph(
             graph=graph,
             inputs=inputs,
             attention_mask=attention_mask,
@@ -530,11 +459,8 @@ class MingAudioVAEGraphRunner:
 
     def _capture_streaming_graph(
         self,
-        key: _MingAudioVAEGraphKey,
-    ) -> _MingAudioVAEStreamingCapturedGraph:
-        allocated_before, reserved_before, free_before, started_at = (
-            self._capture_metrics()
-        )
+        key: _GraphKey,
+    ) -> _StreamingCapturedGraph:
         inputs = torch.zeros(
             (key.batch_size, key.token_size, self._hidden_size),
             device=self._device,
@@ -581,14 +507,7 @@ class MingAudioVAEGraphRunner:
                 cache,
             )
         torch.cuda.synchronize(self._device)
-        self._log_capture(
-            key,
-            allocated_before,
-            reserved_before,
-            free_before,
-            started_at,
-        )
-        return _MingAudioVAEStreamingCapturedGraph(
+        return _StreamingCapturedGraph(
             graph=graph,
             inputs=inputs,
             attention_mask=attention_mask,
@@ -648,7 +567,7 @@ class MingAudioVAEGraphRunner:
         )
         return self._fixed_cache(keys, values, absolute_position=absolute_position)
 
-    def _fixed_cache_from_state(self, state: MingAudioVAEKVState) -> Cache:
+    def _fixed_cache_from_state(self, state: MingAudioVAEFixedKVState) -> Cache:
         return self._fixed_cache(
             state.keys,
             state.values,
@@ -662,13 +581,8 @@ class MingAudioVAEGraphRunner:
         *,
         absolute_position: int,
     ) -> Cache:
-        if len(keys) != self._num_layers or len(values) != self._num_layers:
-            raise RuntimeError(
-                "Ming-Omni-TTS AudioVAE fixed KV state does not match the "
-                f"Qwen2 layer count {self._num_layers}"
-            )
         layers = [
-            _MingAudioVAEFixedKVLayer(
+            _FixedKVLayer(
                 layer_keys,
                 layer_values,
                 absolute_position=absolute_position,
@@ -684,18 +598,15 @@ class MingAudioVAEGraphRunner:
         *,
         row: int,
         absolute_position: int,
-    ) -> MingAudioVAEKVState:
+    ) -> MingAudioVAEFixedKVState:
         keys = []
         values = []
         for layer in cache.layers:
-            if layer.next_keys is None or layer.next_values is None:
-                raise RuntimeError(
-                    "Ming-Omni-TTS AudioVAE fixed KV update did not produce "
-                    "the next request state"
-                )
-            keys.append(layer.next_keys[row : row + 1].detach().clone())
-            values.append(layer.next_values[row : row + 1].detach().clone())
-        return MingAudioVAEKVState(
+            next_keys = cast(torch.Tensor, layer.next_keys)
+            next_values = cast(torch.Tensor, layer.next_values)
+            keys.append(next_keys[row : row + 1].detach().clone())
+            values.append(next_values[row : row + 1].detach().clone())
+        return MingAudioVAEFixedKVState(
             keys=tuple(keys),
             values=tuple(values),
             absolute_position=absolute_position,
@@ -753,72 +664,17 @@ class MingAudioVAEGraphRunner:
             )
         return batch_size
 
-    def _check_input(self, value: torch.Tensor) -> None:
-        if (
-            value.ndim != 3
-            or value.shape[0] != 1
-            or value.shape[2] != self._hidden_size
-        ):
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph expects prepared inputs with "
-                f"shape [1, T, {self._hidden_size}], got {tuple(value.shape)}"
-            )
-
     def _record_replay(
         self,
-        key: _MingAudioVAEGraphKey,
+        key: _GraphKey,
         true_batch_size: int,
         true_lengths: tuple[int, ...],
     ) -> None:
-        observed = (true_batch_size, max(true_lengths), key)
-        if observed not in self._observed_keys:
-            logger.info(
-                "Ming-Omni-TTS AudioVAE graph selected: mode=%s phase=%s "
-                "true_B=%d true_T=%d graph_B=%d graph_T=%d",
-                key.mode,
-                key.phase,
-                true_batch_size,
-                max(true_lengths),
-                key.batch_size,
-                key.token_size,
-            )
-            self._observed_keys.add(observed)
         self._replay_count += 1
         self._active_rows += true_batch_size
         self._captured_rows += key.batch_size
         self._true_tokens += sum(true_lengths)
         self._captured_tokens += key.batch_size * key.token_size
-
-    def _capture_metrics(self) -> tuple[int, int, int, float]:
-        torch.cuda.synchronize(self._device)
-        allocated = torch.cuda.memory_allocated(self._device)
-        reserved = torch.cuda.memory_reserved(self._device)
-        free, _ = torch.cuda.mem_get_info(self._device)
-        return allocated, reserved, free, time.perf_counter()
-
-    def _log_capture(
-        self,
-        key: _MingAudioVAEGraphKey,
-        allocated_before: int,
-        reserved_before: int,
-        free_before: int,
-        started_at: float,
-    ) -> None:
-        allocated_after = torch.cuda.memory_allocated(self._device)
-        reserved_after = torch.cuda.memory_reserved(self._device)
-        free_after, _ = torch.cuda.mem_get_info(self._device)
-        logger.info(
-            "Captured Ming-Omni-TTS AudioVAE graph mode=%s phase=%s B=%d T=%d "
-            "in %.3fs; allocated_delta=%d reserved_delta=%d free_delta=%d",
-            key.mode,
-            key.phase,
-            key.batch_size,
-            key.token_size,
-            time.perf_counter() - started_at,
-            allocated_after - allocated_before,
-            reserved_after - reserved_before,
-            free_after - free_before,
-        )
 
     def _autocast_context(self):
         if self._dtype in (torch.float16, torch.bfloat16):
@@ -827,6 +683,6 @@ class MingAudioVAEGraphRunner:
 
 
 __all__ = [
+    "MingAudioVAEFixedKVState",
     "MingAudioVAEGraphRunner",
-    "MingAudioVAEKVState",
 ]
