@@ -95,6 +95,7 @@ class MingTTSPipelineConfig(PipelineConfig):
 
     model_path: str
     max_decode_steps_cap: int | None = None
+    audio_vae_steady_chunk_patches: int = 2
     audio_vae_cuda_graph: MingAudioVAECudaGraphConfig = Field(
         default_factory=MingAudioVAECudaGraphConfig
     )
@@ -138,6 +139,10 @@ class MingTTSPipelineConfig(PipelineConfig):
         super().model_post_init(__context)
         if self.max_decode_steps_cap is not None and self.max_decode_steps_cap <= 0:
             raise ValueError("Ming-Omni-TTS max_decode_steps_cap must be positive")
+        if self.audio_vae_steady_chunk_patches <= 0:
+            raise ValueError(
+                "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
+            )
         if self.audio_vae_cuda_graph.enabled and self.max_decode_steps_cap is None:
             raise ValueError(
                 "Ming-Omni-TTS AudioVAE CUDA graph requires max_decode_steps_cap"
@@ -163,6 +168,9 @@ class MingTTSPipelineConfig(PipelineConfig):
                 audio_decode,
                 {
                     "max_decode_steps_cap": self.max_decode_steps_cap,
+                    "audio_vae_steady_chunk_patches": (
+                        self.audio_vae_steady_chunk_patches
+                    ),
                     "audio_vae_cuda_graph": graph_factory_config,
                 },
             ),
