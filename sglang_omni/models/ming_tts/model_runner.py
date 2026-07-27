@@ -70,7 +70,6 @@ class _MingTTSRequestState:
     feedback_embeddings: list[torch.Tensor] = field(default_factory=list)
     latent_history: torch.Tensor | None = None
     generated_latents: list[torch.Tensor] = field(default_factory=list)
-    generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
 
 
@@ -181,7 +180,7 @@ class MingTTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
-    ) -> GenerationBatchResult | None:
+    ) -> GenerationBatchResult:
         del schedule_batch
         input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
         return self._forward_with_input_embeds(forward_batch, input_embeds)
@@ -194,7 +193,7 @@ class MingTTSModelRunner(ModelRunner):
         batch_parts = []
         dtype = self.model._decode_input_embedding.weight.dtype
         device = forward_batch.input_ids.device
-        embedding = self.model.get_input_embeddings()
+        input_embedding = self.model.get_input_embeddings()
         for sched_req in requests:
             data = sched_req.data
             request_state = self._request_states[sched_req.request_id]
@@ -203,40 +202,34 @@ class MingTTSModelRunner(ModelRunner):
             extend_len = int(req.extend_input_len)
             prompt_ids = data.input_ids
             prompt_len = int(prompt_ids.shape[0])
-            if prefix_len > prompt_len:
-                raise RuntimeError(
-                    "Ming-Omni-TTS radix prefix crossed the prompt boundary: "
-                    f"request_id={sched_req.request_id}, "
-                    f"prefix_len={prefix_len}, prompt_len={prompt_len}"
-                )
 
             extend_end = prefix_len + extend_len
-            req_parts = []
+            request_parts = []
 
             prompt_stop = min(extend_end, prompt_len)
             if prompt_stop > prefix_len:
                 if request_state.prefill_input_embeds is None:
-                    prompt_rows = embedding(
+                    prompt_rows = input_embedding(
                         prompt_ids[prefix_len:prompt_stop].to(device=device)
-                    ).to(dtype=dtype)
+                    )
                 else:
                     prompt_rows = request_state.prefill_input_embeds[
                         prefix_len:prompt_stop
-                    ].to(device=device, dtype=dtype)
-                req_parts.append(prompt_rows)
+                    ]
+                request_parts.append(prompt_rows)
 
             # note (yzxiao): Retraction may re-prefill generated audio tokens,
             # whose rows live in feedback embeddings rather than token embeds.
-            generated_count = max(extend_end - prompt_len, 0)
-            if generated_count:
+            feedback_count = max(extend_end - prompt_len, 0)
+            if feedback_count:
                 feedback_rows = [
                     feedback.to(device=device, dtype=dtype)
-                    for feedback in request_state.feedback_embeddings[:generated_count]
+                    for feedback in request_state.feedback_embeddings[:feedback_count]
                 ]
-                req_parts.append(torch.stack(feedback_rows, dim=0))
+                request_parts.append(torch.stack(feedback_rows, dim=0))
 
-            req_embeds = torch.cat(req_parts, dim=0)
-            batch_parts.append(req_embeds)
+            request_embeds = torch.cat(request_parts, dim=0)
+            batch_parts.append(request_embeds)
         return torch.cat(batch_parts, dim=0)
 
     def _forward_with_input_embeds(
@@ -244,11 +237,6 @@ class MingTTSModelRunner(ModelRunner):
         forward_batch: Any,
         input_embeds: torch.Tensor,
     ) -> GenerationBatchResult:
-        input_embeds = input_embeds.to(
-            device=forward_batch.input_ids.device,
-            dtype=self.model._decode_input_embedding.weight.dtype,
-        )
-
         model_runner = self.tp_worker.model_runner
         model_runner.attn_backend.init_forward_metadata(forward_batch)
         positions = forward_batch.positions
@@ -442,7 +430,6 @@ class MingTTSModelRunner(ModelRunner):
                     )
                 else:
                     request_state.generated_latents.append(sampled_chunk)
-                    request_state.generated_last_chunk.append(is_last)
                 if stop:
                     request_state.stop_step = step
                     next_ids.append(int(data.audio_eos_token_id))
@@ -475,7 +462,6 @@ class MingTTSModelRunner(ModelRunner):
                     request_state.generated_latents,
                     dim=0,
                 ).to(device="cpu", dtype=torch.float32)
-                data.generated_last_chunk = list(request_state.generated_last_chunk)
 
         step_update.next_token_ids.copy_(
             torch.tensor(next_ids, dtype=torch.long, device=device)

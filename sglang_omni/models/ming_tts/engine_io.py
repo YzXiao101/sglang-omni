@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -40,13 +40,12 @@ class MingTTSSGLangRequestData(SGLangARRequestData):
     audio_eos_token_id: int = 0
     engine_start_s: float = 0.0
     generated_latents: torch.Tensor | None = None
-    generated_last_chunk: list[bool] = field(default_factory=list)
     stop_step: int | None = None
     is_streaming: bool = False
     pending_stream_patch: MingTTSLatentPatch | None = None
 
 
-def _prompt_cache_extra_key(state: MingTTSState) -> str:
+def _prompt_conditioning_fingerprint(state: MingTTSState) -> str:
     speaker = state.spk_emb
     prompt_latent = state.prompt_latent
     if speaker is None and prompt_latent is None:
@@ -108,7 +107,7 @@ def make_ming_tts_scheduler_adapters(
             sampling_params=sampling_params,
             eos_token_ids={int(tokenizer.special.end_of_audio)},
             vocab_size=vocab_size,
-            extra_key=_prompt_cache_extra_key(state),
+            extra_key=_prompt_conditioning_fingerprint(state),
         )
         req.tokenizer = None
         req._input_embeds_are_projected = requires_projected_prefill
@@ -174,11 +173,6 @@ def make_ming_tts_scheduler_adapters(
             else:
                 finish_reason = "stop"
 
-            state.generated_last_chunk = (
-                None
-                if data.is_streaming
-                else [bool(item) for item in data.generated_last_chunk]
-            )
             state.stop_step = data.stop_step
             state.finish_reason = finish_reason
             state.prompt_tokens = len(data.input_ids)
