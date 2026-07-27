@@ -198,12 +198,19 @@ def create_audio_decode_executor(
     dtype: str = "bfloat16",
     keep_latents: bool = False,
     max_decode_steps_cap: int | None = None,
+    audio_vae_steady_chunk_patches: int = 2,
     audio_vae_cuda_graph: dict[str, Any] | None = None,
 ) -> Any:
     from sglang_omni.models.ming_tts.audio_decode import (
         MingAudioDecoder,
         MingTTSStreamingVocoderScheduler,
     )
+
+    steady_chunk_patches = int(audio_vae_steady_chunk_patches)
+    if steady_chunk_patches <= 0:
+        raise ValueError(
+            "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
+        )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
     config = _load_ming_tts_config(checkpoint_dir)
@@ -214,6 +221,8 @@ def create_audio_decode_executor(
         config.audio_tokenizer_config,
         attn_implementation=MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     )
+    qwen_tokens_per_patch = int(config.audio_patch_size) * int(audio_config.patch_size)
+    steady_streaming_token_size = steady_chunk_patches * qwen_tokens_per_patch
     decoder = MingAudioDecoder.from_config(
         audio_config,
         device=device,
@@ -230,22 +239,19 @@ def create_audio_decode_executor(
             raise ValueError(
                 "Ming-Omni-TTS AudioVAE CUDA graph requires max_decode_steps_cap"
             )
-        qwen_tokens_per_step = int(config.audio_patch_size) * int(
-            audio_config.patch_size
-        )
-        max_qwen_tokens = int(max_decode_steps_cap) * qwen_tokens_per_step
+        max_qwen_tokens = int(max_decode_steps_cap) * qwen_tokens_per_patch
         token_sizes = graph_config.nonstream_token_sizes
         if token_sizes is None:
             token_sizes = []
-            token_size = qwen_tokens_per_step
+            token_size = qwen_tokens_per_patch
             while token_size < max_qwen_tokens:
                 token_sizes.append(token_size)
                 token_size *= 4
             token_sizes.append(max_qwen_tokens)
-        elif token_sizes[0] < qwen_tokens_per_step:
+        elif token_sizes[0] < qwen_tokens_per_patch:
             raise ValueError(
                 "Ming-Omni-TTS AudioVAE graph token buckets must be at least "
-                f"{qwen_tokens_per_step}; got {token_sizes!r}"
+                f"{qwen_tokens_per_patch}; got {token_sizes!r}"
             )
         if token_sizes[-1] != max_qwen_tokens:
             raise ValueError(
@@ -255,23 +261,32 @@ def create_audio_decode_executor(
 
         logger.info(
             "Ming-Omni-TTS AudioVAE CUDA graph enabled: "
-            "max_decode_steps=%d qwen_tokens_per_step=%d "
+            "max_decode_steps=%d qwen_tokens_per_patch=%d "
             "batch_sizes=%s token_sizes=%s",
             max_decode_steps_cap,
-            qwen_tokens_per_step,
+            qwen_tokens_per_patch,
             graph_config.batch_sizes,
             token_sizes,
         )
         decoder.capture_cuda_graphs(
             batch_sizes=graph_config.batch_sizes,
             token_sizes=token_sizes,
-            streaming_token_size=qwen_tokens_per_step,
+            streaming_token_size=steady_streaming_token_size,
         )
 
+    logger.info(
+        "Ming-Omni-TTS AudioVAE streaming cadence: "
+        "initial_patches=1 steady_patches=%d "
+        "qwen_tokens_per_patch=%d steady_graph_T=%d",
+        steady_chunk_patches,
+        qwen_tokens_per_patch,
+        steady_streaming_token_size,
+    )
     return MingTTSStreamingVocoderScheduler(
         decoder,
         patch_size=int(config.audio_patch_size),
         latent_dim=int(config.latent_dim),
+        steady_chunk_patches=steady_chunk_patches,
         keep_latents=keep_latents,
     )
 
