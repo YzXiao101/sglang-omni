@@ -46,8 +46,8 @@ stages:
         mem_fraction_static: 0.75
         cuda_graph_bs: [1, 2, 4, 8]
         cuda_graph_max_bs: 8
-    gpu: [0, 1]
-    tp_size: 2
+    gpu: 0
+    tp_size: 1
     stream_to: [audio_decode]
     runtime:
       resources:

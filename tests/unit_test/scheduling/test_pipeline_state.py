@@ -300,7 +300,6 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
                     [[[0.5, -1.25]], [[2.0, 0.0]]],
                     dtype=torch.float32,
                 ),
-                generated_last_chunk=[False, True],
                 stop_step=1,
                 finish_reason="stop",
                 prompt_tokens=6,
