@@ -69,3 +69,19 @@ def test_ming_tts_abort_callback_resets_runner_state() -> None:
     abort_callback("req-ming-tts")
 
     assert runner._request_states == {}
+
+
+def test_ming_tts_retraction_skips_prompt_cache_insert() -> None:
+    runner = object.__new__(MingTTSModelRunner)
+    materialized = []
+    runner._materialize_request_state = materialized.append
+    req = SimpleNamespace(
+        retracted_stain=True,
+        skip_radix_cache_insert=False,
+    )
+    sched_req = SimpleNamespace(data=SimpleNamespace(req=req))
+
+    runner.before_prefill(None, None, [sched_req])
+
+    assert req.skip_radix_cache_insert is True
+    assert materialized == [sched_req]

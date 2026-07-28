@@ -21,18 +21,14 @@ class _FakeDecoder:
     def __init__(self) -> None:
         self.calls = 0
 
-    def decode_chunks(
+    def decode_nonstreaming_batch(
         self,
-        latents: torch.Tensor,
-        last_chunks: list[bool],
-        *,
-        decode_mode: str = "chunked",
-    ) -> torch.Tensor:
-        assert decode_mode == "chunked"
-        assert latents.shape == (0, 2, 3)
-        assert last_chunks == []
+        latent_batches: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        assert len(latent_batches) == 1
+        assert latent_batches[0].shape == (0, 2, 3)
         self.calls += 1
-        return torch.empty((0,), dtype=torch.float32)
+        return [torch.empty((0,), dtype=torch.float32)]
 
 
 class _FailingAudioVAE(torch.nn.Module):
@@ -44,10 +40,13 @@ class _FailingAudioVAE(torch.nn.Module):
 def test_ming_audio_decoder_skips_audio_vae_for_empty_latents() -> None:
     decoder = MingAudioDecoder(_FailingAudioVAE(), sample_rate=44100)
 
-    wav = decoder.decode_chunks(torch.empty((0, 2, 3)), [])
+    waveforms = decoder.decode_nonstreaming_batch(
+        [torch.empty((0, 2, 3), dtype=torch.float32)]
+    )
 
-    assert wav.shape == (0,)
-    assert wav.dtype == torch.float32
+    assert len(waveforms) == 1
+    assert waveforms[0].shape == (0,)
+    assert waveforms[0].dtype == torch.float32
 
 
 def test_ming_tts_audio_decode_accepts_empty_generated_latents() -> None:
@@ -55,7 +54,6 @@ def test_ming_tts_audio_decode_accepts_empty_generated_latents() -> None:
         text="hello",
         prompt_tokens=3,
         completion_tokens=0,
-        generated_last_chunk=[],
         generated_latents=torch.empty((0, 2, 3), dtype=torch.float32),
     )
     payload = StagePayload(

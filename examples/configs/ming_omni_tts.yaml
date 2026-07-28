@@ -2,6 +2,9 @@ config_cls: MingTTSPipelineConfig
 model_path: inclusionAI/Ming-omni-tts-16.8B-A3B
 name: ming-omni-tts
 max_decode_steps_cap: 256
+audio_vae_cuda_graph:
+  enabled: true
+  batch_sizes: [1, 2, 4, 8]
 stages:
   - name: preprocessing
     process: preprocessing
@@ -33,7 +36,7 @@ stages:
       server_args_overrides:
         disable_cuda_graph: false
         disable_overlap_schedule: true
-        disable_radix_cache: false
+        disable_radix_cache: true
         enable_torch_compile: false
         max_prefill_tokens: 8192
         max_running_requests: 8
