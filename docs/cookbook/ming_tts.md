@@ -31,7 +31,7 @@ the checkpoint:
 hf download inclusionAI/Ming-omni-tts-16.8B-A3B
 ```
 
-The provided configuration is the recommended TP2 deployment and uses GPUs 0 and 1.
+The provided configuration is the recommended TP1 deployment and uses GPU 0.
 
 ## Server Configuration
 
@@ -98,7 +98,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ### Streaming
 
 Streaming responses use raw 44.1 kHz PCM and emit audio as acoustic latent patches are decoded.
-The chunk size follows the model's latent patch size and is not configurable.
+The first chunk contains one latent patch. Later chunks follow
+`audio_vae_steady_chunk_patches`, which is configured for the pipeline rather
+than per request.
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -177,34 +179,34 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 
 ## Benchmark Results
 
-### Recommended TP2
+### Recommended Single-H200 TP1
 
-The recommended TP2 configuration was evaluated on the complete
-**Seed-TTS-Eval EN and ZH splits** with **2× H100 80 GB**, concurrency 8, AR and tail CUDA
-graphs enabled, and **Qwen3-ASR-1.7B** for transcription.
+The recommended TP1 configuration was evaluated on **1× H200 141 GB** with concurrency 8,
+eight warmup requests, and the full Seed-TTS-Eval EN and ZH splits. AR, acoustic-tail, and
+AudioVAE CUDA graphs were enabled, while prompt radix caching was disabled.
 
-| Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 1.06% | 0.5052 | 2.287 | 3.489 | 16.480 |
-| text-only | ZH | 2020 | 0 | 0.72% | 0.4802 | 2.347 | 3.404 | 17.038 |
-| reference | EN | 1088 | 0 | 1.36% | 0.5707 | 2.443 | 3.268 | 14.728 |
-| reference | ZH | 2020 | 0 | 0.92% | 0.5298 | 2.970 | 2.690 | 15.399 |
+Streaming:
 
-**Median per-sample WER is 0% for every full-set slice**; corpus WER includes a small
-near-silent tail from unseeded acoustic sampling.
+| Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | First Audio Mean (s) | Throughput (qps) | Audio s/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| text-only | EN | 1088 | 0 | 0.92% | 0.3091 | 1.390 | 0.5393 | 5.747 | 27.188 |
+| text-only | ZH | 2020 | 0 | 0.73% | 0.2836 | 1.388 | 0.5188 | 5.757 | 28.895 |
+| reference | EN | 1088 | 0 | 1.21% | 0.3588 | 1.539 | 0.6620 | 5.195 | 23.448 |
+| reference | ZH | 2020 | 0 | 0.71% | 0.2869 | 1.617 | 0.6307 | 4.941 | 28.296 |
 
-### Single-GPU TP1
-
-TP1 was also verified on **1× H100 80 GB** with the first 100 samples of each slice. This
-confirms that the complete pipeline fits and runs on one GPU; **TP2** remains the recommended
-deployment.
+Non-streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 100 | 0 | 0.64% | 1.5151 | 6.467 | 1.224 | 5.540 |
-| text-only | ZH | 100 | 0 | 0.32% | 1.4429 | 6.329 | 1.251 | 5.606 |
-| reference | EN | 100 | 0 | 0.82% | 1.4584 | 5.636 | 1.406 | 5.852 |
-| reference | ZH | 100 | 0 | 0.21% | 1.4168 | 7.985 | 0.992 | 5.693 |
+| text-only | EN | 1088 | 0 | 0.91% | 0.1998 | 0.947 | 8.440 | 40.089 |
+| text-only | ZH | 2020 | 0 | 0.68% | 0.1932 | 0.969 | 8.252 | 41.403 |
+| reference | EN | 1088 | 0 | 1.09% | 0.2339 | 1.042 | 7.665 | 34.560 |
+| reference | ZH | 2020 | 0 | 0.68% | 0.1992 | 1.141 | 7.002 | 40.221 |
+
+All 12,432 requests completed successfully. Reference EN corpus WER includes a small
+near-silent tail from unseeded acoustic sampling. Streaming returned its first audio
+payload in 0.52-0.66 seconds, while non-streaming retained higher complete-response
+throughput.
 
 ## Known Limitations
 
