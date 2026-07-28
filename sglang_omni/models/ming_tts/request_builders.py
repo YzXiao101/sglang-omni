@@ -98,8 +98,8 @@ def preprocess_ming_tts_payload(
             result = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Ming-Omni-TTS {name} must be a number") from exc
-        # NaN slips through the range checks below (every comparison is
-        # False) and non-finite values reach CFM as invalid latent scales.
+        # Note (yzxiao): Range comparisons do not reject NaN, which would
+        # otherwise reach CFM as an invalid latent scale.
         if not math.isfinite(result):
             raise ValueError(f"Ming-Omni-TTS {name} must be a finite number")
         return result
@@ -209,7 +209,7 @@ def preprocess_ming_tts_payload(
     voice = tts_params.get("voice", params.get("voice"))
     if voice is not None and str(voice).strip().lower() not in ("", "default"):
         raise ValueError(
-            "Ming-Omni-TTS currently supports only the default voice; " f"got {voice!r}"
+            f"Ming-Omni-TTS currently supports only the default voice; got {voice!r}"
         )
 
     language = tts_params.get("language", params.get("language"))
@@ -241,7 +241,7 @@ def preprocess_ming_tts_payload(
     speed = tts_params.get("speed", params.get("speed"))
     if speed is not None and float(speed) != 1.0:
         raise ValueError(
-            "Ming-Omni-TTS speed control is currently unsupported; " f"got {speed!r}"
+            f"Ming-Omni-TTS speed control is currently unsupported; got {speed!r}"
         )
 
     if tts_params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
@@ -287,7 +287,7 @@ def preprocess_ming_tts_payload(
     )
     if max_decode_steps <= 0:
         raise ValueError(
-            "Ming-Omni-TTS max_decode_steps must be > 0, " f"got {max_decode_steps}"
+            f"Ming-Omni-TTS max_decode_steps must be > 0, got {max_decode_steps}"
         )
     if max_decode_steps_cap is not None and max_decode_steps > int(
         max_decode_steps_cap

@@ -147,7 +147,7 @@ class MingAudioDecoder(torch.nn.Module):
         decoder = self.audio_vae.decoder
         qwen_inputs: list[torch.Tensor | None] = []
         next_upsample_states = []
-        # 1. Note (yzxiao): Linear upsampling carries overlap across chunks,
+        # Note (yzxiao): Linear upsampling carries overlap across chunks,
         # so each request must advance its own upsample state before batching.
         for latent_sequence, is_last, state in zip(
             latent_sequences,
@@ -174,7 +174,7 @@ class MingAudioDecoder(torch.nn.Module):
             else nullcontext()
         )
         with context:
-            # 2. Note (yzxiao): Only steady fixed-KV rows share graph replay;
+            # Note (yzxiao): Only steady fixed-KV rows share graph replay;
             # initial and terminal rows stay eager to preserve cache semantics.
             next_dynamic_caches = [state.dynamic_cache for state in states]
             next_fixed_kv_states = [state.fixed_kv_state for state in states]
@@ -225,7 +225,7 @@ class MingAudioDecoder(torch.nn.Module):
                             next_dynamic_caches[0] = None
                             next_fixed_kv_states[0] = fixed_state
 
-            # 3. Note (yzxiao): Waveform overlap buffers remain request-local
+            # Note (yzxiao): Waveform overlap buffers remain request-local
             # even when the Qwen step is coalesced into one graph replay.
             waveforms = []
             next_audio_buffers = []
@@ -253,7 +253,7 @@ class MingAudioDecoder(torch.nn.Module):
                 next_audio_buffers.append(audio_buffer)
                 next_window_buffers.append(window_buffer)
 
-        # 4. Note (yzxiao): Cache and overlap state must advance together with
+        # Note (yzxiao): Cache and overlap state must advance together with
         # the waveform returned by this scheduler step.
         for row, state in enumerate(states):
             state.dynamic_cache = next_dynamic_caches[row]

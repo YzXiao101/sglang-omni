@@ -95,7 +95,7 @@ class MingTTSModelRunner(ModelRunner):
         for sched_req in requests:
             req = sched_req.data.req
             if req.retracted_stain:
-                # note (yzxiao): Re-prefill includes generated feedback rows, which
+                # Note (yzxiao): Re-prefill includes generated feedback rows, which
                 # must never extend the prompt-only radix tree.
                 req.skip_radix_cache_insert = True
             self._materialize_request_state(sched_req)
@@ -218,7 +218,7 @@ class MingTTSModelRunner(ModelRunner):
                     ]
                 request_parts.append(prompt_rows)
 
-            # note (yzxiao): Retraction may re-prefill generated audio tokens,
+            # Note (yzxiao): Retraction may re-prefill generated audio tokens,
             # whose rows live in feedback embeddings rather than token embeds.
             feedback_count = max(extend_end - prompt_len, 0)
             if feedback_count:
