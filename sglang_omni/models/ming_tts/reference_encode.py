@@ -61,12 +61,7 @@ class MingSpeakerEmbeddingExtractor:
 
 
 class _MingTTSReferenceEncodeHook(KeyedReferenceEncodeHook[str, dict, dict]):
-    """M4a hook: cache (speaker embedding, prompt latent) per reference file.
-
-    The artifact is the text-independent conditioning bundle; prompt build
-    stays per-request in encode_payload. Keys are full-content file hashes
-    so a re-uploaded identical reference hits across request ids.
-    """
+    """Cache text-independent reference conditioning by audio content."""
 
     model_revision = ""
     encoder_id = "ming_audio_vae_campplus"
@@ -84,10 +79,8 @@ class _MingTTSReferenceEncodeHook(KeyedReferenceEncodeHook[str, dict, dict]):
         return str(raw_input)
 
     def input_key(self, item: str) -> str | None:
-        # Full-content memoized hash; the sampled variant can collide for
-        # same-size files that differ only in the middle (review on #858).
-        # None means unreadable input: bypass the cache and let encode_one
-        # raise the real error to the caller.
+        # Note (yzxiao): Full-content hashing avoids same-size middle-content
+        # collisions; unreadable paths bypass the cache to preserve the source error.
         return reference_path_cache_key(item, trust_stat=False)
 
     def encode_one(self, item: str) -> dict:
@@ -183,7 +176,7 @@ class MingTTSReferenceEncoder:
         frames = int(prompt_latent.shape[1])
         speaker_embedding = self.speaker_encoder(speaker_waveform)
 
-        # note (luojiaxuan): keep artifacts on CPU float32 so the shared cache
+        # Note (luojiaxuan): Keep artifacts on CPU float32 so the shared cache
         # never pins device memory and typed_tensor emits float32 unchanged.
         return {
             "spk_emb": speaker_embedding.detach().to(device="cpu", dtype=torch.float32),
@@ -272,7 +265,7 @@ class MingTTSReferenceEncoder:
             dtype=waveform.dtype,
             device=waveform.device,
         )
-        padded[:, : int(waveform.shape[-1])] = waveform.clone()
+        padded[:, : int(waveform.shape[-1])] = waveform
         return padded
 
     def _prepare_audio_vae_waveform(self, waveform: Any) -> Any:
@@ -285,7 +278,7 @@ class MingTTSReferenceEncoder:
             dtype=self._audio_vae_floating_dtype(),
         )
 
-    def _audio_vae_floating_dtype(self) -> Any:
+    def _audio_vae_floating_dtype(self) -> torch.dtype:
         for parameter in self.audio_vae.parameters():
             if parameter.is_floating_point():
                 return parameter.dtype

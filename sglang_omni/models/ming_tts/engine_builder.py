@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class MingTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Ming-Omni-TTS"
-    context_length = 0  # resolved from the checkpoint config in pre_infra_setup
+    context_length = 0
 
     def __init__(
         self,
@@ -75,7 +75,6 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         }
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
-        # context_length is supplied by build_sglang_server_args directly.
         overrides.pop("context_length", None)
         overrides["tp_size"] = self.tp_size
 
@@ -135,8 +134,8 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
 
     def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
         del server_args
-        # The acoustic tail graph replays only on the owning rank; other TP
-        # ranks run the backbone graph and skip latent sampling.
+        # Note (yzxiao): Only the acoustic owner captures tail graphs because
+        # follower ranks run the backbone graph without latent sampling.
         if self.tp_rank != 0:
             return
         model.init_tail_graphs(
