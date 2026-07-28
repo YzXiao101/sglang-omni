@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 22, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -217,6 +217,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_tts.html">Ming-Omni-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts_local.html">MOSS-TTS-Local</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fun_asr.html">Fun-ASR-Nano</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
@@ -594,7 +595,7 @@ first executable prefill / extend batch is selected.</p>
 </tr>
 <tr class="row-even"><td><p>Code2Wav first audio</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">code2wav_first_audio</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Code2WavScheduler._decode_and_emit</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Code2WavScheduler.decode_delta</span></code> / <code class="docutils literal notranslate"><span class="pre">run_step</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p>Terminal response</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">terminal_response</span></code></p></td>
@@ -647,6 +648,22 @@ first executable prefill / extend batch is selected.</p>
 <tr class="row-even"><td><p>AR scheduler</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">scheduler_first_emit</span></code></p></td>
 <td><p>First <code class="docutils literal notranslate"><span class="pre">stream_output_builder</span></code> emission per request</p></td>
+</tr>
+<tr class="row-odd"><td><p>Code2Wav</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">code2wav_decode_start</span></code></p></td>
+<td><p>Serial decode start: trigger, start/end/new/context/window frames, active and threshold-ready requests, inbox depth</p></td>
+</tr>
+<tr class="row-even"><td><p>Code2Wav</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">code2wav_decode_end</span></code></p></td>
+<td><p>Repeats the start metadata and adds audio samples plus execution metadata</p></td>
+</tr>
+<tr class="row-odd"><td><p>Code2Wav</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">code2wav_batch_start</span></code></p></td>
+<td><p>Coalesced step start: batch and bucket shape, new/window frames, active requests, inbox depth, oldest wait, fire reason, due-bucket count, and sub-batch decomposition</p></td>
+</tr>
+<tr class="row-even"><td><p>Code2Wav</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">code2wav_batch_end</span></code></p></td>
+<td><p>Repeats the start metadata and adds audio samples, execution mode, graph key, and fallback reason</p></td>
 </tr>
 </tbody>
 </table>
@@ -928,7 +945,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 22, 2026.
+  Last updated on Jul 28, 2026.
   <br/>
 </p>
   </div>
