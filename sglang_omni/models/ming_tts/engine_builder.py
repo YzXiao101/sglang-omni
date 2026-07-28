@@ -67,7 +67,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             "dtype": dtype,
             "disable_cuda_graph": True,
             "disable_overlap_schedule": True,
-            "disable_radix_cache": False,
+            "disable_radix_cache": True,
             "enable_torch_compile": False,
             "max_prefill_tokens": min(int(self.context_length), 8192),
             "sampling_backend": "pytorch",
