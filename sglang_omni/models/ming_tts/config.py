@@ -20,7 +20,7 @@ AUDIO_DECODE_STAGE = "audio_decode"
 class MingAudioVAECudaGraphConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
     batch_sizes: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
     nonstream_token_sizes: list[int] | None = None
 
@@ -94,7 +94,7 @@ class MingTTSPipelineConfig(PipelineConfig):
         }
 
     model_path: str
-    max_decode_steps_cap: int | None = None
+    max_decode_steps_cap: int | None = 256
     audio_vae_steady_chunk_patches: int = 2
     audio_vae_cuda_graph: MingAudioVAECudaGraphConfig = Field(
         default_factory=MingAudioVAECudaGraphConfig
