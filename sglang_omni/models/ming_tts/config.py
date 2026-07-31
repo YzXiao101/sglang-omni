@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from sglang_omni.config import PipelineConfig, StageConfig
 
 _PKG = "sglang_omni.models.ming_tts"
@@ -15,39 +13,6 @@ PREPROCESSING_STAGE = "preprocessing"
 REFERENCE_ENCODE_STAGE = "reference_encode"
 TTS_ENGINE_STAGE = "tts_engine"
 AUDIO_DECODE_STAGE = "audio_decode"
-
-
-class MingAudioVAECudaGraphConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    batch_sizes: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
-    nonstream_token_sizes: list[int] | None = None
-
-    def model_post_init(self, __context: Any = None) -> None:
-        if not self.batch_sizes:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph batch_sizes must not be empty"
-            )
-        if any(batch_size <= 0 for batch_size in self.batch_sizes):
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph batch_sizes must contain only "
-                f"positive values; got {self.batch_sizes!r}"
-            )
-        self.batch_sizes = sorted(set(self.batch_sizes))
-
-        if self.nonstream_token_sizes is None:
-            return
-        if not self.nonstream_token_sizes:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph nonstream_token_sizes must not be empty"
-            )
-        if any(token_size <= 0 for token_size in self.nonstream_token_sizes):
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph nonstream_token_sizes must contain "
-                f"only positive values; got {self.nonstream_token_sizes!r}"
-            )
-        self.nonstream_token_sizes = sorted(set(self.nonstream_token_sizes))
 
 
 class MingTTSPipelineConfig(PipelineConfig):
@@ -96,9 +61,6 @@ class MingTTSPipelineConfig(PipelineConfig):
     model_path: str
     max_decode_steps_cap: int | None = 256
     audio_vae_steady_chunk_patches: int = 2
-    audio_vae_cuda_graph: MingAudioVAECudaGraphConfig = Field(
-        default_factory=MingAudioVAECudaGraphConfig
-    )
     entry_stage: str = PREPROCESSING_STAGE
     stages: list[StageConfig] = [
         StageConfig(
@@ -143,11 +105,6 @@ class MingTTSPipelineConfig(PipelineConfig):
             raise ValueError(
                 "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
             )
-        if self.audio_vae_cuda_graph.enabled and self.max_decode_steps_cap is None:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE CUDA graph requires max_decode_steps_cap"
-            )
-
         stages = {stage.name: stage for stage in self.stages}
         required_stages = {PREPROCESSING_STAGE, AUDIO_DECODE_STAGE}
         missing_stages = required_stages - stages.keys()
@@ -158,7 +115,6 @@ class MingTTSPipelineConfig(PipelineConfig):
             )
         preprocessing = stages[PREPROCESSING_STAGE]
         audio_decode = stages[AUDIO_DECODE_STAGE]
-        graph_factory_config = self.audio_vae_cuda_graph.model_dump(mode="python")
         for stage, expected_args in (
             (
                 preprocessing,
@@ -167,11 +123,9 @@ class MingTTSPipelineConfig(PipelineConfig):
             (
                 audio_decode,
                 {
-                    "max_decode_steps_cap": self.max_decode_steps_cap,
                     "audio_vae_steady_chunk_patches": (
                         self.audio_vae_steady_chunk_patches
                     ),
-                    "audio_vae_cuda_graph": graph_factory_config,
                 },
             ),
         ):

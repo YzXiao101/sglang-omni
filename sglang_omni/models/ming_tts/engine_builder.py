@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang_omni.models.ming_omni.tp_utils import validate_attention_tp_config
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_bs
 
@@ -55,7 +56,35 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         from sglang_omni.models.ming_tts import stages as ming_stages
 
         self.config = ming_stages._load_ming_tts_config(checkpoint_dir)
-        ming_stages._check_ming_tts_tp_backbone_config(self.config, self.tp_size)
+        if self.tp_size > 1:
+            llm_config = self.config.llm_config
+            hidden_size = int(llm_config.hidden_size)
+            head_dim = int(llm_config.head_dim)
+            num_heads = int(llm_config.num_attention_heads)
+            num_kv_heads = int(llm_config.num_key_value_heads)
+            if min(hidden_size, head_dim, num_heads, num_kv_heads) <= 0:
+                raise ValueError(
+                    "Ming-Omni-TTS TP requires positive hidden/head dimensions: "
+                    f"hidden_size={hidden_size}, head_dim={head_dim}, "
+                    f"num_attention_heads={num_heads}, "
+                    f"num_key_value_heads={num_kv_heads}"
+                )
+            if head_dim * num_heads != hidden_size:
+                raise ValueError(
+                    "Ming-Omni-TTS TP requires head_dim * num_attention_heads "
+                    f"to equal hidden_size ({head_dim} * {num_heads} != {hidden_size})"
+                )
+            if hidden_size % self.tp_size != 0:
+                raise ValueError(
+                    "Ming-Omni-TTS TP requires hidden_size divisible by tp_size: "
+                    f"hidden_size={hidden_size}, tp_size={self.tp_size}"
+                )
+            validate_attention_tp_config(
+                num_attention_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                tp_size=self.tp_size,
+                context="Ming-Omni-TTS tts_engine",
+            )
         context_length = int(self.requested_context_length or 0)
         if context_length <= 0:
             context_length = ming_stages._resolve_context_length(self.config)

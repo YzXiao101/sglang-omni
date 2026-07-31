@@ -7,7 +7,6 @@ import logging
 from typing import Any
 
 from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
-from sglang_omni.models.ming_tts.config import MingAudioVAECudaGraphConfig
 from sglang_omni.models.ming_tts.hf_config import (
     MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     register_ming_tts_hf_config,
@@ -19,60 +18,6 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
-
-
-def _check_ming_tts_tp_backbone_config(config: Any, tp_size: int) -> None:
-    tp_size = int(tp_size)
-    if tp_size <= 1:
-        return
-
-    llm_config = getattr(config, "llm_config", None)
-    if llm_config is None:
-        raise ValueError("Ming-Omni-TTS TP requires llm_config")
-
-    def require_int_config_field(field: str) -> int:
-        value = getattr(llm_config, field, None)
-        if value is None:
-            raise ValueError(f"Ming-Omni-TTS llm_config is missing {field}")
-        return int(value)
-
-    hidden_size = require_int_config_field("hidden_size")
-    head_dim = require_int_config_field("head_dim")
-    num_heads = require_int_config_field("num_attention_heads")
-    num_kv_heads = require_int_config_field("num_key_value_heads")
-    if min(hidden_size, head_dim, num_heads, num_kv_heads) <= 0:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires positive hidden/head dimensions: "
-            f"hidden_size={hidden_size}, head_dim={head_dim}, "
-            f"num_attention_heads={num_heads}, "
-            f"num_key_value_heads={num_kv_heads}"
-        )
-    if head_dim * num_heads != hidden_size:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires head_dim * num_attention_heads "
-            f"to equal hidden_size ({head_dim} * {num_heads} != {hidden_size})"
-        )
-    if hidden_size % tp_size != 0:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires hidden_size divisible by tp_size: "
-            f"hidden_size={hidden_size}, tp_size={tp_size}"
-        )
-    if num_heads % tp_size != 0:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires attention heads divisible by tp_size: "
-            f"num_attention_heads={num_heads}, tp_size={tp_size}"
-        )
-    if num_kv_heads >= tp_size and num_kv_heads % tp_size != 0:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires KV heads divisible by tp_size: "
-            f"num_key_value_heads={num_kv_heads}, tp_size={tp_size}"
-        )
-    if num_kv_heads < tp_size and tp_size % num_kv_heads != 0:
-        raise ValueError(
-            "Ming-Omni-TTS TP requires KV heads to divide or be divisible "
-            f"by tp_size: num_key_value_heads={num_kv_heads}, "
-            f"tp_size={tp_size}"
-        )
 
 
 def create_preprocessing_executor(
@@ -197,9 +142,7 @@ def create_audio_decode_executor(
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     keep_latents: bool = False,
-    max_decode_steps_cap: int | None = None,
     audio_vae_steady_chunk_patches: int = 2,
-    audio_vae_cuda_graph: dict[str, Any] | None = None,
 ) -> Any:
     from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
     from sglang_omni.models.ming_tts.streaming_vocoder import (
@@ -221,8 +164,6 @@ def create_audio_decode_executor(
         config.audio_tokenizer_config,
         attn_implementation=MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     )
-    qwen_tokens_per_patch = int(config.audio_patch_size) * int(audio_config.patch_size)
-    steady_streaming_token_size = steady_chunk_patches * qwen_tokens_per_patch
     decoder = MingAudioDecoder.from_config(
         audio_config,
         device=device,
@@ -231,56 +172,10 @@ def create_audio_decode_executor(
     report = load_ming_tts_audio_vae_weights(checkpoint_dir, decoder.audio_vae)
     logger.info("%s", report.summary())
 
-    graph_config = MingAudioVAECudaGraphConfig.model_validate(
-        audio_vae_cuda_graph or {}
-    )
-    if graph_config.enabled:
-        if max_decode_steps_cap is None:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE CUDA graph requires max_decode_steps_cap"
-            )
-        max_qwen_tokens = int(max_decode_steps_cap) * qwen_tokens_per_patch
-        token_sizes = graph_config.nonstream_token_sizes
-        if token_sizes is None:
-            token_sizes = []
-            token_size = qwen_tokens_per_patch
-            while token_size < max_qwen_tokens:
-                token_sizes.append(token_size)
-                token_size *= 4
-            token_sizes.append(max_qwen_tokens)
-        elif token_sizes[0] < qwen_tokens_per_patch:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph token buckets must be at least "
-                f"{qwen_tokens_per_patch}; got {token_sizes!r}"
-            )
-        if token_sizes[-1] != max_qwen_tokens:
-            raise ValueError(
-                "Ming-Omni-TTS AudioVAE graph token buckets must end at the "
-                f"admission envelope {max_qwen_tokens}; got {token_sizes!r}"
-            )
-
-        logger.info(
-            "Ming-Omni-TTS AudioVAE CUDA graph enabled: "
-            "max_decode_steps=%d qwen_tokens_per_patch=%d "
-            "batch_sizes=%s token_sizes=%s",
-            max_decode_steps_cap,
-            qwen_tokens_per_patch,
-            graph_config.batch_sizes,
-            token_sizes,
-        )
-        decoder.capture_cuda_graphs(
-            batch_sizes=graph_config.batch_sizes,
-            token_sizes=token_sizes,
-            streaming_token_size=steady_streaming_token_size,
-        )
-
     logger.info(
         "Ming-Omni-TTS AudioVAE streaming cadence: "
-        "initial_patches=1 steady_patches=%d "
-        "qwen_tokens_per_patch=%d steady_graph_T=%d",
+        "initial_patches=1 steady_patches=%d",
         steady_chunk_patches,
-        qwen_tokens_per_patch,
-        steady_streaming_token_size,
     )
     return MingTTSStreamingVocoderScheduler(
         decoder,
