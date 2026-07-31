@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, cast
 
 import torch
@@ -13,12 +12,7 @@ from transformers.cache_utils import Cache
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
 from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
-from sglang_omni.models.ming_tts.audio_vae_graph import (
-    MingAudioVAEFixedKVState,
-    MingAudioVAEGraphRunner,
-)
 from sglang_omni.models.ming_tts.payload_types import (
-    MingTTSState,
     load_ming_tts_state,
     store_ming_tts_state,
 )
@@ -30,15 +24,9 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 @dataclass
 class MingAudioDecoderState:
     dynamic_cache: Cache | None = None
-    fixed_kv_state: MingAudioVAEFixedKVState | None = None
     upsample_state: dict[str, Any] | None = None
     audio_buffer: torch.Tensor | None = None
     window_buffer: torch.Tensor | None = None
-
-
-class MingAudioVAEStepPhase(Enum):
-    EAGER = "eager"
-    GRAPH = "graph"
 
 
 class MingAudioDecoder(torch.nn.Module):
@@ -48,7 +36,6 @@ class MingAudioDecoder(torch.nn.Module):
         super().__init__()
         self.audio_vae = audio_vae
         self.sample_rate = int(sample_rate)
-        self._graph_runner: MingAudioVAEGraphRunner | None = None
 
     @classmethod
     def from_config(
@@ -88,84 +75,25 @@ class MingAudioDecoder(torch.nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.audio_vae.parameters()).dtype
 
-    @property
-    def cuda_graph_enabled(self) -> bool:
-        return self._graph_runner is not None
-
-    @property
-    def max_decode_batch_size(self) -> int:
-        if self._graph_runner is None:
-            return 1
-        return self._graph_runner.max_batch_size
-
-    @torch.inference_mode()
-    def capture_cuda_graphs(
-        self,
-        *,
-        batch_sizes: list[int],
-        token_sizes: list[int],
-        streaming_token_size: int,
-    ) -> None:
-        runner = MingAudioVAEGraphRunner(
-            self.audio_vae.decoder,
-            batch_sizes=batch_sizes,
-            token_sizes=token_sizes,
-            streaming_token_size=streaming_token_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        runner.capture()
-        self._graph_runner = runner
-
-    def log_cuda_graph_stats(self) -> None:
-        if self._graph_runner is not None:
-            self._graph_runner.log_stats()
-
-    def select_streaming_phase(
-        self,
-        state: MingAudioDecoderState,
-        *,
-        is_last: bool,
-    ) -> MingAudioVAEStepPhase:
-        if (
-            self._graph_runner is not None
-            and state.fixed_kv_state is not None
-            and not is_last
-        ):
-            return MingAudioVAEStepPhase.GRAPH
-        return MingAudioVAEStepPhase.EAGER
-
     @torch.inference_mode()
     def decode_streaming_step(
         self,
-        latent_sequences: list[torch.Tensor],
-        last_chunks: list[bool],
-        states: list[MingAudioDecoderState],
+        latent_sequence: torch.Tensor,
         *,
-        phase: MingAudioVAEStepPhase,
-    ) -> list[torch.Tensor]:
+        state: MingAudioDecoderState,
+        is_last: bool,
+    ) -> torch.Tensor:
         decoder = self.audio_vae.decoder
-        qwen_inputs: list[torch.Tensor | None] = []
-        next_upsample_states = []
-        # Note (yzxiao): Linear upsampling carries overlap across chunks,
-        # so each request must advance its own upsample state before batching.
-        for latent_sequence, is_last, state in zip(
-            latent_sequences,
-            last_chunks,
-            states,
-        ):
-            latent_sequence = latent_sequence.to(
-                device=self.device,
-                dtype=self.dtype,
-            ).unsqueeze(0)
-            inputs, upsample_state = decoder.project_and_upsample_latents(
-                latent_sequence,
-                streaming=True,
-                upsample_state=state.upsample_state,
-                is_last=is_last,
-            )
-            qwen_inputs.append(inputs)
-            next_upsample_states.append(upsample_state)
+        latent_sequence = latent_sequence.to(
+            device=self.device,
+            dtype=self.dtype,
+        ).unsqueeze(0)
+        inputs, next_upsample_state = decoder.project_and_upsample_latents(
+            latent_sequence,
+            streaming=True,
+            upsample_state=state.upsample_state,
+            is_last=is_last,
+        )
 
         context = (
             torch.autocast(device_type="cuda", dtype=self.dtype)
@@ -173,95 +101,38 @@ class MingAudioDecoder(torch.nn.Module):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+        next_dynamic_cache = state.dynamic_cache
+        next_audio_buffer = state.audio_buffer
+        next_window_buffer = state.window_buffer
         with context:
-            # Note (yzxiao): Only steady fixed-KV rows share graph replay;
-            # initial and terminal rows stay eager to preserve cache semantics.
-            next_dynamic_caches = [state.dynamic_cache for state in states]
-            next_fixed_kv_states = [state.fixed_kv_state for state in states]
-            if phase is MingAudioVAEStepPhase.GRAPH:
-                graph_runner = cast(MingAudioVAEGraphRunner, self._graph_runner)
-                graph_inputs = cast(list[torch.Tensor], qwen_inputs)
-                fixed_kv_states = cast(
-                    list[MingAudioVAEFixedKVState],
-                    [state.fixed_kv_state for state in states],
+            if inputs is None:
+                waveform = torch.empty(
+                    (0,),
+                    device=self.device,
+                    dtype=self.dtype,
                 )
-                result = graph_runner.replay_streaming(
-                    graph_inputs,
-                    fixed_kv_states,
-                )
-                qwen_hidden_states = [
-                    value.unsqueeze(0) for value in result.hidden_states.unbind(dim=0)
-                ]
-                next_fixed_kv_states = list(result.states)
             else:
-                inputs = qwen_inputs[0]
-                if inputs is None:
-                    qwen_hidden_states = [None]
-                elif states[0].fixed_kv_state is not None:
-                    graph_runner = cast(MingAudioVAEGraphRunner, self._graph_runner)
-                    hidden_states_value, next_fixed_state = (
-                        graph_runner.forward_streaming_eager(
-                            inputs,
-                            states[0].fixed_kv_state,
-                        )
-                    )
-                    qwen_hidden_states = [hidden_states_value]
-                    next_fixed_kv_states[0] = next_fixed_state
-                else:
-                    hidden_states_value, next_dynamic_cache = (
-                        decoder.decode_qwen_hidden_states(
-                            inputs,
-                            past_key_values=states[0].dynamic_cache,
-                            use_cache=True,
-                        )
-                    )
-                    qwen_hidden_states = [hidden_states_value]
-                    next_dynamic_caches[0] = next_dynamic_cache
-                    if self._graph_runner is not None and not last_chunks[0]:
-                        fixed_state = self._graph_runner.promote_dynamic_cache(
-                            next_dynamic_cache
-                        )
-                        if fixed_state is not None:
-                            next_dynamic_caches[0] = None
-                            next_fixed_kv_states[0] = fixed_state
-
-            # Note (yzxiao): Waveform overlap buffers remain request-local
-            # even when the Qwen step is coalesced into one graph replay.
-            waveforms = []
-            next_audio_buffers = []
-            next_window_buffers = []
-            for row, hidden_states_value in enumerate(qwen_hidden_states):
-                state = states[row]
-                audio_buffer = state.audio_buffer
-                window_buffer = state.window_buffer
-                if hidden_states_value is None:
-                    waveform = torch.empty(
-                        (0,),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                else:
-                    waveform, audio_buffer, window_buffer = decoder.synthesize_waveform(
-                        hidden_states_value,
+                hidden_states, next_dynamic_cache = decoder.decode_qwen_hidden_states(
+                    inputs,
+                    past_key_values=state.dynamic_cache,
+                    use_cache=True,
+                )
+                waveform, next_audio_buffer, next_window_buffer = (
+                    decoder.synthesize_waveform(
+                        hidden_states,
                         streaming=True,
-                        audio_buffer=audio_buffer,
-                        window_buffer=window_buffer,
-                        is_last=last_chunks[row],
+                        audio_buffer=state.audio_buffer,
+                        window_buffer=state.window_buffer,
+                        is_last=is_last,
                     )
-                    waveform = waveform[0, 0].detach()
-                waveforms.append(waveform)
-                next_audio_buffers.append(audio_buffer)
-                next_window_buffers.append(window_buffer)
+                )
+                waveform = waveform[0, 0].detach()
 
-        # Note (yzxiao): Cache and overlap state must advance together with
-        # the waveform returned by this scheduler step.
-        for row, state in enumerate(states):
-            state.dynamic_cache = next_dynamic_caches[row]
-            state.fixed_kv_state = next_fixed_kv_states[row]
-            state.upsample_state = next_upsample_states[row]
-            state.audio_buffer = next_audio_buffers[row]
-            state.window_buffer = next_window_buffers[row]
-        return waveforms
+        state.dynamic_cache = next_dynamic_cache
+        state.upsample_state = next_upsample_state
+        state.audio_buffer = next_audio_buffer
+        state.window_buffer = next_window_buffer
+        return waveform
 
     @torch.inference_mode()
     def decode_nonstreaming_batch(
@@ -271,66 +142,32 @@ class MingAudioDecoder(torch.nn.Module):
         if not latent_batches:
             return []
 
-        waveforms: dict[int, torch.Tensor] = {}
-        sequences: dict[int, torch.Tensor] = {}
-        for request_index, latents in enumerate(latent_batches):
-            chunk_count = int(latents.shape[0])
-            if chunk_count == 0:
-                waveforms[request_index] = latents.new_empty((0,), dtype=torch.float32)
-                continue
-            latents = latents.to(device=self.device, dtype=self.dtype)
-            sequences[request_index] = latents.reshape(1, -1, latents.shape[-1])
-
-        if not sequences:
-            return [waveforms[index] for index in range(len(latent_batches))]
-
         context = (
             torch.autocast(device_type="cuda", dtype=self.dtype)
             if self.device.type == "cuda"
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+        waveforms = []
         with context:
-            prepared_inputs: dict[int, torch.Tensor] = {}
-            for request_index, sequence in sequences.items():
+            for latents in latent_batches:
+                if int(latents.shape[0]) == 0:
+                    waveforms.append(latents.new_empty((0,), dtype=torch.float32))
+                    continue
+
+                latents = latents.to(device=self.device, dtype=self.dtype)
+                sequence = latents.reshape(1, -1, latents.shape[-1])
                 inputs, _ = self.audio_vae.decoder.project_and_upsample_latents(
                     sequence,
                     streaming=False,
                     upsample_state=None,
                     is_last=True,
                 )
-                prepared_inputs[request_index] = cast(torch.Tensor, inputs)
-
-            hidden_states_by_request: dict[int, torch.Tensor] = {}
-            if self._graph_runner is None:
-                for request_index, inputs in prepared_inputs.items():
-                    hidden_states, _ = self.audio_vae.decoder.decode_qwen_hidden_states(
-                        inputs,
-                        past_key_values=None,
-                        use_cache=False,
-                    )
-                    hidden_states_by_request[request_index] = hidden_states
-            else:
-                groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
-                for request_index, inputs in prepared_inputs.items():
-                    token_size = self._graph_runner.select_token_size(
-                        int(inputs.shape[1])
-                    )
-                    groups.setdefault(token_size, []).append((request_index, inputs))
-
-                for token_size in sorted(groups):
-                    group = groups[token_size]
-                    result = self._graph_runner.replay(
-                        [inputs for _, inputs in group],
-                        token_size=token_size,
-                    )
-                    for row, (request_index, _) in enumerate(group):
-                        true_length = result.true_lengths[row]
-                        hidden_states_by_request[request_index] = result.hidden_states[
-                            row : row + 1, :true_length
-                        ]
-
-            for request_index, hidden_states in hidden_states_by_request.items():
+                hidden_states, _ = self.audio_vae.decoder.decode_qwen_hidden_states(
+                    cast(torch.Tensor, inputs),
+                    past_key_values=None,
+                    use_cache=False,
+                )
                 waveform, _, _ = self.audio_vae.decoder.synthesize_waveform(
                     hidden_states,
                     streaming=False,
@@ -338,9 +175,9 @@ class MingAudioDecoder(torch.nn.Module):
                     window_buffer=None,
                     is_last=True,
                 )
-                waveforms[request_index] = waveform[0, 0].detach()
+                waveforms.append(waveform[0, 0].detach())
 
-        return [waveforms[index] for index in range(len(latent_batches))]
+        return waveforms
 
 
 def decode_ming_tts_audio_payload(
@@ -349,49 +186,10 @@ def decode_ming_tts_audio_payload(
     *,
     keep_latents: bool = False,
 ) -> StagePayload:
-    """Adapt the scalar scheduler callback to the batched decode path."""
+    """Decode generated acoustic latents into the terminal waveform payload."""
 
-    return decode_ming_tts_audio_payload_batch(
-        [payload],
-        decoder,
-        keep_latents=keep_latents,
-    )[0]
-
-
-def decode_ming_tts_audio_payload_batch(
-    payloads: list[StagePayload],
-    decoder: MingAudioDecoder,
-    *,
-    keep_latents: bool = False,
-) -> list[StagePayload]:
-    """Decode a non-streaming scheduler wave without changing payload order."""
-
-    states = [load_ming_tts_state(payload) for payload in payloads]
-    waveforms = decoder.decode_nonstreaming_batch(
-        [state.generated_latents for state in states],
-    )
-    results = []
-    for payload, state, waveform in zip(payloads, states, waveforms):
-        results.append(
-            _store_decoded_waveform(
-                payload,
-                state,
-                waveform,
-                decoder=decoder,
-                keep_latents=keep_latents,
-            )
-        )
-    return results
-
-
-def _store_decoded_waveform(
-    payload: StagePayload,
-    state: MingTTSState,
-    waveform: torch.Tensor,
-    *,
-    decoder: MingAudioDecoder,
-    keep_latents: bool,
-) -> StagePayload:
+    state = load_ming_tts_state(payload)
+    waveform = decoder.decode_nonstreaming_batch([state.generated_latents])[0]
     state.sample_rate = int(decoder.sample_rate)
     state.duration_s = float(waveform.numel() / int(decoder.sample_rate))
     if not keep_latents:
@@ -415,7 +213,5 @@ def _store_decoded_waveform(
 __all__ = [
     "MingAudioDecoder",
     "MingAudioDecoderState",
-    "MingAudioVAEStepPhase",
     "decode_ming_tts_audio_payload",
-    "decode_ming_tts_audio_payload_batch",
 ]

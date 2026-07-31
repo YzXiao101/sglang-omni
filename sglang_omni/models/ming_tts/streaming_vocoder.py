@@ -12,9 +12,7 @@ import torch
 from sglang_omni.models.ming_tts.audio_decode import (
     MingAudioDecoder,
     MingAudioDecoderState,
-    MingAudioVAEStepPhase,
     decode_ming_tts_audio_payload,
-    decode_ming_tts_audio_payload_batch,
 )
 from sglang_omni.models.ming_tts.payload_types import load_ming_tts_state
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -36,15 +34,12 @@ class _StreamState:
 
 @dataclass(frozen=True)
 class _StepPlan:
-    phase: MingAudioVAEStepPhase
     patch_count: int
     is_last: bool
 
 
 class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepPlan]):
     """Decode Ming acoustic latents with request-local AudioVAE state."""
-
-    _stream_chunk_batch_distinct_requests = True
 
     def __init__(
         self,
@@ -60,14 +55,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         self._latent_dim = int(latent_dim)
         self._steady_chunk_patches = int(steady_chunk_patches)
         self._can_batch_stream_chunks = True
-        self._stream_chunk_batch_max = decoder.max_decode_batch_size
-        batch_compute_fn = None
-        if decoder.cuda_graph_enabled:
-            batch_compute_fn = partial(
-                decode_ming_tts_audio_payload_batch,
-                decoder=decoder,
-                keep_latents=bool(keep_latents),
-            )
+        self._stream_chunk_batch_max = 1
         super().__init__(
             partial(
                 decode_ming_tts_audio_payload,
@@ -76,16 +64,11 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
             ),
             sample_rate=decoder.sample_rate,
             stream_source_hint="Ming-Omni-TTS",
-            batch_compute_fn=batch_compute_fn,
-            max_batch_size=decoder.max_decode_batch_size,
         )
 
     def create_stream_state(self, request_id: str) -> _StreamState:
         del request_id
         return _StreamState()
-
-    def on_serving_stop(self) -> None:
-        self._decoder.log_cuda_graph_stats()
 
     def _ingest_stream_item(
         self,
@@ -107,7 +90,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
                 f"chunk_id={item.chunk_id}, expected {state.expected_chunk_id}"
             )
         if state.terminal_received or state.terminal_decoded:
-            raise RuntimeError(
+            raise ValueError(
                 f"Ming-Omni-TTS stream chunk arrived after the terminal patch "
                 f"for {request_id!r}"
             )
@@ -169,25 +152,15 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
             is_last = False
 
         return _StepPlan(
-            phase=self._decoder.select_streaming_phase(
-                state.decoder_state,
-                is_last=is_last,
-            ),
             patch_count=patch_count,
             is_last=is_last,
         )
 
     def select_step_participants(self) -> list[tuple[str, _StreamState]]:
-        graph_participants = []
         for request_id, state in self._stream_state_items():
-            plan = self._step_plan_for_state(state)
-            if plan is None:
-                continue
-            participant = (request_id, state)
-            if plan.phase is MingAudioVAEStepPhase.EAGER:
-                return [participant]
-            graph_participants.append(participant)
-        return graph_participants[: self._decoder.max_decode_batch_size]
+            if self._step_plan_for_state(state) is not None:
+                return [(request_id, state)]
+        return []
 
     def build_step_plan(
         self,
@@ -200,29 +173,27 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         participants: list[tuple[str, _StreamState]],
         plan: _StepPlan,
     ) -> dict[str, torch.Tensor]:
-        latent_sequences = [
-            torch.cat(state.pending_patches[: plan.patch_count], dim=0)
-            for _, state in participants
-        ]
-        waveforms = self._decoder.decode_streaming_step(
-            latent_sequences,
-            [plan.is_last] * len(participants),
-            [state.decoder_state for _, state in participants],
-            phase=plan.phase,
+        request_id, state = participants[0]
+        latent_sequence = torch.cat(
+            state.pending_patches[: plan.patch_count],
+            dim=0,
+        )
+        waveform = self._decoder.decode_streaming_step(
+            latent_sequence,
+            state=state.decoder_state,
+            is_last=plan.is_last,
         )
 
-        decoded = {}
-        for (request_id, state), waveform in zip(participants, waveforms):
-            del state.pending_patches[: plan.patch_count]
-            if not state.initial_patch_consumed and not plan.is_last:
-                state.initial_patch_consumed = True
-            if plan.is_last:
-                state.terminal_received = False
-                state.terminal_decoded = True
-            if waveform.numel() > 0:
-                state.emitted_samples += int(waveform.numel())
-                decoded[request_id] = waveform
-        return decoded
+        del state.pending_patches[: plan.patch_count]
+        if not state.initial_patch_consumed and not plan.is_last:
+            state.initial_patch_consumed = True
+        if plan.is_last:
+            state.terminal_received = False
+            state.terminal_decoded = True
+        if waveform.numel() == 0:
+            return {}
+        state.emitted_samples += int(waveform.numel())
+        return {request_id: waveform}
 
     def decode_delta(
         self,
