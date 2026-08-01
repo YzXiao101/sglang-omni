@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 from transformers.cache_utils import Cache
@@ -83,57 +83,33 @@ class MingAudioDecoder(torch.nn.Module):
         state: MingAudioDecoderState,
         is_last: bool,
     ) -> torch.Tensor:
-        decoder = self.audio_vae.decoder
         device = self.device
         dtype = self.dtype
         latent_sequence = latent_sequence.to(
             device=device,
             dtype=dtype,
         ).unsqueeze(0)
-        inputs, next_upsample_state = decoder.project_and_upsample_latents(
-            latent_sequence,
-            streaming=True,
-            upsample_state=state.upsample_state,
-            is_last=is_last,
-        )
-
         context = (
             torch.autocast(device_type="cuda", dtype=dtype)
             if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        next_dynamic_cache = state.dynamic_cache
-        next_audio_buffer = state.audio_buffer
-        next_window_buffer = state.window_buffer
         with context:
-            if inputs is None:
-                waveform = torch.empty(
-                    (0,),
-                    device=device,
-                    dtype=dtype,
-                )
-            else:
-                hidden_states, next_dynamic_cache = decoder.decode_qwen_hidden_states(
-                    inputs,
-                    past_key_values=state.dynamic_cache,
-                    use_cache=True,
-                )
-                waveform, next_audio_buffer, next_window_buffer = (
-                    decoder.synthesize_waveform(
-                        hidden_states,
-                        streaming=True,
-                        audio_buffer=state.audio_buffer,
-                        window_buffer=state.window_buffer,
-                        is_last=is_last,
-                    )
-                )
-                waveform = waveform[0, 0].detach()
+            waveform, stream_state, dynamic_cache = self.audio_vae.decode(
+                latent_sequence,
+                past_key_values=state.dynamic_cache,
+                use_cache=True,
+                stream_state=(
+                    state.upsample_state,
+                    state.audio_buffer,
+                    state.window_buffer,
+                ),
+                last_chunk=is_last,
+            )
 
-        state.dynamic_cache = next_dynamic_cache
-        state.upsample_state = next_upsample_state
-        state.audio_buffer = next_audio_buffer
-        state.window_buffer = next_window_buffer
-        return waveform
+        state.dynamic_cache = dynamic_cache
+        state.upsample_state, state.audio_buffer, state.window_buffer = stream_state
+        return waveform[0, 0].detach()
 
     @torch.inference_mode()
     def decode_nonstreaming_batch(
@@ -159,23 +135,12 @@ class MingAudioDecoder(torch.nn.Module):
 
                 latents = latents.to(device=device, dtype=dtype)
                 sequence = latents.reshape(1, -1, latents.shape[-1])
-                inputs, _ = self.audio_vae.decoder.project_and_upsample_latents(
+                waveform, _, _ = self.audio_vae.decode(
                     sequence,
-                    streaming=False,
-                    upsample_state=None,
-                    is_last=True,
-                )
-                hidden_states, _ = self.audio_vae.decoder.decode_qwen_hidden_states(
-                    cast(torch.Tensor, inputs),
                     past_key_values=None,
                     use_cache=False,
-                )
-                waveform, _, _ = self.audio_vae.decoder.synthesize_waveform(
-                    hidden_states,
-                    streaming=False,
-                    audio_buffer=None,
-                    window_buffer=None,
-                    is_last=True,
+                    stream_state=(None, None, None),
+                    last_chunk=True,
                 )
                 waveforms.append(waveform[0, 0].detach())
 
