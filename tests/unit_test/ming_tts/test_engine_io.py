@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang_omni.models.ming_tts import engine_io
+from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoderState
 from sglang_omni.models.ming_tts.engine_io import (
     MingTTSLatentPatch,
     MingTTSSGLangRequestData,
@@ -15,6 +16,9 @@ from sglang_omni.models.ming_tts.engine_io import (
     make_ming_tts_scheduler_adapters,
 )
 from sglang_omni.models.ming_tts.payload_types import MingTTSState
+from sglang_omni.models.ming_tts.streaming_vocoder import (
+    MingTTSStreamingVocoderScheduler,
+)
 from sglang_omni.proto import OmniRequest, StagePayload
 
 
@@ -35,6 +39,17 @@ def _result_adapter(reset_request):
         reset_request=reset_request,
     )
     return result_adapter
+
+
+def _request_adapter():
+    request_adapter, _ = make_ming_tts_scheduler_adapters(
+        model=SimpleNamespace(vocab_size=128),
+        tokenizer=SimpleNamespace(
+            special=SimpleNamespace(end_of_audio=5, audio_patch=3)
+        ),
+        reset_request=lambda _: None,
+    )
+    return request_adapter
 
 
 def _request_data(
@@ -59,6 +74,24 @@ def _request_data(
     )
 
 
+class _FakeStreamingDecoder:
+    sample_rate = 44100
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, bool]] = []
+
+    def decode_streaming_step(
+        self,
+        latent_sequence: torch.Tensor,
+        *,
+        state: MingAudioDecoderState,
+        is_last: bool,
+    ) -> torch.Tensor:
+        del state
+        self.calls.append((latent_sequence.clone(), is_last))
+        return torch.ones(latent_sequence.shape[0], dtype=torch.float32)
+
+
 def test_ming_tts_result_adapter_serializes_empty_latent_output() -> None:
     reset_requests = []
 
@@ -71,6 +104,36 @@ def test_ming_tts_result_adapter_serializes_empty_latent_output() -> None:
     assert restored.completion_tokens == 0
     assert restored.finish_reason == "stop"
     assert reset_requests == ["req-ming-tts"]
+
+
+def test_ming_tts_request_builder_namespaces_cache_by_reference() -> None:
+    request_adapter = _request_adapter()
+
+    def extra_key(request_id: str, speaker: float, latent: float) -> str:
+        state = MingTTSState(
+            text="hello",
+            input_ids=[1, 2, 3],
+            max_decode_steps=2,
+            spk_emb=torch.full((1, 3), speaker),
+            prompt_latent=torch.full((2, 3), latent),
+            spk_injection_positions=[1],
+            prompt_latent_start_position=2,
+            prompt_latent_token_count=2,
+        )
+        data = request_adapter(
+            StagePayload(
+                request_id=request_id,
+                request=OmniRequest(inputs="hello"),
+                data=state.to_dict(),
+            )
+        )
+        return data.req.extra_key
+
+    key = extra_key("reference-a", 1.0, 2.0)
+
+    assert extra_key("reference-b", 1.0, 2.0) == key
+    assert extra_key("speaker-changed", 3.0, 2.0) != key
+    assert extra_key("latent-changed", 1.0, 4.0) != key
 
 
 def test_ming_tts_result_adapter_prefers_stop_head_finish_reason() -> None:
@@ -142,6 +205,35 @@ def test_ming_tts_stream_output_consumes_pending_patch_once() -> None:
     assert messages[0].data.dtype == torch.float32
     assert data.pending_stream_patch is None
     assert build_ming_tts_stream_output("req-ming-tts", data, None) == []
+
+
+def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
+    decoder = _FakeStreamingDecoder()
+    scheduler = MingTTSStreamingVocoderScheduler(
+        decoder,
+        patch_size=2,
+        latent_dim=3,
+        steady_chunk_patches=2,
+    )
+    state = scheduler.create_stream_state("req-ming-tts")
+    participants = [("req-ming-tts", state)]
+
+    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 1.0))
+    scheduler.run_step(participants, scheduler.build_step_plan(participants))
+
+    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 2.0))
+    assert scheduler._step_plan_for_state(state) is None
+
+    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 3.0))
+    state.terminal_received = True
+    scheduler.run_step(participants, scheduler.build_step_plan(participants))
+
+    assert [(tuple(latent.shape), is_last) for latent, is_last in decoder.calls] == [
+        ((2, 3), False),
+        ((4, 3), True),
+    ]
+    assert torch.equal(decoder.calls[1][0][:2], torch.full((2, 3), 2.0))
+    assert torch.equal(decoder.calls[1][0][2:], torch.full((2, 3), 3.0))
 
 
 def test_ming_tts_result_adapter_resets_state_after_serialization_error(

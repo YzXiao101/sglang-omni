@@ -39,10 +39,7 @@ class MingTTSState(DeclarativeStateBase):
     sigma: float = wire(0.25, codec="float")
     temperature: float = wire(0.0, codec="float")
 
-    prompt_text: str | None = None
-    spk_token_positions: list[int] | None = wire(None, codec="list")
     spk_injection_positions: list[int] | None = wire(None, codec="list")
-    audio_token_position: int | None = wire(None, codec="opt_int")
     prompt_latent_start_position: int | None = wire(None, codec="opt_int")
     prompt_latent_token_count: int = wire(0, emit="truthy", codec="int")
     spk_emb: Any | None = wire(None, codec="typed_tensor")
