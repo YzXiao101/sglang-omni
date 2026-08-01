@@ -156,12 +156,22 @@ class MingTTSPipelineConfig(PipelineConfig):
                     )
                 continue
 
+            if stage.tp_size <= 0:
+                raise ValueError(
+                    "Ming-Omni-TTS tts_engine tp_size must be positive; "
+                    f"got tp_size={stage.tp_size}."
+                )
             if stage.tp_size == 1:
                 continue
             if not isinstance(stage.gpu, list):
                 raise ValueError(
                     "Ming-Omni-TTS tts_engine tensor parallelism requires "
                     "gpu=[rank0_gpu, rank1_gpu, ...]."
+                )
+            if len(stage.gpu) != stage.tp_size:
+                raise ValueError(
+                    "Ming-Omni-TTS tts_engine TP GPU list length must match "
+                    f"tp_size; got gpu={stage.gpu!r}, tp_size={stage.tp_size}."
                 )
 
 

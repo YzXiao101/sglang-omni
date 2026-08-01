@@ -518,9 +518,19 @@ class MingTTSModelRunner(ModelRunner):
     def _broadcast_tensor_from_entry(self, tensor: torch.Tensor) -> None:
         import torch.distributed as dist
 
-        tp_group = self.tp_worker.get_tp_group()
-        dist.broadcast(
-            tensor,
-            src=int(tp_group.ranks[0]),
-            group=tp_group.device_group,
-        )
+        tp_group = self._get_tp_group()
+        if tp_group is None:
+            raise RuntimeError("Ming TTS TP broadcast requires a TP group")
+        ranks = getattr(tp_group, "ranks", None)
+        src_rank = int(ranks[0]) if ranks else int(getattr(tp_group, "first_rank", 0))
+        dist_group = getattr(tp_group, "device_group", None)
+        if dist_group is None:
+            dist_group = getattr(tp_group, "group", None)
+        dist.broadcast(tensor, src=src_rank, group=dist_group)
+
+    def _get_tp_group(self) -> Any:
+        getter = getattr(self.tp_worker, "get_tp_group", None)
+        if callable(getter):
+            return getter()
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        return getattr(model_runner, "tp_group", None)

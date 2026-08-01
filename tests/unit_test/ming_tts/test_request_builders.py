@@ -116,13 +116,24 @@ def test_ming_tts_rejects_seed_until_fl_rng_contract_exists(
         )
 
 
-def test_ming_tts_rejects_initial_codec_chunk_frames() -> None:
+@pytest.mark.parametrize(
+    ("params", "tts_params"),
+    [
+        ({}, {"initial_codec_chunk_frames": 1}),
+        ({"initial_codec_chunk_frames": 1}, {}),
+        ({"initial_codec_chunk_frames": 0}, {}),
+    ],
+)
+def test_ming_tts_rejects_initial_codec_chunk_frames(
+    params: dict,
+    tts_params: dict,
+) -> None:
     with pytest.raises(
         ValueError,
         match="does not support initial_codec_chunk_frames",
     ):
         preprocess_ming_tts_payload(
-            _payload(tts_params={"initial_codec_chunk_frames": 1}),
+            _payload(params=params, tts_params=tts_params),
             tokenizer=_tokenizer(),
             context_length=MING_TTS_DEFAULT_MAX_DECODE_STEPS + 64,
         )

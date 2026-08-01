@@ -19,6 +19,7 @@ from sglang_omni.models.ming_tts.payload_types import MingTTSState
 from sglang_omni.models.ming_tts.streaming_vocoder import (
     MingTTSStreamingVocoderScheduler,
 )
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 
 
@@ -215,18 +216,37 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
         latent_dim=3,
         steady_chunk_patches=2,
     )
-    state = scheduler.create_stream_state("req-ming-tts")
-    participants = [("req-ming-tts", state)]
+    request_id = "req-ming-tts"
+    payload = _payload()
+    payload.request.params["stream"] = True
 
-    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 1.0))
-    scheduler.run_step(participants, scheduler.build_step_plan(participants))
+    def stream_item(chunk_id: int, value: float, *, is_last: bool) -> StreamItem:
+        return StreamItem(
+            chunk_id=chunk_id,
+            data=torch.full((2, 3), value),
+            from_stage="tts_engine",
+            metadata={
+                "modality": "audio_codes",
+                "stream": True,
+                "is_last": is_last,
+            },
+        )
 
-    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 2.0))
-    assert scheduler._step_plan_for_state(state) is None
+    scheduler.on_stream_chunk_batch([(request_id, stream_item(0, 1.0, is_last=False))])
+    assert len(decoder.calls) == 1
 
-    scheduler.ingest("req-ming-tts", state, torch.full((2, 3), 3.0))
-    state.terminal_received = True
-    scheduler.run_step(participants, scheduler.build_step_plan(participants))
+    scheduler.on_stream_chunk_batch([(request_id, stream_item(1, 2.0, is_last=False))])
+    assert len(decoder.calls) == 1
+
+    scheduler.on_stream_chunk_batch([(request_id, stream_item(2, 3.0, is_last=True))])
+    state = scheduler._stream_states[request_id]
+    assert state.terminal_decoded is True
+    assert state.emitted_samples == 6
+
+    scheduler._on_done(request_id)
+    assert request_id in scheduler._stream_states
+    assert request_id in scheduler._pending_done
+    scheduler._on_streaming_new_request(request_id, payload)
 
     assert [(tuple(latent.shape), is_last) for latent, is_last in decoder.calls] == [
         ((2, 3), False),
@@ -234,6 +254,13 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
     ]
     assert torch.equal(decoder.calls[1][0][:2], torch.full((2, 3), 2.0))
     assert torch.equal(decoder.calls[1][0][2:], torch.full((2, 3), 3.0))
+    assert request_id not in scheduler._stream_states
+
+    outputs = [scheduler.outbox.get_nowait() for _ in range(3)]
+    assert [output.type for output in outputs] == ["stream", "stream", "result"]
+    assert outputs[-1].data.data["duration_s"] == pytest.approx(6 / 44100)
+    assert "audio_waveform" not in outputs[-1].data.data
+    assert scheduler.outbox.empty()
 
 
 def test_ming_tts_result_adapter_resets_state_after_serialization_error(

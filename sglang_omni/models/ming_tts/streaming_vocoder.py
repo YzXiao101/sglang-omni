@@ -202,7 +202,17 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         *,
         is_final: bool,
     ) -> None:
-        del request_id, state, is_final
+        if not is_final:
+            raise RuntimeError("Ming coalesced pump owns non-final audio decode")
+        if not state.terminal_decoded:
+            raise RuntimeError(
+                f"Ming-Omni-TTS stream {request_id!r} ended without a decoded "
+                "terminal latent patch"
+            )
+        if state.emitted_samples <= 0:
+            raise RuntimeError(
+                f"Ming-Omni-TTS stream {request_id!r} completed without audio"
+            )
 
     def final_result_data(
         self,

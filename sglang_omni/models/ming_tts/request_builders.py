@@ -244,7 +244,12 @@ def preprocess_ming_tts_payload(
             f"Ming-Omni-TTS speed control is currently unsupported; got {speed!r}"
         )
 
-    if tts_params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
+    initial_codec_chunk_frames = first_present(
+        tts_params,
+        params,
+        names=(INITIAL_CODEC_CHUNK_FRAMES_PARAM,),
+    )
+    if initial_codec_chunk_frames is not None:
         raise ValueError(
             "Ming-Omni-TTS does not support initial_codec_chunk_frames because "
             "audio chunks follow the acoustic latent patch size"
