@@ -32,9 +32,13 @@ class _FakeDecoder:
 
 
 class _FailingAudioVAE(torch.nn.Module):
-    def decode(self, *args, **kwargs):
-        del args, kwargs
-        raise AssertionError("empty latents should not call AudioVAE.decode")
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.empty(()))
+
+    @property
+    def decoder(self):
+        raise AssertionError("empty latents should not call the AudioVAE decoder")
 
 
 def test_ming_audio_decoder_skips_audio_vae_for_empty_latents() -> None:
