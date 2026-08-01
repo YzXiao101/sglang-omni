@@ -84,9 +84,11 @@ class MingAudioDecoder(torch.nn.Module):
         is_last: bool,
     ) -> torch.Tensor:
         decoder = self.audio_vae.decoder
+        device = self.device
+        dtype = self.dtype
         latent_sequence = latent_sequence.to(
-            device=self.device,
-            dtype=self.dtype,
+            device=device,
+            dtype=dtype,
         ).unsqueeze(0)
         inputs, next_upsample_state = decoder.project_and_upsample_latents(
             latent_sequence,
@@ -96,9 +98,8 @@ class MingAudioDecoder(torch.nn.Module):
         )
 
         context = (
-            torch.autocast(device_type="cuda", dtype=self.dtype)
-            if self.device.type == "cuda"
-            and self.dtype in (torch.float16, torch.bfloat16)
+            torch.autocast(device_type="cuda", dtype=dtype)
+            if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
         next_dynamic_cache = state.dynamic_cache
@@ -108,8 +109,8 @@ class MingAudioDecoder(torch.nn.Module):
             if inputs is None:
                 waveform = torch.empty(
                     (0,),
-                    device=self.device,
-                    dtype=self.dtype,
+                    device=device,
+                    dtype=dtype,
                 )
             else:
                 hidden_states, next_dynamic_cache = decoder.decode_qwen_hidden_states(
@@ -142,10 +143,11 @@ class MingAudioDecoder(torch.nn.Module):
         if not latent_batches:
             return []
 
+        device = self.device
+        dtype = self.dtype
         context = (
-            torch.autocast(device_type="cuda", dtype=self.dtype)
-            if self.device.type == "cuda"
-            and self.dtype in (torch.float16, torch.bfloat16)
+            torch.autocast(device_type="cuda", dtype=dtype)
+            if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
         waveforms = []
@@ -155,7 +157,7 @@ class MingAudioDecoder(torch.nn.Module):
                     waveforms.append(latents.new_empty((0,), dtype=torch.float32))
                     continue
 
-                latents = latents.to(device=self.device, dtype=self.dtype)
+                latents = latents.to(device=device, dtype=dtype)
                 sequence = latents.reshape(1, -1, latents.shape[-1])
                 inputs, _ = self.audio_vae.decoder.project_and_upsample_latents(
                     sequence,

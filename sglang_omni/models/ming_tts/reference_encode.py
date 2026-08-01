@@ -72,7 +72,7 @@ class _MingTTSReferenceEncodeHook(KeyedReferenceEncodeHook[str, dict, dict]):
         self.model_id = str(model_identity)
         self.encoder_config_hash = (
             f"sr{encoder.sample_rate}:patch{encoder.patch_size}:"
-            f"dtype{encoder._audio_vae_floating_dtype()}"
+            f"dtype{encoder.dtype}"
         )
 
     def normalize_input(self, raw_input: Any) -> str:
@@ -109,6 +109,7 @@ class MingTTSReferenceEncoder:
         self.audio_vae = decoder.audio_vae
         self.sample_rate = int(decoder.sample_rate)
         self.device = decoder.device
+        self.dtype = decoder.dtype
         self.patch_size = int(patch_size)
         self.speaker_encoder = speaker_encoder
         if self.sample_rate != MING_TTS_SAMPLE_RATE:
@@ -206,7 +207,6 @@ class MingTTSReferenceEncoder:
         state.spk_emb = artifact["spk_emb"]
         state.prompt_latent = artifact["prompt_latent"]
         state.prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
-        state.prompt_text = str(state.ref_text)
 
         plan = build_ming_tts_prompt(
             state,
@@ -239,7 +239,7 @@ class MingTTSReferenceEncoder:
                 "Ming-Omni-TTS currently supports only mono reference audio, "
                 f"got shape {tuple(waveform.shape)}"
             )
-        speaker_waveform = waveform.clone()
+        speaker_waveform = waveform
         if int(sample_rate) != self.sample_rate:
             waveform = F.resample(
                 waveform,
@@ -275,14 +275,8 @@ class MingTTSReferenceEncoder:
         # under bf16 autocast, so this split stage must match weight dtype.
         return waveform.to(
             device=self.device,
-            dtype=self._audio_vae_floating_dtype(),
+            dtype=self.dtype,
         )
-
-    def _audio_vae_floating_dtype(self) -> torch.dtype:
-        for parameter in self.audio_vae.parameters():
-            if parameter.is_floating_point():
-                return parameter.dtype
-        return torch.float32
 
 
 __all__ = [
