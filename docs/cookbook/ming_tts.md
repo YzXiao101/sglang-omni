@@ -42,11 +42,12 @@ sgl-omni serve \
   --port 8000
 ```
 
-The provided configuration enables the AR, acoustic-tail, and AudioVAE CUDA graphs. Streaming
-and prompt radix caching remain opt-in: requests are non-streaming unless `stream` is set, and
-`disable_radix_cache` is `true` in the TTS engine configuration. To reuse matching text or
-reference-conditioned prompt prefixes, set `disable_radix_cache` to `false`. Generated acoustic
-history is never inserted into the radix tree.
+The provided configuration enables the AR and acoustic-tail CUDA graphs. AudioVAE decode remains
+eager. Streaming and prompt radix caching remain opt-in: requests are non-streaming unless
+`stream` is set, and `disable_radix_cache` is `true` in the TTS engine configuration. To reuse
+matching text or reference-conditioned prompt prefixes, set `disable_radix_cache` to `false`.
+Generated acoustic history is never inserted into the radix tree. Reference encoding has a
+separate content cache enabled by default; it is independent of the AR prompt radix cache.
 
 ## Synthesizing Speech
 
@@ -97,10 +98,11 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Streaming
 
-Streaming responses use raw 44.1 kHz PCM and emit audio as acoustic latent patches are decoded.
-The first chunk contains one latent patch. Later chunks follow
-`audio_vae_steady_chunk_patches`, which is configured for the pipeline rather
-than per request.
+Streaming responses use raw signed 16-bit 44.1 kHz PCM. The decoder first consumes one latent
+patch to prime AudioVAE lookahead, which normally emits no user-visible audio. It then decodes
+groups of `audio_vae_steady_chunk_patches` patches; the provided configuration uses two. The
+terminal step flushes any remaining patches immediately. This cadence is configured for the
+pipeline rather than per request.
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -142,6 +144,9 @@ Advanced FlowLoss controls can be passed through `stage_params.tts_engine`:
 }
 ```
 
+`cfg` must be positive and cannot equal `1.0`; `sigma` and `temperature` must be
+non-negative.
+
 ## Benchmarking
 
 The reference serving configuration uses Seed-TTS-Eval with concurrency 8. Run generation
@@ -155,7 +160,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --meta zhaochenyang20/seed-tts-eval-arrow \
   --output-dir results/ming_tts_reference_en \
   --lang en --ref-format references \
-  --max-new-tokens 256 --max-concurrency 8 --warmup 0
+  --max-new-tokens 256 --max-concurrency 8 --warmup 8
 ```
 
 Use `--no-ref-audio` for text-only synthesis. Use `--lang zh` and a different output directory
@@ -182,30 +187,30 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 ### Recommended Single-H200 TP1
 
 The recommended TP1 configuration was evaluated on **1× H200 141 GB** with concurrency 8,
-eight warmup requests, and the full Seed-TTS-Eval EN and ZH splits. AR, acoustic-tail, and
-AudioVAE CUDA graphs were enabled, while prompt radix caching was disabled.
+eight warmup requests, and the full Seed-TTS-Eval EN and ZH splits. AR and acoustic-tail CUDA
+graphs were enabled, while AudioVAE decode remained eager and prompt radix caching was disabled.
 
 Streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | First Audio Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.92% | 0.3091 | 1.390 | 0.5393 | 5.747 | 27.188 |
-| text-only | ZH | 2020 | 0 | 0.73% | 0.2836 | 1.388 | 0.5188 | 5.757 | 28.895 |
-| reference | EN | 1088 | 0 | 1.21% | 0.3588 | 1.539 | 0.6620 | 5.195 | 23.448 |
-| reference | ZH | 2020 | 0 | 0.71% | 0.2869 | 1.617 | 0.6307 | 4.941 | 28.296 |
+| text-only | EN | 1088 | 0 | 0.93% | 0.3377 | 1.543 | 0.5285 | 5.174 | 24.428 |
+| text-only | ZH | 2020 | 0 | 0.70% | 0.3368 | 1.659 | 0.5250 | 4.818 | 24.199 |
+| reference | EN | 1088 | 0 | 1.03% | 0.3770 | 1.650 | 0.6327 | 4.844 | 22.038 |
+| reference | ZH | 2020 | 0 | 0.71% | 0.3467 | 1.961 | 0.6188 | 4.076 | 23.365 |
 
 Non-streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.91% | 0.1998 | 0.947 | 8.440 | 40.089 |
-| text-only | ZH | 2020 | 0 | 0.68% | 0.1932 | 0.969 | 8.252 | 41.403 |
-| reference | EN | 1088 | 0 | 1.09% | 0.2339 | 1.042 | 7.665 | 34.560 |
-| reference | ZH | 2020 | 0 | 0.68% | 0.1992 | 1.141 | 7.002 | 40.221 |
+| text-only | EN | 1088 | 0 | 0.95% | 0.2155 | 1.011 | 7.898 | 37.220 |
+| text-only | ZH | 2020 | 0 | 0.69% | 0.2084 | 1.042 | 7.669 | 38.478 |
+| reference | EN | 1088 | 0 | 1.17% | 0.2342 | 1.048 | 7.623 | 34.592 |
+| reference | ZH | 2020 | 0 | 0.72% | 0.2005 | 1.148 | 6.958 | 39.986 |
 
-All 12,432 requests completed successfully. Reference EN corpus WER includes a small
+All 12,432 requests completed successfully. Reference corpus WER includes a small
 near-silent tail from unseeded acoustic sampling. Streaming returned its first audio
-payload in 0.52-0.66 seconds, while non-streaming retained higher complete-response
+payload in 0.53-0.63 seconds, while non-streaming retained higher complete-response
 throughput.
 
 ## Known Limitations
@@ -219,6 +224,7 @@ throughput.
   are not yet exposed.
 - **Generation controls.** Request-local `seed`, logits sampling fields (`top_p`, `top_k`,
   `repetition_penalty`), named voices, explicit language selection, instructions, and duration
-  control are not yet exposed.
+  control are not yet exposed. `initial_codec_chunk_frames` is rejected because AudioVAE cadence
+  is a pipeline-level setting.
 - **Checkpoint coverage.** The provided configuration targets the 16.8B-A3B checkpoint. A
   configuration for the 0.5B checkpoint has not yet been added.

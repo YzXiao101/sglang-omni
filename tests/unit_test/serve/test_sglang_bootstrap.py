@@ -74,6 +74,7 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
     monkeypatch,
 ) -> None:
     events: list[str] = []
+    disable_finished_insert_values: list[bool] = []
     monkeypatch.setattr(
         bootstrap,
         "_describe_sglang_runtime_configuration",
@@ -116,13 +117,20 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
         def __init__(self, **kwargs) -> None:
             del kwargs
 
+    def fake_create_tree_cache(
+        *args,
+        disable_finished_insert: bool = False,
+    ):
+        disable_finished_insert_values.append(disable_finished_insert)
+        return "tree_cache", args
+
     monkeypatch.setattr(model_worker_module, "ModelWorker", FakeWorker)
     monkeypatch.setattr(sglang_backend, "PrefillManager", FakePrefillManager)
     monkeypatch.setattr(sglang_backend, "DecodeManager", FakeDecodeManager)
     monkeypatch.setattr(
         sglang_backend,
         "create_tree_cache",
-        lambda *args: ("tree_cache", args),
+        fake_create_tree_cache,
     )
 
     server_args = SimpleNamespace(
@@ -145,6 +153,7 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
         "init_cuda_graphs",
         "get_memory_pool",
     ]
+    assert disable_finished_insert_values == [False]
     assert infrastructure[0].model_runner.model is FakeRunner.model
 
 
