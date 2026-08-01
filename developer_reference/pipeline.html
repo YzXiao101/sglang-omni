@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -220,6 +220,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fun_asr.html">Fun-ASR-Nano</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/arkasr.html">ARK-ASR-3B</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
@@ -230,6 +231,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/qwen3_omni.html">Omni Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/omni_router.html">Omni Router Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
@@ -590,9 +592,11 @@ same surface.</p>
 <h3>OmniScheduler<a class="headerlink" href="#omnischeduler" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">OmniScheduler</span></code> is used by autoregressive stages. It composes with SGLang’s
 upstream scheduler. The goal is to reuse SGLang’s
-batch selection, KV cache management, prefill/decode scheduling, tree cache, and
-overlap scheduling while keeping SGLang-Omni’s transport, request objects, and
-streaming behavior outside the upstream scheduler.</p>
+batch selection, KV cache management, prefill/decode scheduling, and tree cache
+while keeping SGLang-Omni’s transport, request objects, and streaming behavior
+outside the upstream scheduler. (Overlap scheduling is explicitly unsupported:
+<code class="docutils literal notranslate"><span class="pre">OmniScheduler._event_loop_overlap</span></code> refuses to run because the
+<code class="docutils literal notranslate"><span class="pre">Req.inflight_middle_chunks</span></code> decrement would lag one iteration on that loop.)</p>
 </section>
 <section id="simplescheduler">
 <h3>SimpleScheduler<a class="headerlink" href="#simplescheduler" title="Link to this heading">#</a></h3>
@@ -748,7 +752,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 28, 2026.
+  Last updated on Aug 01, 2026.
   <br/>
 </p>
   </div>

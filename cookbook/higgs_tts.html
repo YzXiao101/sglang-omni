@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 28, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -220,6 +220,7 @@
 <li class="toctree-l1"><a class="reference internal" href="zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fun_asr.html">Fun-ASR-Nano</a></li>
+<li class="toctree-l1"><a class="reference internal" href="arkasr.html">ARK-ASR-3B</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Qwen3-Omni</a></li>
@@ -230,6 +231,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/qwen3_omni.html">Omni Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/omni_router.html">Omni Router Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
@@ -759,11 +761,12 @@ headers.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">-N</span></code> flag disables curl’s output buffering so chunks are written as they arrive.</p>
 <p>Streaming returns <code class="docutils literal notranslate"><span class="pre">audio/pcm</span></code> 16-bit mono PCM bytes. It has no in-band JSON
 events, final usage event, or terminal sentinel. The response headers report the
-actual stream sample rate, channel count, and bit depth. Streaming speech
-requests default <code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> for lower first-audio
-latency. Clients can still set another value, including <code class="docutils literal notranslate"><span class="pre">0</span></code>. The setting
-controls only the first vocoder chunk for TTFA tuning. Follow-up chunks return
-to the normal Higgs streaming window.</p>
+actual stream sample rate, channel count, and bit depth. Higgs defaults
+<code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code> to <code class="docutils literal notranslate"><span class="pre">20</span></code>; with eight codebooks, the AR producer
+flushes the corresponding delayed-code rows at row 27. Clients can still set
+another value, including <code class="docutils literal notranslate"><span class="pre">0</span></code> to use the steady chunk size from the start. The
+producer and vocoder share the effective value, and it controls only the first
+chunk. Follow-up chunks return to the normal Higgs streaming window.</p>
 <ol class="arabic simple" start="2">
 <li><p>Use Python</p></li>
 </ol>
@@ -1465,7 +1468,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 28, 2026.
+  Last updated on Aug 01, 2026.
   <br/>
 </p>
   </div>
