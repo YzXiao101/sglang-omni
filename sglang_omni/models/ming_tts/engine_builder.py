@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang_omni.models.ming_omni.tp_utils import validate_attention_tp_config
+from sglang_omni.models.ming_tts.config import MING_TTS_DEFAULT_DISABLE_RADIX_CACHE
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_bs
 
@@ -25,6 +26,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         tp_rank: int = 0,
         tp_size: int = 1,
         nccl_port: int | None = None,
+        expected_disable_radix_cache: bool = MING_TTS_DEFAULT_DISABLE_RADIX_CACHE,
     ) -> None:
         from sglang_omni.models.ming_tts.hf_config import MING_TTS_MODEL_ARCH_OVERRIDE
 
@@ -48,6 +50,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.nccl_port = nccl_port
+        self.expected_disable_radix_cache = expected_disable_radix_cache
         self.config: Any = None
         self.tokenizer: Any = None
         self._model_runner: Any = None
@@ -96,7 +99,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             "dtype": dtype,
             "disable_cuda_graph": True,
             "disable_overlap_schedule": True,
-            "disable_radix_cache": True,
+            "disable_radix_cache": MING_TTS_DEFAULT_DISABLE_RADIX_CACHE,
             "enable_torch_compile": False,
             "max_prefill_tokens": min(int(self.context_length), 8192),
             "sampling_backend": "pytorch",
@@ -118,6 +121,16 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         overrides["chunked_prefill_size"] = 0
         if bool(overrides.get("enable_torch_compile", False)):
             raise ValueError("Ming-Omni-TTS torch.compile is not currently supported")
+
+    def customize_server_args(self, server_args: Any) -> None:
+        disable_radix_cache = bool(server_args.disable_radix_cache)
+        if disable_radix_cache != self.expected_disable_radix_cache:
+            raise ValueError(
+                "Ming-Omni-TTS resolved disable_radix_cache conflicts with "
+                "the pipeline reference-stage policy: "
+                f"actual={disable_radix_cache}, "
+                f"expected={self.expected_disable_radix_cache}"
+            )
 
     def infra_kwargs(self) -> dict[str, Any]:
         return {
@@ -186,6 +199,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             model=model,
             tokenizer=self.tokenizer,
             reset_request=self._model_runner.reset_request,
+            prompt_radix_cache_enabled=not self.expected_disable_radix_cache,
             owns_acoustic_result=self.tp_rank == 0,
         )
 
