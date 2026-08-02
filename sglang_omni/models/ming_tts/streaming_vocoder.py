@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import torch
 
@@ -28,17 +28,10 @@ class _StreamState:
     pending_patches: list[torch.Tensor] = field(default_factory=list)
     terminal_received: bool = False
     initial_patch_consumed: bool = False
-    terminal_decoded: bool = False
     emitted_samples: int = 0
 
 
-@dataclass(frozen=True)
-class _StepPlan:
-    patch_count: int
-    is_last: bool
-
-
-class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepPlan]):
+class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None]):
     """Decode Ming acoustic latents with request-local AudioVAE state."""
 
     def __init__(
@@ -54,8 +47,6 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         self._patch_size = int(patch_size)
         self._latent_dim = int(latent_dim)
         self._steady_chunk_patches = int(steady_chunk_patches)
-        self._can_batch_stream_chunks = True
-        self._stream_chunk_batch_max = 1
         super().__init__(
             partial(
                 decode_ming_tts_audio_payload,
@@ -89,7 +80,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
                 f"Ming-Omni-TTS stream chunk for {request_id!r} has "
                 f"chunk_id={item.chunk_id}, expected {state.expected_chunk_id}"
             )
-        if state.terminal_received or state.terminal_decoded:
+        if state.terminal_received:
             raise ValueError(
                 f"Ming-Omni-TTS stream chunk arrived after the terminal patch "
                 f"for {request_id!r}"
@@ -140,60 +131,12 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         del request_id
         state.pending_patches.append(codes)
 
-    def _step_plan_for_state(self, state: _StreamState) -> _StepPlan | None:
+    def should_decode(self, state: _StreamState, *, is_final: bool) -> bool:
+        del is_final
         if state.terminal_received:
-            patch_count = len(state.pending_patches)
-            is_last = True
-        else:
-            target = self._steady_chunk_patches if state.initial_patch_consumed else 1
-            if len(state.pending_patches) < target:
-                return None
-            patch_count = target
-            is_last = False
-
-        return _StepPlan(
-            patch_count=patch_count,
-            is_last=is_last,
-        )
-
-    def select_step_participants(self) -> list[tuple[str, _StreamState]]:
-        for request_id, state in self._stream_state_items():
-            if self._step_plan_for_state(state) is not None:
-                return [(request_id, state)]
-        return []
-
-    def build_step_plan(
-        self,
-        participants: list[tuple[str, _StreamState]],
-    ) -> _StepPlan:
-        return cast(_StepPlan, self._step_plan_for_state(participants[0][1]))
-
-    def run_step(
-        self,
-        participants: list[tuple[str, _StreamState]],
-        plan: _StepPlan,
-    ) -> dict[str, torch.Tensor]:
-        request_id, state = participants[0]
-        latent_sequence = torch.cat(
-            state.pending_patches[: plan.patch_count],
-            dim=0,
-        )
-        waveform = self._decoder.decode_streaming_step(
-            latent_sequence,
-            state=state.decoder_state,
-            is_last=plan.is_last,
-        )
-
-        del state.pending_patches[: plan.patch_count]
-        if not state.initial_patch_consumed and not plan.is_last:
-            state.initial_patch_consumed = True
-        if plan.is_last:
-            state.terminal_received = False
-            state.terminal_decoded = True
-        if waveform.numel() == 0:
-            return {}
-        state.emitted_samples += int(waveform.numel())
-        return {request_id: waveform}
+            return True
+        target = self._steady_chunk_patches if state.initial_patch_consumed else 1
+        return len(state.pending_patches) >= target
 
     def decode_delta(
         self,
@@ -201,18 +144,43 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, _StepP
         state: _StreamState,
         *,
         is_final: bool,
-    ) -> None:
-        if not is_final:
-            raise RuntimeError("Ming coalesced pump owns non-final audio decode")
-        if not state.terminal_decoded:
-            raise RuntimeError(
-                f"Ming-Omni-TTS stream {request_id!r} ended without a decoded "
-                "terminal latent patch"
+    ) -> torch.Tensor | None:
+        if is_final:
+            if not state.terminal_received:
+                raise RuntimeError(
+                    f"Ming-Omni-TTS stream {request_id!r} ended without a decoded "
+                    "terminal latent patch"
+                )
+            if state.emitted_samples <= 0:
+                raise RuntimeError(
+                    f"Ming-Omni-TTS stream {request_id!r} completed without audio"
+                )
+            return None
+
+        terminal = state.terminal_received
+        if terminal:
+            patch_count = len(state.pending_patches)
+        else:
+            patch_count = (
+                self._steady_chunk_patches if state.initial_patch_consumed else 1
             )
-        if state.emitted_samples <= 0:
-            raise RuntimeError(
-                f"Ming-Omni-TTS stream {request_id!r} completed without audio"
-            )
+        latent_sequence = torch.cat(
+            state.pending_patches[:patch_count],
+            dim=0,
+        )
+        waveform = self._decoder.decode_streaming_step(
+            latent_sequence,
+            state=state.decoder_state,
+            is_last=terminal,
+        )
+
+        del state.pending_patches[:patch_count]
+        if not state.initial_patch_consumed and not terminal:
+            state.initial_patch_consumed = True
+        if waveform.numel() == 0:
+            return None
+        state.emitted_samples += int(waveform.numel())
+        return waveform
 
     def final_result_data(
         self,
