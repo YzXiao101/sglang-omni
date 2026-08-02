@@ -112,12 +112,12 @@ class MingAudioDecoder(torch.nn.Module):
         return waveform[0, 0].detach()
 
     @torch.inference_mode()
-    def decode_nonstreaming_batch(
+    def decode_nonstreaming(
         self,
-        latent_batches: list[torch.Tensor],
-    ) -> list[torch.Tensor]:
-        if not latent_batches:
-            return []
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        if int(latents.shape[0]) == 0:
+            return latents.new_empty((0,), dtype=torch.float32)
 
         device = self.device
         dtype = self.dtype
@@ -126,25 +126,18 @@ class MingAudioDecoder(torch.nn.Module):
             if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        waveforms = []
         with context:
-            for latents in latent_batches:
-                if int(latents.shape[0]) == 0:
-                    waveforms.append(latents.new_empty((0,), dtype=torch.float32))
-                    continue
+            latents = latents.to(device=device, dtype=dtype)
+            sequence = latents.reshape(1, -1, latents.shape[-1])
+            waveform, _, _ = self.audio_vae.decode(
+                sequence,
+                past_key_values=None,
+                use_cache=False,
+                stream_state=(None, None, None),
+                last_chunk=True,
+            )
 
-                latents = latents.to(device=device, dtype=dtype)
-                sequence = latents.reshape(1, -1, latents.shape[-1])
-                waveform, _, _ = self.audio_vae.decode(
-                    sequence,
-                    past_key_values=None,
-                    use_cache=False,
-                    stream_state=(None, None, None),
-                    last_chunk=True,
-                )
-                waveforms.append(waveform[0, 0].detach())
-
-        return waveforms
+        return waveform[0, 0].detach()
 
 
 def decode_ming_tts_audio_payload(
@@ -156,7 +149,7 @@ def decode_ming_tts_audio_payload(
     """Decode generated acoustic latents into the terminal waveform payload."""
 
     state = load_ming_tts_state(payload)
-    waveform = decoder.decode_nonstreaming_batch([state.generated_latents])[0]
+    waveform = decoder.decode_nonstreaming(state.generated_latents)
     state.sample_rate = int(decoder.sample_rate)
     state.duration_s = float(waveform.numel() / int(decoder.sample_rate))
     if not keep_latents:

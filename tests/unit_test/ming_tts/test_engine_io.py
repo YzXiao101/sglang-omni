@@ -124,22 +124,16 @@ def test_ming_tts_result_adapter_serializes_empty_latent_output() -> None:
     assert reset_requests == ["req-ming-tts"]
 
 
-def test_ming_tts_request_builder_skips_radix_key_hash_when_disabled(
-    monkeypatch,
-) -> None:
-    def fail_hash(*_args, **_kwargs):
-        raise AssertionError("Radix-key hashing must be disabled")
-
-    monkeypatch.setattr(engine_io.hashlib, "blake2b", fail_hash)
+def test_ming_tts_request_builder_preserves_prompt_ids_when_cache_disabled() -> None:
     states = [
         MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2),
         MingTTSState(
             text="hello",
             ref_audio="ref.wav",
-            input_ids=[1, 2, 3],
+            input_ids=[11, 3, 3, 3],
             max_decode_steps=2,
             spk_emb=torch.full((1, 3), 1.0),
-            prompt_latent=torch.full((1, 2, 3), 2.0),
+            prompt_latent=torch.full((1, 4, 3), 2.0),
             spk_injection_positions=[1],
             prompt_latent_start_position=2,
             prompt_latent_token_count=2,
@@ -153,51 +147,61 @@ def test_ming_tts_request_builder_skips_radix_key_hash_when_disabled(
             prompt_radix_cache_enabled=False,
         )
         assert data.req.extra_key is None
+        assert list(data.req.origin_input_ids) == state.input_ids
+        assert data.input_ids.tolist() == state.input_ids
 
 
-def test_ming_tts_request_builder_namespaces_enabled_prompt_cache() -> None:
+def test_ming_tts_request_builder_namespaces_text_prompt_cache() -> None:
     text = MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2)
+    data = _adapt_state(
+        text,
+        request_id="text",
+        prompt_radix_cache_enabled=True,
+    )
+
+    assert data.req.extra_key == "ming-tts:prompt:v3:text"
+    assert list(data.req.origin_input_ids) == [1, 2, 3]
+    assert data.input_ids.tolist() == [1, 2, 3]
+
+
+def test_ming_tts_request_builder_tags_reference_prompt_cache_rows() -> None:
+    actual_ids = [11, 3, 3, 3]
 
     def reference_state(marker: int) -> MingTTSState:
         return MingTTSState(
             text="hello",
             ref_audio=f"ref-{marker}.wav",
-            input_ids=[1, 2, 3],
+            input_ids=actual_ids,
             max_decode_steps=2,
             spk_emb=torch.full((1, 3), float(marker)),
-            prompt_latent=torch.full((1, 2, 3), float(marker + 1)),
+            prompt_latent=torch.full((1, 4, 3), float(marker + 1)),
             prompt_conditioning_digest=f"conditioning-{marker}",
             spk_injection_positions=[1],
             prompt_latent_start_position=2,
             prompt_latent_token_count=2,
         )
 
-    text_key = _adapt_state(
-        text,
-        request_id="text",
-        prompt_radix_cache_enabled=True,
-    ).req.extra_key
-    reference_key = _adapt_state(
+    reference = _adapt_state(
         reference_state(1),
         request_id="reference-a",
         prompt_radix_cache_enabled=True,
-    ).req.extra_key
-    repeated_key = _adapt_state(
+    )
+    repeated = _adapt_state(
         reference_state(1),
         request_id="reference-a-repeat",
         prompt_radix_cache_enabled=True,
-    ).req.extra_key
-    other_key = _adapt_state(
+    )
+    other = _adapt_state(
         reference_state(2),
         request_id="reference-b",
         prompt_radix_cache_enabled=True,
-    ).req.extra_key
+    )
 
-    assert text_key == "ming-tts:prompt:v2:text"
-    assert reference_key is not None
-    assert reference_key.startswith("ming-tts:prompt:v2:reference:")
-    assert repeated_key == reference_key
-    assert other_key != reference_key
+    assert reference.req.extra_key == ("ming-tts:prompt:v3:reference:conditioning-1")
+    assert repeated.req.extra_key == reference.req.extra_key
+    assert other.req.extra_key == "ming-tts:prompt:v3:reference:conditioning-2"
+    assert reference.input_ids.tolist() == actual_ids
+    assert list(reference.req.origin_input_ids) == [11, 128, 129, 131]
 
 
 @pytest.mark.parametrize(
