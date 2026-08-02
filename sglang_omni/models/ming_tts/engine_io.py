@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
 
@@ -21,7 +19,7 @@ from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
-_PROMPT_CACHE_SCHEMA = "ming-tts:prompt:v2"
+_PROMPT_CACHE_SCHEMA = "ming-tts:prompt:v3"
 
 
 @dataclass
@@ -78,17 +76,7 @@ def _prompt_cache_extra_key(
             "prompt cache digest while Radix cache is enabled"
         )
 
-    metadata = {
-        "speaker_positions": state.spk_injection_positions,
-        "latent_start": state.prompt_latent_start_position,
-        "latent_tokens": state.prompt_latent_token_count,
-    }
-    digest = hashlib.blake2b(digest_size=16)
-    digest.update(producer_digest.encode("ascii"))
-    digest.update(
-        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
-    return f"{_PROMPT_CACHE_SCHEMA}:reference:{digest.hexdigest()}"
+    return f"{_PROMPT_CACHE_SCHEMA}:reference:{producer_digest}"
 
 
 def make_ming_tts_scheduler_adapters(
@@ -120,19 +108,36 @@ def make_ming_tts_scheduler_adapters(
         requires_projected_prefill = (
             state.spk_emb is not None or state.prompt_latent is not None
         )
+        extra_key = _prompt_cache_extra_key(
+            state,
+            enabled=prompt_radix_cache_enabled,
+            request_id=payload.request_id,
+        )
+        # Note (yzxiao): origin_input_ids is the Radix identity, while
+        # data.input_ids below keeps the actual ids used to build projected
+        # embeddings. Row tags prevent conditioning rows from aliasing ordinary
+        # audio-patch tokens in the cache.
+        radix_input_ids = input_ids_list
+        if prompt_radix_cache_enabled and state.ref_audio is not None:
+            radix_input_ids = input_ids_list.copy()
+            speaker_positions = cast(list[int], state.spk_injection_positions)
+            for speaker_row, position in enumerate(speaker_positions):
+                radix_input_ids[position] = vocab_size + 2 * speaker_row
+
+            latent_start = cast(int, state.prompt_latent_start_position)
+            for latent_offset in range(state.prompt_latent_token_count):
+                radix_input_ids[latent_start + latent_offset] = (
+                    vocab_size + 2 * latent_offset + 1
+                )
 
         req = Req(
             rid=payload.request_id,
             origin_input_text="",
-            origin_input_ids=input_ids_list,
+            origin_input_ids=radix_input_ids,
             sampling_params=sampling_params,
             eos_token_ids={int(tokenizer.special.end_of_audio)},
             vocab_size=vocab_size,
-            extra_key=_prompt_cache_extra_key(
-                state,
-                enabled=prompt_radix_cache_enabled,
-                request_id=payload.request_id,
-            ),
+            extra_key=extra_key,
         )
         req.tokenizer = None
         req._input_embeds_are_projected = requires_projected_prefill

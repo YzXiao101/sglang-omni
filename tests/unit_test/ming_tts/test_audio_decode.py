@@ -26,14 +26,13 @@ class _FakeDecoder:
     def __init__(self) -> None:
         self.calls = 0
 
-    def decode_nonstreaming_batch(
+    def decode_nonstreaming(
         self,
-        latent_batches: list[torch.Tensor],
-    ) -> list[torch.Tensor]:
-        assert len(latent_batches) == 1
-        assert latent_batches[0].shape == (0, 2, 3)
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        assert latents.shape == (0, 2, 3)
         self.calls += 1
-        return [torch.empty((0,), dtype=torch.float32)]
+        return torch.empty((0,), dtype=torch.float32)
 
 
 class _FailingAudioVAE(torch.nn.Module):
@@ -49,13 +48,10 @@ class _FailingAudioVAE(torch.nn.Module):
 def test_ming_audio_decoder_skips_audio_vae_for_empty_latents() -> None:
     decoder = MingAudioDecoder(_FailingAudioVAE(), sample_rate=44100)
 
-    waveforms = decoder.decode_nonstreaming_batch(
-        [torch.empty((0, 2, 3), dtype=torch.float32)]
-    )
+    waveform = decoder.decode_nonstreaming(torch.empty((0, 2, 3), dtype=torch.float32))
 
-    assert len(waveforms) == 1
-    assert waveforms[0].shape == (0,)
-    assert waveforms[0].dtype == torch.float32
+    assert waveform.shape == (0,)
+    assert waveform.dtype == torch.float32
 
 
 def test_ming_audio_decoder_incremental_matches_full_sequence_on_cpu() -> None:
@@ -98,7 +94,7 @@ def test_ming_audio_decoder_incremental_matches_full_sequence_on_cpu() -> None:
         decoder = MingAudioDecoder(AudioVAE(config).eval(), sample_rate=44100)
         latents = torch.randn(5, 4, 4)
 
-        full = decoder.decode_nonstreaming_batch([latents])[0]
+        full = decoder.decode_nonstreaming(latents)
         state = MingAudioDecoderState()
         incremental_parts = [
             decoder.decode_streaming_step(

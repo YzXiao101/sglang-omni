@@ -46,17 +46,22 @@ def _make_radix_cache() -> tuple[RadixCache, ReqToTokenPool]:
 def _build_reference_request(
     request_id: str,
     marker: int,
+    *,
+    input_ids: list[int] | None = None,
+    latent_start: int = 2,
 ) -> MingTTSSGLangRequestData:
+    if input_ids is None:
+        input_ids = [11, 3, 3, 3]
     state = MingTTSState(
         text="hello",
         ref_audio=f"ref-{marker}.wav",
-        input_ids=[11, 12, 13, 14],
+        input_ids=input_ids,
         max_decode_steps=4,
         spk_emb=torch.full((1, 3), float(marker)),
-        prompt_latent=torch.full((1, 2, 3), float(marker + 1)),
+        prompt_latent=torch.full((1, 4, 3), float(marker + 1)),
         prompt_conditioning_digest=f"conditioning-{marker}",
         spk_injection_positions=[1],
-        prompt_latent_start_position=2,
+        prompt_latent_start_position=latent_start,
         prompt_latent_token_count=2,
     )
     request_builder, _ = make_ming_tts_scheduler_adapters(
@@ -107,6 +112,8 @@ def test_ming_tts_prompt_cache_populates_reuses_and_isolates_reference() -> None
 
     assert cache.total_size() == prompt_len
     assert list(first.req.get_fill_ids()) == list(first.req.origin_input_ids)
+    assert first.input_ids.tolist() == [11, 3, 3, 3]
+    assert list(first.req.origin_input_ids) == [11, 128, 129, 131]
 
     repeated = _build_reference_request("reference-a-repeat", marker=1)
     repeated.req.init_next_round_input(cache)
@@ -116,6 +123,60 @@ def test_ming_tts_prompt_cache_populates_reuses_and_isolates_reference() -> None
     assert other.req.origin_input_ids == repeated.req.origin_input_ids
     other.req.init_next_round_input(cache)
     assert len(other.req.prefix_indices) == 0
+
+
+def test_ming_tts_prompt_cache_reuses_prefix_before_target_layout_diverges() -> None:
+    cache, req_to_token_pool = _make_radix_cache()
+    short = _build_reference_request(
+        "short-target",
+        marker=1,
+        input_ids=[10, 3, 20, 30, 3, 3],
+        latent_start=4,
+    )
+    _cache_initial_prompt(short, cache, req_to_token_pool)
+
+    long = _build_reference_request(
+        "long-target",
+        marker=1,
+        input_ids=[10, 3, 20, 40, 30, 3, 3],
+        latent_start=5,
+    )
+    match = cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(long.req.origin_input_ids, long.req.extra_key),
+        )
+    )
+
+    assert list(short.req.origin_input_ids) == [10, 128, 20, 30, 129, 131]
+    assert list(long.req.origin_input_ids) == [10, 128, 20, 40, 30, 129, 131]
+    assert len(match.device_indices) == 3
+
+
+def test_ming_tts_prompt_cache_distinguishes_literal_and_conditioning_rows() -> None:
+    cache, req_to_token_pool = _make_radix_cache()
+    conditioned = _build_reference_request(
+        "conditioned-row",
+        marker=1,
+        input_ids=[10, 3, 20, 3, 3],
+        latent_start=3,
+    )
+    _cache_initial_prompt(conditioned, cache, req_to_token_pool)
+
+    literal = _build_reference_request(
+        "literal-audio-patch",
+        marker=1,
+        input_ids=[10, 3, 20, 3, 4, 3, 3],
+        latent_start=5,
+    )
+    match = cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(literal.req.origin_input_ids, literal.req.extra_key),
+        )
+    )
+
+    assert list(conditioned.req.origin_input_ids) == [10, 128, 20, 129, 131]
+    assert list(literal.req.origin_input_ids) == [10, 128, 20, 3, 4, 129, 131]
+    assert len(match.device_indices) == 3
 
 
 def test_ming_tts_retraction_does_not_extend_prompt_cache() -> None:
