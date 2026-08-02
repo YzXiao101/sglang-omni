@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
+from sglang_omni.models.ming_tts.config import MING_TTS_DEFAULT_DISABLE_RADIX_CACHE
 from sglang_omni.models.ming_tts.hf_config import (
     MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     register_ming_tts_hf_config,
@@ -58,6 +59,7 @@ def create_sglang_tts_engine_executor(
     tp_rank: int = 0,
     tp_size: int = 1,
     nccl_port: int | None = None,
+    expected_disable_radix_cache: bool = MING_TTS_DEFAULT_DISABLE_RADIX_CACHE,
 ) -> Any:
     from sglang_omni.models.ming_tts.engine_builder import MingTtsEngineBuilder
 
@@ -75,6 +77,7 @@ def create_sglang_tts_engine_executor(
         tp_rank=tp_rank,
         tp_size=tp_size,
         nccl_port=nccl_port,
+        expected_disable_radix_cache=expected_disable_radix_cache,
     ).build(
         model_path,
         device=device,
@@ -95,6 +98,7 @@ def create_reference_encode_executor(
     ref_audio_cache: bool = True,
     ref_audio_cache_max_items: int = 256,
     ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
+    compute_prompt_cache_digest: bool = False,
 ) -> SimpleScheduler:
     from sglang_omni.models.ming_tts.reference_encode import MingTTSReferenceEncoder
 
@@ -121,6 +125,7 @@ def create_reference_encode_executor(
         ref_audio_cache=ref_audio_cache,
         ref_audio_cache_max_items=ref_audio_cache_max_items,
         ref_audio_cache_max_bytes=ref_audio_cache_max_bytes,
+        compute_prompt_cache_digest=compute_prompt_cache_digest,
     )
     report = load_ming_tts_audio_vae_weights(checkpoint_dir, encoder.audio_vae)
     logger.info("%s", report.summary())

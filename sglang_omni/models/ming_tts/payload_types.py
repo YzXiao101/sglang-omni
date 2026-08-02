@@ -44,6 +44,7 @@ class MingTTSState(DeclarativeStateBase):
     prompt_latent_token_count: int = wire(0, emit="truthy", codec="int")
     spk_emb: Any | None = wire(None, codec="typed_tensor")
     prompt_latent: Any | None = wire(None, codec="typed_tensor")
+    prompt_conditioning_digest: str | None = wire(None, codec="str")
 
     generated_latents: Any | None = wire(None, codec="typed_tensor")
     stop_step: int | None = wire(None, codec="opt_int")

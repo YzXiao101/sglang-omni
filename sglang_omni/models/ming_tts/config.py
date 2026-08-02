@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
 
 _PKG = "sglang_omni.models.ming_tts"
 
@@ -13,6 +15,7 @@ PREPROCESSING_STAGE = "preprocessing"
 REFERENCE_ENCODE_STAGE = "reference_encode"
 TTS_ENGINE_STAGE = "tts_engine"
 AUDIO_DECODE_STAGE = "audio_decode"
+MING_TTS_DEFAULT_DISABLE_RADIX_CACHE = True
 
 
 class MingTTSPipelineConfig(PipelineConfig):
@@ -106,7 +109,12 @@ class MingTTSPipelineConfig(PipelineConfig):
                 "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
             )
         stages = {stage.name: stage for stage in self.stages}
-        required_stages = {PREPROCESSING_STAGE, AUDIO_DECODE_STAGE}
+        required_stages = {
+            PREPROCESSING_STAGE,
+            REFERENCE_ENCODE_STAGE,
+            TTS_ENGINE_STAGE,
+            AUDIO_DECODE_STAGE,
+        }
         missing_stages = required_stages - stages.keys()
         if missing_stages:
             raise ValueError(
@@ -114,11 +122,52 @@ class MingTTSPipelineConfig(PipelineConfig):
                 f"{sorted(missing_stages)}"
             )
         preprocessing = stages[PREPROCESSING_STAGE]
+        reference_encode = stages[REFERENCE_ENCODE_STAGE]
+        tts_engine = stages[TTS_ENGINE_STAGE]
         audio_decode = stages[AUDIO_DECODE_STAGE]
+
+        resolved_tts_args = resolve_stage_static_factory_args(tts_engine, self)
+        resolved_server_args = resolved_tts_args.get("server_args_overrides")
+        if resolved_server_args is None:
+            resolved_server_args = {}
+        elif not isinstance(resolved_server_args, Mapping):
+            raise ValueError(
+                "Ming-Omni-TTS tts_engine server_args_overrides must be a mapping"
+            )
+        disable_radix_cache = resolved_server_args.get(
+            "disable_radix_cache",
+            MING_TTS_DEFAULT_DISABLE_RADIX_CACHE,
+        )
+        if not isinstance(disable_radix_cache, bool):
+            raise ValueError("Ming-Omni-TTS disable_radix_cache must be a boolean")
+
+        factory_server_args = tts_engine.factory_args.get("server_args_overrides")
+        if factory_server_args is None:
+            factory_server_args = {}
+        elif not isinstance(factory_server_args, Mapping):
+            raise ValueError(
+                "Ming-Omni-TTS tts_engine server_args_overrides must be a mapping"
+            )
+        factory_server_args = dict(factory_server_args)
+        factory_server_args["disable_radix_cache"] = disable_radix_cache
+        tts_engine.factory_args["server_args_overrides"] = factory_server_args
+
         for stage, expected_args in (
             (
                 preprocessing,
                 {"max_decode_steps_cap": self.max_decode_steps_cap},
+            ),
+            (
+                reference_encode,
+                {
+                    "compute_prompt_cache_digest": not disable_radix_cache,
+                },
+            ),
+            (
+                tts_engine,
+                {
+                    "expected_disable_radix_cache": disable_radix_cache,
+                },
             ),
             (
                 audio_decode,

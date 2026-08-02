@@ -15,6 +15,7 @@ from sglang_omni.models.ming_tts.engine_builder import MingTtsEngineBuilder
 from sglang_omni.models.ming_tts.model_runner import (
     MingTTSModelRunner,
     MingTTSTPStepUpdate,
+    _MingTTSRequestState,
 )
 
 
@@ -264,17 +265,61 @@ def test_prefill_forward_publishes_sglang_forward_context() -> None:
     assert result.logits_output == "logits"
 
 
-def test_ming_tts_retraction_skips_prompt_cache_insert() -> None:
-    runner = object.__new__(MingTTSModelRunner)
-    materialized = []
-    runner._materialize_request_state = materialized.append
-    req = SimpleNamespace(
-        retracted_stain=True,
-        skip_radix_cache_insert=False,
+@pytest.mark.parametrize(
+    ("prefix_len", "extend_len", "expected"),
+    [
+        pytest.param(
+            2,
+            1,
+            torch.tensor([[30.0, 31.0]]),
+            id="repeated-prompt",
+        ),
+        pytest.param(
+            3,
+            2,
+            torch.tensor([[40.0, 41.0], [50.0, 51.0]]),
+            id="retracted-generated-suffix",
+        ),
+    ],
+)
+def test_ming_tts_prefill_uses_only_uncached_continuous_rows(
+    prefix_len: int,
+    extend_len: int,
+    expected: torch.Tensor,
+) -> None:
+    def fail_token_embedding(_input_ids: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("continuous rows must not use token embeddings")
+
+    runner = MingTTSModelRunner.__new__(MingTTSModelRunner)
+    runner.model = SimpleNamespace(
+        _decode_input_embedding=SimpleNamespace(
+            weight=torch.empty((1, 2), dtype=torch.float32)
+        ),
+        get_input_embeddings=lambda: fail_token_embedding,
     )
-    sched_req = SimpleNamespace(data=SimpleNamespace(req=req))
+    runner._request_states = {
+        "req-ming-tts": _MingTTSRequestState(
+            prefill_input_embeds=torch.tensor(
+                [[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]
+            ),
+            feedback_embeddings=[
+                torch.tensor([40.0, 41.0]),
+                torch.tensor([50.0, 51.0]),
+            ],
+        )
+    }
+    request = SimpleNamespace(
+        request_id="req-ming-tts",
+        data=SimpleNamespace(
+            input_ids=torch.tensor([1, 2, 3]),
+            req=SimpleNamespace(
+                prefix_indices=torch.arange(prefix_len),
+                extend_range=SimpleNamespace(length=extend_len),
+            ),
+        ),
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.zeros(extend_len, dtype=torch.long))
 
-    runner.before_prefill(None, None, [sched_req])
+    actual = runner._build_prefill_input_embeds(forward_batch, [request])
 
-    assert req.skip_radix_cache_insert is True
-    assert materialized == [sched_req]
+    assert torch.equal(actual, expected)

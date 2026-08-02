@@ -38,19 +38,36 @@ def _result_adapter(reset_request):
         model=model,
         tokenizer=SimpleNamespace(),
         reset_request=reset_request,
+        prompt_radix_cache_enabled=False,
     )
     return result_adapter
 
 
-def _request_adapter():
+def _request_adapter(*, prompt_radix_cache_enabled: bool = False):
     request_adapter, _ = make_ming_tts_scheduler_adapters(
         model=SimpleNamespace(vocab_size=128),
         tokenizer=SimpleNamespace(
             special=SimpleNamespace(end_of_audio=5, audio_patch=3)
         ),
         reset_request=lambda _: None,
+        prompt_radix_cache_enabled=prompt_radix_cache_enabled,
     )
     return request_adapter
+
+
+def _adapt_state(
+    state: MingTTSState,
+    *,
+    request_id: str,
+    prompt_radix_cache_enabled: bool,
+) -> MingTTSSGLangRequestData:
+    return _request_adapter(prompt_radix_cache_enabled=prompt_radix_cache_enabled)(
+        StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs="hello"),
+            data=state.to_dict(),
+        )
+    )
 
 
 def _request_data(
@@ -107,34 +124,133 @@ def test_ming_tts_result_adapter_serializes_empty_latent_output() -> None:
     assert reset_requests == ["req-ming-tts"]
 
 
-def test_ming_tts_request_builder_namespaces_cache_by_reference() -> None:
-    request_adapter = _request_adapter()
+def test_ming_tts_request_builder_skips_radix_key_hash_when_disabled(
+    monkeypatch,
+) -> None:
+    def fail_hash(*_args, **_kwargs):
+        raise AssertionError("Radix-key hashing must be disabled")
 
-    def extra_key(request_id: str, speaker: float, latent: float) -> str:
-        state = MingTTSState(
+    monkeypatch.setattr(engine_io.hashlib, "blake2b", fail_hash)
+    states = [
+        MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2),
+        MingTTSState(
             text="hello",
+            ref_audio="ref.wav",
             input_ids=[1, 2, 3],
             max_decode_steps=2,
-            spk_emb=torch.full((1, 3), speaker),
-            prompt_latent=torch.full((2, 3), latent),
+            spk_emb=torch.full((1, 3), 1.0),
+            prompt_latent=torch.full((1, 2, 3), 2.0),
+            spk_injection_positions=[1],
+            prompt_latent_start_position=2,
+            prompt_latent_token_count=2,
+        ),
+    ]
+
+    for index, state in enumerate(states):
+        data = _adapt_state(
+            state,
+            request_id=f"cache-off-{index}",
+            prompt_radix_cache_enabled=False,
+        )
+        assert data.req.extra_key is None
+
+
+def test_ming_tts_request_builder_namespaces_enabled_prompt_cache() -> None:
+    text = MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2)
+
+    def reference_state(marker: int) -> MingTTSState:
+        return MingTTSState(
+            text="hello",
+            ref_audio=f"ref-{marker}.wav",
+            input_ids=[1, 2, 3],
+            max_decode_steps=2,
+            spk_emb=torch.full((1, 3), float(marker)),
+            prompt_latent=torch.full((1, 2, 3), float(marker + 1)),
+            prompt_conditioning_digest=f"conditioning-{marker}",
             spk_injection_positions=[1],
             prompt_latent_start_position=2,
             prompt_latent_token_count=2,
         )
-        data = request_adapter(
-            StagePayload(
-                request_id=request_id,
-                request=OmniRequest(inputs="hello"),
-                data=state.to_dict(),
-            )
+
+    text_key = _adapt_state(
+        text,
+        request_id="text",
+        prompt_radix_cache_enabled=True,
+    ).req.extra_key
+    reference_key = _adapt_state(
+        reference_state(1),
+        request_id="reference-a",
+        prompt_radix_cache_enabled=True,
+    ).req.extra_key
+    repeated_key = _adapt_state(
+        reference_state(1),
+        request_id="reference-a-repeat",
+        prompt_radix_cache_enabled=True,
+    ).req.extra_key
+    other_key = _adapt_state(
+        reference_state(2),
+        request_id="reference-b",
+        prompt_radix_cache_enabled=True,
+    ).req.extra_key
+
+    assert text_key == "ming-tts:prompt:v2:text"
+    assert reference_key is not None
+    assert reference_key.startswith("ming-tts:prompt:v2:reference:")
+    assert repeated_key == reference_key
+    assert other_key != reference_key
+
+
+@pytest.mark.parametrize(
+    ("state_kwargs", "enabled", "error"),
+    [
+        pytest.param(
+            {
+                "ref_audio": "ref.wav",
+                "spk_emb": torch.ones(1, 3),
+            },
+            False,
+            "missing reference conditioning",
+            id="incomplete-reference-bundle",
+        ),
+        pytest.param(
+            {
+                "ref_audio": "ref.wav",
+                "spk_emb": torch.ones(1, 3),
+                "prompt_latent": torch.ones(1, 2, 3),
+            },
+            True,
+            "missing the prompt cache digest",
+            id="enabled-without-producer-digest",
+        ),
+        pytest.param(
+            {
+                "spk_emb": torch.ones(1, 3),
+                "prompt_latent": torch.ones(1, 2, 3),
+            },
+            False,
+            "unexpectedly contains reference conditioning",
+            id="text-with-reference-bundle",
+        ),
+    ],
+)
+def test_ming_tts_request_builder_rejects_invalid_reference_contract(
+    state_kwargs: dict,
+    enabled: bool,
+    error: str,
+) -> None:
+    state = MingTTSState(
+        text="hello",
+        input_ids=[1, 2, 3],
+        max_decode_steps=2,
+        **state_kwargs,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        _adapt_state(
+            state,
+            request_id="invalid-reference",
+            prompt_radix_cache_enabled=enabled,
         )
-        return data.req.extra_key
-
-    key = extra_key("reference-a", 1.0, 2.0)
-
-    assert extra_key("reference-b", 1.0, 2.0) == key
-    assert extra_key("speaker-changed", 3.0, 2.0) != key
-    assert extra_key("latent-changed", 1.0, 4.0) != key
 
 
 def test_ming_tts_result_adapter_prefers_stop_head_finish_reason() -> None:

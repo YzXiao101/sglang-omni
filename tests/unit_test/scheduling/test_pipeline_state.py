@@ -289,6 +289,7 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
                 prompt_latent_token_count=2,
                 spk_emb=torch.zeros(1, 2),
                 prompt_latent=torch.zeros(1, 1, 2),
+                prompt_conditioning_digest="conditioning-digest",
                 max_decode_steps=16,
                 cfg=1.5,
                 sigma=0.2,

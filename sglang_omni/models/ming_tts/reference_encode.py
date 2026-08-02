@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,32 @@ from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
     ReferenceEncodeService,
 )
+
+_PROMPT_CONDITIONING_DIGEST_SCHEMA = b"ming-tts:conditioning:v1"
+
+
+def _prompt_conditioning_digest(
+    speaker: torch.Tensor,
+    prompt_latent: torch.Tensor,
+) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(_PROMPT_CONDITIONING_DIGEST_SCHEMA)
+    for tag, tensor in (("speaker", speaker), ("latent", prompt_latent)):
+        header = json.dumps(
+            {
+                "tag": tag,
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raw = memoryview(tensor.numpy()).cast("B")
+        digest.update(len(header).to_bytes(4, "little"))
+        digest.update(header)
+        digest.update(len(raw).to_bytes(8, "little"))
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 class MingSpeakerEmbeddingExtractor:
@@ -105,6 +133,7 @@ class MingTTSReferenceEncoder:
         cache_model_identity: str | None = None,
         cache_max_items: int | None = 256,
         cache_max_bytes: int | None = 64 * 1024 * 1024,
+        compute_prompt_cache_digest: bool = False,
     ) -> None:
         self.audio_vae = decoder.audio_vae
         self.sample_rate = int(decoder.sample_rate)
@@ -112,6 +141,7 @@ class MingTTSReferenceEncoder:
         self.dtype = decoder.dtype
         self.patch_size = int(patch_size)
         self.speaker_encoder = speaker_encoder
+        self.compute_prompt_cache_digest = compute_prompt_cache_digest
         if self.sample_rate != MING_TTS_SAMPLE_RATE:
             raise ValueError(
                 "Ming-Omni-TTS reference encoder requires sample_rate "
@@ -142,6 +172,7 @@ class MingTTSReferenceEncoder:
         ref_audio_cache: bool = True,
         ref_audio_cache_max_items: int = 256,
         ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
+        compute_prompt_cache_digest: bool = False,
     ) -> "MingTTSReferenceEncoder":
         decoder = MingAudioDecoder.from_config(
             audio_config,
@@ -155,6 +186,7 @@ class MingTTSReferenceEncoder:
             cache_model_identity=str(checkpoint_dir) if ref_audio_cache else None,
             cache_max_items=ref_audio_cache_max_items,
             cache_max_bytes=ref_audio_cache_max_bytes,
+            compute_prompt_cache_digest=compute_prompt_cache_digest,
         )
 
     def _encode_reference(self, ref_audio: str) -> dict:
@@ -179,13 +211,22 @@ class MingTTSReferenceEncoder:
 
         # Note (luojiaxuan): Keep artifacts on CPU float32 so the shared cache
         # never pins device memory and typed_tensor emits float32 unchanged.
-        return {
-            "spk_emb": speaker_embedding.detach().to(device="cpu", dtype=torch.float32),
-            "prompt_latent": prompt_latent.detach().to(
-                device="cpu", dtype=torch.float32
-            ),
+        speaker = speaker_embedding.detach().to(device="cpu", dtype=torch.float32)
+        prompt_latent = prompt_latent.detach().to(device="cpu", dtype=torch.float32)
+        if self.compute_prompt_cache_digest:
+            speaker = speaker.contiguous()
+            prompt_latent = prompt_latent.contiguous()
+        artifact = {
+            "spk_emb": speaker,
+            "prompt_latent": prompt_latent,
             "prompt_latent_token_count": frames // self.patch_size,
         }
+        if self.compute_prompt_cache_digest:
+            artifact["prompt_conditioning_digest"] = _prompt_conditioning_digest(
+                speaker,
+                prompt_latent,
+            )
+        return artifact
 
     def encode_payload(
         self,
@@ -206,6 +247,11 @@ class MingTTSReferenceEncoder:
 
         state.spk_emb = artifact["spk_emb"]
         state.prompt_latent = artifact["prompt_latent"]
+        state.prompt_conditioning_digest = (
+            artifact["prompt_conditioning_digest"]
+            if self.compute_prompt_cache_digest
+            else None
+        )
         state.prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
 
         plan = build_ming_tts_prompt(
