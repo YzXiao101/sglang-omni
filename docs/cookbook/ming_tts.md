@@ -123,8 +123,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 | `input` | (required) | Non-empty text to synthesize |
 | `references` | `null` | At most one local reference clip with non-empty `text` |
 | `ref_audio` / `ref_text` | `null` | Shorthand for the reference clip and transcript |
-| `max_new_tokens` | `200` | Maximum acoustic generation steps; the provided config caps this at `256` |
-| `temperature` | `0.0` | Non-negative SDE temperature used by the FlowLoss sampler |
+| `max_new_tokens` | `200` (effective) | Maximum acoustic generation steps; the provided config caps this at `256` |
+| `temperature` | `0.0` (effective) | Non-negative SDE temperature used by the FlowLoss sampler |
 | `response_format` | `wav` | Use `pcm` when `stream` is enabled; `wav` is used by the reference benchmark |
 | `stream` | `false` | Streams raw PCM audio when enabled |
 | `voice` | `default` | Only the default voice selector is accepted |
@@ -144,12 +144,12 @@ Advanced FlowLoss controls can be passed through `stage_params.tts_engine`:
 }
 ```
 
-`cfg` must be positive and cannot equal `1.0`; `sigma` and `temperature` must be
+`cfg` must be at least `1e-5` and cannot equal `1.0`; `sigma` and `temperature` must be
 non-negative.
 
 ## Benchmarking
 
-The reference serving configuration uses Seed-TTS-Eval with concurrency 8. Run generation
+The benchmark below uses Seed-TTS-Eval with concurrency 8. Run generation
 against the existing Ming-TTS server and save the audio for a separate ASR pass:
 
 ```bash
@@ -194,37 +194,37 @@ Streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | First Audio Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.93% | 0.3377 | 1.543 | 0.5285 | 5.174 | 24.428 |
-| text-only | ZH | 2020 | 0 | 0.70% | 0.3368 | 1.659 | 0.5250 | 4.818 | 24.199 |
-| reference | EN | 1088 | 0 | 1.03% | 0.3770 | 1.650 | 0.6327 | 4.844 | 22.038 |
-| reference | ZH | 2020 | 0 | 0.71% | 0.3467 | 1.961 | 0.6188 | 4.076 | 23.365 |
+| text-only | EN | 1088 | 0 | 1.00% | 0.3526 | 1.615 | 0.5454 | 4.945 | 23.492 |
+| text-only | ZH | 2020 | 0 | 0.67% | 0.3414 | 1.678 | 0.5215 | 4.762 | 23.845 |
+| reference | EN | 1088 | 0 | 1.26% | 0.3777 | 1.655 | 0.6270 | 4.826 | 21.888 |
+| reference | ZH | 2020 | 0 | 0.80% | 0.3474 | 1.962 | 0.6001 | 4.075 | 23.362 |
 
 Non-streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.95% | 0.2155 | 1.011 | 7.898 | 37.220 |
-| text-only | ZH | 2020 | 0 | 0.69% | 0.2084 | 1.042 | 7.669 | 38.478 |
-| reference | EN | 1088 | 0 | 1.17% | 0.2342 | 1.048 | 7.623 | 34.592 |
-| reference | ZH | 2020 | 0 | 0.72% | 0.2005 | 1.148 | 6.958 | 39.986 |
+| text-only | EN | 1088 | 0 | 0.89% | 0.1997 | 0.943 | 8.467 | 40.106 |
+| text-only | ZH | 2020 | 0 | 0.64% | 0.1964 | 0.986 | 8.104 | 40.787 |
+| reference | EN | 1088 | 0 | 1.10% | 0.2307 | 1.031 | 7.748 | 35.039 |
+| reference | ZH | 2020 | 0 | 0.73% | 0.1967 | 1.124 | 7.113 | 40.723 |
 
 All 12,432 requests completed successfully. Reference corpus WER includes a small
 near-silent tail from unseeded acoustic sampling. Streaming returned its first audio
-payload in 0.53-0.63 seconds, while non-streaming retained higher complete-response
+payload in 0.52-0.63 seconds, while non-streaming retained higher complete-response
 throughput.
 
 ## Known Limitations
 
 - **Serving optimizations.** Prompt radix caching is supported but disabled by default. When
   enabled, reuse is limited to the original prompt; generated acoustic history is not inserted
-  into the cache. `torch.compile` has not yet been validated and remains disabled in the provided
+  into the cache. `torch.compile` is not supported and remains disabled in the provided
   configuration.
 - **Reference inputs.** The current request adapter accepts one local reference audio file with a
   non-empty transcript; remote URLs, data URLs, precomputed prompt latents, and speaker embeddings
-  are not yet exposed.
+  are not supported.
 - **Generation controls.** Request-local `seed`, logits sampling fields (`top_p`, `top_k`,
   `repetition_penalty`), named voices, explicit language selection, instructions, and duration
-  control are not yet exposed. `initial_codec_chunk_frames` is rejected because AudioVAE cadence
+  control are not supported. `initial_codec_chunk_frames` is rejected because AudioVAE cadence
   is a pipeline-level setting.
-- **Checkpoint coverage.** The provided configuration targets the 16.8B-A3B checkpoint. A
-  configuration for the 0.5B checkpoint has not yet been added.
+- **Checkpoint coverage.** The current serving implementation supports only the 16.8B-A3B MoE
+  checkpoint; the dense 0.5B checkpoint is not supported.
