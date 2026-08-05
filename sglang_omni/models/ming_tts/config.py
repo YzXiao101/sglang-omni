@@ -125,6 +125,11 @@ class MingTTSPipelineConfig(PipelineConfig):
         reference_encode = stages[REFERENCE_ENCODE_STAGE]
         tts_engine = stages[TTS_ENGINE_STAGE]
         audio_decode = stages[AUDIO_DECODE_STAGE]
+        if AUDIO_DECODE_STAGE not in tts_engine.stream_to:
+            raise ValueError(
+                "Ming-Omni-TTS tts_engine stream_to must include "
+                f"{AUDIO_DECODE_STAGE!r}"
+            )
 
         resolved_tts_args = resolve_stage_static_factory_args(tts_engine, self)
         resolved_server_args = resolved_tts_args.get("server_args_overrides")
