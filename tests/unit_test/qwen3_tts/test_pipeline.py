@@ -2590,6 +2590,7 @@ def test_qwen3_tts_ar_scheduler_abort_cleans_prepared_state() -> None:
         scheduler._dirty_deferred_request_ids = set()
         scheduler._first_emit_done = set()
         scheduler._prefill_start_done = set()
+        scheduler._prefill_end_done = set()
         scheduler.waiting_queue = []
         scheduler._request_admission_lock = threading.RLock()
         scheduler._request_build_executor = None
