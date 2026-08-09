@@ -161,8 +161,18 @@ non-negative.
 
 ## Benchmarking
 
-The benchmark below uses Seed-TTS-Eval with concurrency 8. Run generation
-against the existing Ming-TTS server and save the audio for a separate ASR pass:
+The benchmark uses Seed-TTS-Eval with concurrency 8. Run each row below for
+both `en` and `zh`, replacing `{lang}` in the output directory:
+
+| Response mode | Input mode | Scenario flags | Output directory |
+|---|---|---|---|
+| Non-streaming | Reference | _(none)_ | `results/ming_tts/nonstream/reference/{lang}` |
+| Non-streaming | Text-only | `--no-ref-audio` | `results/ming_tts/nonstream/text_only/{lang}` |
+| Streaming | Reference | `--stream` | `results/ming_tts/stream/reference/{lang}` |
+| Streaming | Text-only | `--stream --no-ref-audio` | `results/ming_tts/stream/text_only/{lang}` |
+
+With the Ming-TTS server running on port 8000, generate each scenario by
+substituting its language, flags, and output directory in this command:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
@@ -170,28 +180,34 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --base-url http://127.0.0.1:8000 \
   --model ming-omni-tts \
   --meta zhaochenyang20/seed-tts-eval-arrow \
-  --output-dir results/ming_tts_reference_en \
-  --lang en --ref-format references \
-  --max-new-tokens 256 --max-concurrency 8 --warmup 8
+  --output-dir <output-directory> \
+  --lang <lang> --ref-format references \
+  --max-new-tokens 256 --max-concurrency 8 --warmup 8 \
+  <scenario-flags>
 ```
 
-Use `--no-ref-audio` for text-only synthesis. Use `--lang zh` and a different output directory
-for the Chinese split. Release the TTS server GPUs before starting the ASR server, then compute
-WER from the saved audio:
+After generation finishes, stop the TTS server and start the ASR server in
+another terminal:
 
 ```bash
 sgl-omni serve \
   --model-path Qwen/Qwen3-ASR-1.7B \
   --port 8100
+```
 
+Then transcribe each output directory with the same language and scenario
+flags used for generation:
+
+```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
   --transcribe-only --use-existing-server \
   --host 127.0.0.1 --port 8100 \
   --model ming-omni-tts \
   --meta zhaochenyang20/seed-tts-eval-arrow \
-  --output-dir results/ming_tts_reference_en \
-  --lang en --ref-format references \
-  --max-new-tokens 256
+  --output-dir <output-directory> \
+  --lang <lang> --ref-format references \
+  --max-new-tokens 256 --max-concurrency 8 \
+  <scenario-flags>
 ```
 
 ## Benchmark Results
