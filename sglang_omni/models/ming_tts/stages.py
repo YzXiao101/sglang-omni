@@ -7,6 +7,11 @@ import logging
 from typing import Any
 
 from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
+from sglang_omni.models.ming_tts.config import (
+    MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
+    MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
+    validate_ming_tts_audio_decode_batch_config,
+)
 from sglang_omni.models.ming_tts.hf_config import (
     MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
     register_ming_tts_hf_config,
@@ -84,6 +89,10 @@ def create_sglang_tts_engine_executor(
     )
 
 
+def create_tts_engine_executor(*args, **kwargs) -> Any:
+    return create_sglang_tts_engine_executor(*args, **kwargs)
+
+
 def create_reference_encode_executor(
     model_path: str,
     *,
@@ -143,7 +152,13 @@ def create_audio_decode_executor(
     dtype: str = "bfloat16",
     keep_latents: bool = False,
     audio_vae_steady_chunk_patches: int = 2,
+    max_batch_size: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
+    max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
 ) -> Any:
+    max_batch_size, max_batch_wait_ms = validate_ming_tts_audio_decode_batch_config(
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
+    )
     from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
     from sglang_omni.models.ming_tts.streaming_vocoder import (
         MingTTSStreamingVocoderScheduler,
@@ -183,6 +198,8 @@ def create_audio_decode_executor(
         latent_dim=int(config.latent_dim),
         steady_chunk_patches=steady_chunk_patches,
         keep_latents=keep_latents,
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
     )
 
 
@@ -206,4 +223,5 @@ __all__ = [
     "create_preprocessing_executor",
     "create_reference_encode_executor",
     "create_sglang_tts_engine_executor",
+    "create_tts_engine_executor",
 ]

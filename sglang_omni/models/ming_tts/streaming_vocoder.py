@@ -41,6 +41,8 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         patch_size: int,
         latent_dim: int,
         steady_chunk_patches: int,
+        max_batch_size: int,
+        max_batch_wait_ms: int,
         keep_latents: bool = False,
     ) -> None:
         self._decoder = decoder
@@ -55,6 +57,8 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
             ),
             sample_rate=decoder.sample_rate,
             stream_source_hint="Ming-Omni-TTS",
+            max_batch_size=max_batch_size,
+            max_batch_wait_ms=max_batch_wait_ms,
         )
 
     def create_stream_state(self, request_id: str) -> _StreamState:

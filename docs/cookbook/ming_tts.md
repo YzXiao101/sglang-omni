@@ -45,6 +45,17 @@ sgl-omni serve \
 The provided configuration enables the AR and acoustic-tail CUDA graphs. AudioVAE decode remains
 eager, and requests are non-streaming unless `stream` is set.
 
+For non-streaming requests, `audio_decode` sends the complete generated latent sequence through
+one full-sequence AudioVAE decode. Streaming requests use the separate incremental AudioVAE path
+with request-local cache and overlap state. Older configs must remove `decode_mode` from either
+`audio_decode.factory_args` or `runtime_overrides.audio_decode`; non-streaming chunked decode is
+no longer supported, and the server rejects the legacy setting during config loading.
+
+Cross-request AudioVAE batching is not implemented yet. The only supported audio-decode batch
+configuration is `max_batch_size: 1` with `max_batch_wait_ms: 0`, as shown in the provided YAML;
+other values are rejected before the server starts. A future batching change can expand this
+configuration only after it implements and validates a real multi-request AudioVAE decode.
+
 ## Synthesizing Speech
 
 ### Text Only

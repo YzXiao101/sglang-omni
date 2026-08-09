@@ -208,7 +208,12 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
         patch_size=2,
         latent_dim=3,
         steady_chunk_patches=2,
+        max_batch_size=1,
+        max_batch_wait_ms=0,
     )
+    assert scheduler._batch_fn is None
+    assert scheduler._max_batch_size == 1
+    assert scheduler._max_batch_wait_s == 0.0
     request_id = "req-ming-tts"
     payload = _payload()
     payload.request.params["stream"] = True
@@ -272,6 +277,8 @@ def test_ming_tts_streaming_retraction_preserves_latent_and_decoder_state() -> N
         patch_size=2,
         latent_dim=3,
         steady_chunk_patches=2,
+        max_batch_size=1,
+        max_batch_wait_ms=0,
     )
     chunk_id = 0
 

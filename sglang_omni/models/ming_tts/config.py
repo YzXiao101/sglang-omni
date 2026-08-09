@@ -14,6 +14,39 @@ REFERENCE_ENCODE_STAGE = "reference_encode"
 TTS_ENGINE_STAGE = "tts_engine"
 AUDIO_DECODE_STAGE = "audio_decode"
 
+MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
+MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
+
+
+def validate_ming_tts_audio_decode_batch_config(
+    *,
+    max_batch_size: int,
+    max_batch_wait_ms: int,
+) -> tuple[int, int]:
+    if (
+        isinstance(max_batch_size, bool)
+        or not isinstance(max_batch_size, int)
+        or max_batch_size != MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS audio_decode currently supports "
+            f"max_batch_size={MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE} only; "
+            "cross-request AudioVAE batching is not implemented yet, got "
+            f"{max_batch_size!r}"
+        )
+    if (
+        isinstance(max_batch_wait_ms, bool)
+        or not isinstance(max_batch_wait_ms, int)
+        or max_batch_wait_ms != MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS audio_decode currently supports "
+            f"max_batch_wait_ms={MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS} only "
+            "while cross-request AudioVAE batching is disabled, got "
+            f"{max_batch_wait_ms!r}"
+        )
+    return max_batch_size, max_batch_wait_ms
+
 
 class MingTTSPipelineConfig(PipelineConfig):
     """Ming-Omni-TTS pipeline.
@@ -90,7 +123,11 @@ class MingTTSPipelineConfig(PipelineConfig):
             name=AUDIO_DECODE_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_audio_decode_executor",
-            factory_args={"dtype": "bfloat16"},
+            factory_args={
+                "dtype": "bfloat16",
+                "max_batch_size": MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
+                "max_batch_wait_ms": MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
+            },
             gpu=0,
             terminal=True,
             can_accept_stream_before_payload=True,
@@ -132,6 +169,31 @@ class MingTTSPipelineConfig(PipelineConfig):
                 "can_accept_stream_before_payload=true because tts_engine sends "
                 "stream data and stream_done before the terminal payload"
             )
+
+        audio_decode_overrides = self.runtime_overrides.get(AUDIO_DECODE_STAGE, {})
+        if "decode_mode" in audio_decode.factory_args or (
+            "decode_mode" in audio_decode_overrides
+        ):
+            raise ValueError(
+                "Ming-Omni-TTS audio_decode no longer supports 'decode_mode'. "
+                "Non-streaming requests always use full-sequence AudioVAE decode; "
+                "streaming requests use incremental decode. Remove 'decode_mode' "
+                "from audio_decode factory_args/runtime_overrides."
+            )
+        validate_ming_tts_audio_decode_batch_config(
+            max_batch_size=audio_decode_overrides.get(
+                "max_batch_size",
+                audio_decode.factory_args.get(
+                    "max_batch_size", MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE
+                ),
+            ),
+            max_batch_wait_ms=audio_decode_overrides.get(
+                "max_batch_wait_ms",
+                audio_decode.factory_args.get(
+                    "max_batch_wait_ms", MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS
+                ),
+            ),
+        )
 
         for stage, expected_args in (
             (
