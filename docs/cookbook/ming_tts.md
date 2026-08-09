@@ -105,14 +105,16 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Streaming
 
-Streaming responses use raw signed 16-bit 44.1 kHz PCM. The decoder first consumes one latent
-patch to prime AudioVAE lookahead, which normally emits no user-visible audio. It then decodes
-groups of `audio_vae_steady_chunk_patches` patches; the provided configuration uses two. The
-terminal step flushes any remaining patches immediately. This cadence is configured for the
-pipeline rather than per request.
+Streaming returns headerless mono signed 16-bit little-endian PCM (`s16le`) at 44.1 kHz with
+`Content-Type: audio/pcm`. The `X-Sample-Rate`, `X-Channels`, and `X-Bit-Depth` headers report the
+sample rate, channel count, and bit depth; HTTP EOF ends the stream.
+
+Ming AudioVAE primes its lookahead with one latent patch, then decodes groups of
+`audio_vae_steady_chunk_patches` patches; the provided configuration uses two. The terminal step
+flushes any remainder. Pipe the response to `ffplay` to play it during generation:
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -sS --fail --no-buffer -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "ming-omni-tts",
@@ -120,8 +122,11 @@ curl -X POST http://localhost:8000/v1/audio/speech \
     "stream": true,
     "response_format": "pcm"
   }' \
-  --output output.pcm
+  | ffplay -nodisp -autoexit -f s16le -ar 44100 -ac 1 -
 ```
+
+To save the raw stream instead, use `--output output.pcm`. The file has no WAV header; convert it
+with `ffmpeg -f s16le -ar 44100 -ac 1 -i output.pcm output.wav`.
 
 ## Generation Parameters
 
