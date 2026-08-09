@@ -126,6 +126,12 @@ class MingTTSPipelineConfig(PipelineConfig):
                 "Ming-Omni-TTS tts_engine stream_to must include "
                 f"{AUDIO_DECODE_STAGE!r}"
             )
+        if not audio_decode.can_accept_stream_before_payload:
+            raise ValueError(
+                "Ming-Omni-TTS audio_decode must set "
+                "can_accept_stream_before_payload=true because tts_engine sends "
+                "stream data and stream_done before the terminal payload"
+            )
 
         for stage, expected_args in (
             (
