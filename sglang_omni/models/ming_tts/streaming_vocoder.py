@@ -57,6 +57,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
             ),
             sample_rate=decoder.sample_rate,
             stream_source_hint="Ming-Omni-TTS",
+            stream_input_modality="audio_latents",
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
@@ -105,35 +106,35 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         self,
         request_id: str,
         state: _StreamState,
-        codes: torch.Tensor,
+        latents: torch.Tensor,
     ) -> torch.Tensor:
         del request_id, state
-        if codes.device.type != "cpu":
+        if latents.device.type != "cpu":
             raise ValueError(
                 "Ming-Omni-TTS stream latent must be on CPU, "
-                f"got device {codes.device}"
+                f"got device {latents.device}"
             )
-        if codes.dtype != torch.float32:
+        if latents.dtype != torch.float32:
             raise TypeError(
                 "Ming-Omni-TTS stream latent dtype must be torch.float32, "
-                f"got {codes.dtype}"
+                f"got {latents.dtype}"
             )
         expected_shape = (self._patch_size, self._latent_dim)
-        if tuple(codes.shape) != expected_shape:
+        if tuple(latents.shape) != expected_shape:
             raise ValueError(
                 f"Ming-Omni-TTS stream latent shape must be {expected_shape}, "
-                f"got {tuple(codes.shape)}"
+                f"got {tuple(latents.shape)}"
             )
-        return codes.contiguous()
+        return latents.contiguous()
 
     def ingest(
         self,
         request_id: str,
         state: _StreamState,
-        codes: torch.Tensor,
+        latents: torch.Tensor,
     ) -> None:
         del request_id
-        state.pending_patches.append(codes)
+        state.pending_patches.append(latents)
 
     def should_decode(self, state: _StreamState, *, is_final: bool) -> bool:
         del is_final

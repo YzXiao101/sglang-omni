@@ -176,7 +176,7 @@ def build_ming_tts_stream_output(
             data=latent,
             target="audio_decode",
             metadata={
-                "modality": "audio_codes",
+                "modality": "audio_latents",
                 "stream": True,
                 "is_last": bool(patch.is_last),
             },

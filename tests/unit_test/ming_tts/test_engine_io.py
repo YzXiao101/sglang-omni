@@ -191,7 +191,7 @@ def test_ming_tts_stream_output_consumes_pending_patch_once() -> None:
     assert messages[0].request_id == "req-ming-tts"
     assert messages[0].target == "audio_decode"
     assert messages[0].metadata == {
-        "modality": "audio_codes",
+        "modality": "audio_latents",
         "stream": True,
         "is_last": True,
     }
@@ -199,6 +199,32 @@ def test_ming_tts_stream_output_consumes_pending_patch_once() -> None:
     assert messages[0].data.dtype == torch.float32
     assert data.pending_stream_patch is None
     assert build_ming_tts_stream_output("req-ming-tts", data, None) == []
+
+
+def test_ming_tts_streaming_vocoder_rejects_discrete_audio_codes() -> None:
+    scheduler = MingTTSStreamingVocoderScheduler(
+        _FakeStreamingDecoder(),
+        patch_size=2,
+        latent_dim=3,
+        steady_chunk_patches=2,
+        max_batch_size=1,
+        max_batch_wait_ms=0,
+    )
+
+    with pytest.raises(ValueError, match="must be audio_latents"):
+        scheduler._ingest_stream_item(
+            "req-ming-tts",
+            StreamItem(
+                chunk_id=0,
+                data=torch.ones((2, 3)),
+                from_stage="tts_engine",
+                metadata={
+                    "modality": "audio_codes",
+                    "stream": True,
+                    "is_last": False,
+                },
+            ),
+        )
 
 
 def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
@@ -224,7 +250,7 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
             data=torch.full((2, 3), value),
             from_stage="tts_engine",
             metadata={
-                "modality": "audio_codes",
+                "modality": "audio_latents",
                 "stream": True,
                 "is_last": is_last,
             },
