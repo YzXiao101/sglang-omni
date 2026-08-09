@@ -15,6 +15,7 @@ from sglang_omni.models.ming_tts.engine_builder import MingTtsEngineBuilder
 from sglang_omni.models.ming_tts.model_runner import (
     MingTTSModelRunner,
     MingTTSTPStepUpdate,
+    _MingTTSRequestState,
 )
 
 
@@ -262,3 +263,53 @@ def test_prefill_forward_publishes_sglang_forward_context() -> None:
 
     assert seen == [attn_backend]
     assert result.logits_output == "logits"
+
+
+def test_ming_tts_prefill_replays_prompt_and_generated_feedback() -> None:
+    def fail_token_embedding(_input_ids: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("continuous rows must not use token embeddings")
+
+    runner = MingTTSModelRunner.__new__(MingTTSModelRunner)
+    runner.model = SimpleNamespace(
+        _decode_input_embedding=SimpleNamespace(
+            weight=torch.empty((1, 2), dtype=torch.float32)
+        ),
+        get_input_embeddings=lambda: fail_token_embedding,
+    )
+    runner._request_states = {
+        "req-ming-tts": _MingTTSRequestState(
+            prefill_input_embeds=torch.tensor(
+                [[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]
+            ),
+            feedback_embeddings=[
+                torch.tensor([40.0, 41.0]),
+                torch.tensor([50.0, 51.0]),
+            ],
+        )
+    }
+    request = SimpleNamespace(
+        request_id="req-ming-tts",
+        data=SimpleNamespace(
+            input_ids=torch.tensor([1, 2, 3]),
+            req=SimpleNamespace(
+                prefix_indices=torch.empty(0, dtype=torch.long),
+                extend_range=SimpleNamespace(length=5),
+            ),
+        ),
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.zeros(5, dtype=torch.long))
+
+    actual = runner._build_prefill_input_embeds(forward_batch, [request])
+
+    assert torch.equal(
+        actual,
+        torch.tensor(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+                [30.0, 31.0],
+                [40.0, 41.0],
+                [50.0, 51.0],
+            ]
+        ),
+    )

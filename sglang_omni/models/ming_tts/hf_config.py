@@ -83,11 +83,11 @@ class BailingMoeTTSConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
-        self.raw_rope_scaling = dict(rope_scaling) if rope_scaling is not None else None
-        if rope_scaling is None:
+        raw_rope_scaling = dict(rope_scaling) if rope_scaling is not None else None
+        self.raw_rope_scaling = raw_rope_scaling
+        if raw_rope_scaling is None:
             self.rope_scaling = None
         else:
-            raw_rope_scaling = dict(rope_scaling)
             if (
                 raw_rope_scaling.get("type") == "3D"
                 and raw_rope_scaling.get("factor") is None
