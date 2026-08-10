@@ -1,14 +1,13 @@
 config_cls: MingTTSPipelineConfig
 model_path: inclusionAI/Ming-omni-tts-16.8B-A3B
 name: ming-omni-tts
-max_decode_steps_cap: 256
-audio_vae_steady_chunk_patches: 2
 stages:
   - name: preprocessing
     process: preprocessing
     factory: sglang_omni.models.ming_tts.stages.create_preprocessing_executor
     factory_args:
       context_length: 8192
+      max_decode_steps_cap: 256
       max_concurrency: 1
     next: reference_encode
 
@@ -57,6 +56,7 @@ stages:
     factory: sglang_omni.models.ming_tts.stages.create_audio_decode_executor
     factory_args:
       dtype: bfloat16
+      audio_vae_steady_chunk_patches: 2
       max_batch_size: 1
       max_batch_wait_ms: 0
     gpu: 0

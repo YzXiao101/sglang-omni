@@ -107,6 +107,13 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         overrides.pop("context_length", None)
         overrides["tp_size"] = self.tp_size
 
+        if overrides["disable_overlap_schedule"] is not True:
+            raise ValueError(
+                "Ming-Omni-TTS does not currently support SGLang overlap "
+                "scheduling; set disable_overlap_schedule=true because the "
+                "continuous acoustic feedback state has no overlap-safe lifecycle"
+            )
+
         if overrides["disable_radix_cache"] is not True:
             raise ValueError(
                 "Ming-Omni-TTS requires disable_radix_cache=true because "

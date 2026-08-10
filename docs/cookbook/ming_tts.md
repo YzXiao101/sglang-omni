@@ -109,9 +109,9 @@ Streaming returns headerless mono signed 16-bit little-endian PCM (`s16le`) at 4
 `Content-Type: audio/pcm`. The `X-Sample-Rate`, `X-Channels`, and `X-Bit-Depth` headers report the
 sample rate, channel count, and bit depth; HTTP EOF ends the stream.
 
-Ming AudioVAE primes its lookahead with one latent patch, then decodes groups of
-`audio_vae_steady_chunk_patches` patches; the provided configuration uses two. The terminal step
-flushes any remainder. Pipe the response to `ffplay` to play it during generation:
+Ming AudioVAE primes its lookahead with one latent patch, then decodes groups configured by
+`audio_decode.factory_args.audio_vae_steady_chunk_patches`; the provided configuration uses two.
+The terminal step flushes any remainder. Pipe the response to `ffplay` to play it during generation:
 
 ```bash
 curl -sS --fail --no-buffer -X POST http://localhost:8000/v1/audio/speech \

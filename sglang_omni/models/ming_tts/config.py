@@ -18,6 +18,89 @@ MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
 MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
 
 
+def _validate_ming_tts_pipeline_contract(
+    config: "MingTTSPipelineConfig",
+) -> dict[str, StageConfig]:
+    """Validate the fixed Ming payload and streaming topology."""
+
+    expected_next = {
+        PREPROCESSING_STAGE: REFERENCE_ENCODE_STAGE,
+        REFERENCE_ENCODE_STAGE: TTS_ENGINE_STAGE,
+        TTS_ENGINE_STAGE: AUDIO_DECODE_STAGE,
+        AUDIO_DECODE_STAGE: None,
+    }
+    stages = {stage.name: stage for stage in config.stages}
+    if set(stages) != set(expected_next):
+        raise ValueError(
+            "Ming-Omni-TTS requires exactly the stages "
+            f"{sorted(expected_next)}; got {sorted(stages)}"
+        )
+    if config.resolved_entry_stage != PREPROCESSING_STAGE:
+        raise ValueError(f"Ming-Omni-TTS entry_stage must be {PREPROCESSING_STAGE!r}")
+
+    for stage_name, next_stage in expected_next.items():
+        stage = stages[stage_name]
+        next_targets = (
+            []
+            if stage.next is None
+            else [stage.next] if isinstance(stage.next, str) else list(stage.next)
+        )
+        expected_targets = [] if next_stage is None else [next_stage]
+        expected_terminal = next_stage is None
+        if next_targets != expected_targets or stage.terminal != expected_terminal:
+            raise ValueError(
+                f"Ming-Omni-TTS stage {stage_name!r} must set "
+                f"next={expected_targets!r}, terminal={expected_terminal}; got "
+                f"next={next_targets!r}, terminal={stage.terminal}"
+            )
+
+    tts_engine = stages[TTS_ENGINE_STAGE]
+    if list(tts_engine.stream_to) != [AUDIO_DECODE_STAGE]:
+        raise ValueError(
+            "Ming-Omni-TTS tts_engine stream_to must include 'audio_decode' as "
+            f"its only target, got {list(tts_engine.stream_to)!r}"
+        )
+    for stage_name in (
+        PREPROCESSING_STAGE,
+        REFERENCE_ENCODE_STAGE,
+        AUDIO_DECODE_STAGE,
+    ):
+        if stages[stage_name].stream_to:
+            raise ValueError(
+                f"Ming-Omni-TTS stage {stage_name!r} stream_to must be empty"
+            )
+
+    audio_decode = stages[AUDIO_DECODE_STAGE]
+    if not audio_decode.can_accept_stream_before_payload:
+        raise ValueError(
+            "Ming-Omni-TTS audio_decode must set "
+            "can_accept_stream_before_payload=true because "
+            "tts_engine sends stream data and stream_done before the terminal payload"
+        )
+
+    dynamic_fields = [
+        f"{stage.name}.{field_name}"
+        for stage in config.stages
+        for field_name in (
+            "route_fn",
+            "wait_for",
+            "wait_for_fn",
+            "merge_fn",
+            "stream_done_to_fn",
+            "project_payload",
+        )
+        if getattr(stage, field_name)
+    ]
+    if config.terminal_stages_fn is not None:
+        dynamic_fields.append("terminal_stages_fn")
+    if dynamic_fields:
+        raise ValueError(
+            "Ming-Omni-TTS fixed pipeline must not configure dynamic data-flow "
+            f"fields: {sorted(dynamic_fields)}"
+        )
+    return stages
+
+
 def validate_ming_tts_audio_decode_batch_config(
     *,
     max_batch_size: int,
@@ -92,14 +175,13 @@ class MingTTSPipelineConfig(PipelineConfig):
         }
 
     model_path: str
-    max_decode_steps_cap: int | None = 256
-    audio_vae_steady_chunk_patches: int = 2
     entry_stage: str = PREPROCESSING_STAGE
     stages: list[StageConfig] = [
         StageConfig(
             name=PREPROCESSING_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"max_decode_steps_cap": 256},
             next=REFERENCE_ENCODE_STAGE,
         ),
         StageConfig(
@@ -125,6 +207,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_audio_decode_executor",
             factory_args={
                 "dtype": "bfloat16",
+                "audio_vae_steady_chunk_patches": 2,
                 "max_batch_size": MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
                 "max_batch_wait_ms": MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
             },
@@ -136,41 +219,48 @@ class MingTTSPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
-        if self.max_decode_steps_cap is not None and self.max_decode_steps_cap <= 0:
-            raise ValueError("Ming-Omni-TTS max_decode_steps_cap must be positive")
-        if self.audio_vae_steady_chunk_patches <= 0:
-            raise ValueError(
-                "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
-            )
-        stages = {stage.name: stage for stage in self.stages}
-        required_stages = {
-            PREPROCESSING_STAGE,
-            REFERENCE_ENCODE_STAGE,
-            TTS_ENGINE_STAGE,
-            AUDIO_DECODE_STAGE,
-        }
-        missing_stages = required_stages - stages.keys()
-        if missing_stages:
-            raise ValueError(
-                "Ming-Omni-TTS pipeline is missing required stages: "
-                f"{sorted(missing_stages)}"
-            )
+        stages = _validate_ming_tts_pipeline_contract(self)
         preprocessing = stages[PREPROCESSING_STAGE]
-        tts_engine = stages[TTS_ENGINE_STAGE]
         audio_decode = stages[AUDIO_DECODE_STAGE]
-        if AUDIO_DECODE_STAGE not in tts_engine.stream_to:
+
+        preprocessing_overrides = self.runtime_overrides.get(PREPROCESSING_STAGE, {})
+        if "max_decode_steps_cap" in preprocessing_overrides:
             raise ValueError(
-                "Ming-Omni-TTS tts_engine stream_to must include "
-                f"{AUDIO_DECODE_STAGE!r}"
+                "Ming-Omni-TTS max_decode_steps_cap is owned by "
+                "preprocessing.factory_args, not runtime_overrides"
             )
-        if not audio_decode.can_accept_stream_before_payload:
+        max_decode_steps_cap = preprocessing.factory_args.setdefault(
+            "max_decode_steps_cap", 256
+        )
+        if max_decode_steps_cap is not None and (
+            isinstance(max_decode_steps_cap, bool)
+            or not isinstance(max_decode_steps_cap, int)
+            or max_decode_steps_cap <= 0
+        ):
             raise ValueError(
-                "Ming-Omni-TTS audio_decode must set "
-                "can_accept_stream_before_payload=true because tts_engine sends "
-                "stream data and stream_done before the terminal payload"
+                "Ming-Omni-TTS preprocessing.factory_args.max_decode_steps_cap "
+                "must be a positive integer or null"
             )
 
         audio_decode_overrides = self.runtime_overrides.get(AUDIO_DECODE_STAGE, {})
+        if "audio_vae_steady_chunk_patches" in audio_decode_overrides:
+            raise ValueError(
+                "Ming-Omni-TTS audio_vae_steady_chunk_patches is owned by "
+                "audio_decode.factory_args, not runtime_overrides"
+            )
+        audio_vae_steady_chunk_patches = audio_decode.factory_args.setdefault(
+            "audio_vae_steady_chunk_patches", 2
+        )
+        if (
+            isinstance(audio_vae_steady_chunk_patches, bool)
+            or not isinstance(audio_vae_steady_chunk_patches, int)
+            or audio_vae_steady_chunk_patches <= 0
+        ):
+            raise ValueError(
+                "Ming-Omni-TTS "
+                "audio_decode.factory_args.audio_vae_steady_chunk_patches "
+                "must be a positive integer"
+            )
         if "decode_mode" in audio_decode.factory_args or (
             "decode_mode" in audio_decode_overrides
         ):
@@ -194,37 +284,6 @@ class MingTTSPipelineConfig(PipelineConfig):
                 ),
             ),
         )
-
-        for stage, expected_args in (
-            (
-                preprocessing,
-                {"max_decode_steps_cap": self.max_decode_steps_cap},
-            ),
-            (
-                audio_decode,
-                {
-                    "audio_vae_steady_chunk_patches": (
-                        self.audio_vae_steady_chunk_patches
-                    ),
-                },
-            ),
-        ):
-            runtime_overrides = self.runtime_overrides.get(stage.name, {})
-            for arg, expected_value in expected_args.items():
-                if arg in runtime_overrides:
-                    raise ValueError(
-                        f"Ming-Omni-TTS {arg!r} is owned by the pipeline config, "
-                        f"not stage {stage.name!r}"
-                    )
-                if (
-                    arg in stage.factory_args
-                    and stage.factory_args[arg] != expected_value
-                ):
-                    raise ValueError(
-                        f"Ming-Omni-TTS stage {stage.name!r} {arg!r} conflicts "
-                        "with the pipeline config"
-                    )
-                stage.factory_args[arg] = expected_value
 
         for stage in self.stages:
             if stage.name != TTS_ENGINE_STAGE:
