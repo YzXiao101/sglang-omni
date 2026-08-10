@@ -110,7 +110,7 @@ Streaming returns headerless mono signed 16-bit little-endian PCM (`s16le`) at 4
 sample rate, channel count, and bit depth; HTTP EOF ends the stream.
 
 Ming AudioVAE primes its lookahead with one latent patch, then decodes groups configured by
-`audio_decode.factory_args.steady_chunk_patches`; the provided configuration uses two.
+`audio_decode.factory_args.steady_chunk_patches`; the provided configuration uses four.
 The terminal step flushes any remainder. Pipe the response to `ffplay` to play it during generation:
 
 ```bash
@@ -206,7 +206,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --meta zhaochenyang20/seed-tts-eval-arrow \
   --output-dir <output-directory> \
   --lang <lang> --ref-format references \
-  --max-new-tokens 256 --max-concurrency 8 \
+  --max-new-tokens 256 --max-concurrency 8 --asr-concurrency 1 \
   <scenario-flags>
 ```
 
