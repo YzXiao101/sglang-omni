@@ -10,6 +10,7 @@ import yaml
 
 from sglang_omni.models.ming_tts.config import (
     AUDIO_DECODE_STAGE,
+    MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     TTS_ENGINE_STAGE,
     MingTTSPipelineConfig,
 )
@@ -43,6 +44,7 @@ def test_ming_tts_audio_decode_defaults_are_full_sequence_and_serial() -> None:
     factory_args = _audio_decode_stage(raw)["factory_args"]
 
     assert "decode_mode" not in factory_args
+    assert factory_args["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
     assert factory_args["max_batch_size"] == 1
     assert factory_args["max_batch_wait_ms"] == 0
 
@@ -60,6 +62,7 @@ def test_ming_tts_example_config_uses_supported_audio_decode_contract() -> None:
     )
 
     assert "decode_mode" not in factory_args
+    assert factory_args["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
     assert factory_args["max_batch_size"] == 1
     assert factory_args["max_batch_wait_ms"] == 0
 

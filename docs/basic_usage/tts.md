@@ -166,7 +166,7 @@ SOAR and base are flow-matching checkpoints, so they run the single-request solv
 MeanFlow-only for now. `rednote-hilab/dots.tts-*` is the old org name and redirects to
 `dots-studio/dots.tts-*`; both work as `--model-path`.
 
-For Ming-Omni-TTS on one H200:
+For Ming-Omni-TTS:
 
 ```bash
 sgl-omni serve \

@@ -10,6 +10,7 @@ from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_
 from sglang_omni.models.ming_tts.config import (
     MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
+    MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     validate_ming_tts_audio_decode_batch_config,
 )
 from sglang_omni.models.ming_tts.hf_config import (
@@ -151,7 +152,7 @@ def create_audio_decode_executor(
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     keep_latents: bool = False,
-    audio_vae_steady_chunk_patches: int = 2,
+    steady_chunk_patches: int = MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     max_batch_size: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
 ) -> Any:
@@ -159,16 +160,19 @@ def create_audio_decode_executor(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
+    if (
+        isinstance(steady_chunk_patches, bool)
+        or not isinstance(steady_chunk_patches, int)
+        or steady_chunk_patches <= 0
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS steady_chunk_patches must be a positive integer"
+        )
+
     from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
     from sglang_omni.models.ming_tts.streaming_vocoder import (
         MingTTSStreamingVocoderScheduler,
     )
-
-    steady_chunk_patches = int(audio_vae_steady_chunk_patches)
-    if steady_chunk_patches <= 0:
-        raise ValueError(
-            "Ming-Omni-TTS audio_vae_steady_chunk_patches must be positive"
-        )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
     config = _load_ming_tts_config(checkpoint_dir)

@@ -16,6 +16,8 @@ AUDIO_DECODE_STAGE = "audio_decode"
 
 MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
 MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
+MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP = 256
+MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES = 2
 
 
 def _validate_ming_tts_pipeline_contract(
@@ -181,7 +183,9 @@ class MingTTSPipelineConfig(PipelineConfig):
             name=PREPROCESSING_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
-            factory_args={"max_decode_steps_cap": 256},
+            factory_args={
+                "max_decode_steps_cap": MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP
+            },
             next=REFERENCE_ENCODE_STAGE,
         ),
         StageConfig(
@@ -207,7 +211,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_audio_decode_executor",
             factory_args={
                 "dtype": "bfloat16",
-                "audio_vae_steady_chunk_patches": 2,
+                "steady_chunk_patches": MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
                 "max_batch_size": MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
                 "max_batch_wait_ms": MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
             },
@@ -230,7 +234,7 @@ class MingTTSPipelineConfig(PipelineConfig):
                 "preprocessing.factory_args, not runtime_overrides"
             )
         max_decode_steps_cap = preprocessing.factory_args.setdefault(
-            "max_decode_steps_cap", 256
+            "max_decode_steps_cap", MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP
         )
         if max_decode_steps_cap is not None and (
             isinstance(max_decode_steps_cap, bool)
@@ -243,22 +247,22 @@ class MingTTSPipelineConfig(PipelineConfig):
             )
 
         audio_decode_overrides = self.runtime_overrides.get(AUDIO_DECODE_STAGE, {})
-        if "audio_vae_steady_chunk_patches" in audio_decode_overrides:
+        if "steady_chunk_patches" in audio_decode_overrides:
             raise ValueError(
-                "Ming-Omni-TTS audio_vae_steady_chunk_patches is owned by "
+                "Ming-Omni-TTS steady_chunk_patches is owned by "
                 "audio_decode.factory_args, not runtime_overrides"
             )
-        audio_vae_steady_chunk_patches = audio_decode.factory_args.setdefault(
-            "audio_vae_steady_chunk_patches", 2
+        steady_chunk_patches = audio_decode.factory_args.setdefault(
+            "steady_chunk_patches", MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
         )
         if (
-            isinstance(audio_vae_steady_chunk_patches, bool)
-            or not isinstance(audio_vae_steady_chunk_patches, int)
-            or audio_vae_steady_chunk_patches <= 0
+            isinstance(steady_chunk_patches, bool)
+            or not isinstance(steady_chunk_patches, int)
+            or steady_chunk_patches <= 0
         ):
             raise ValueError(
                 "Ming-Omni-TTS "
-                "audio_decode.factory_args.audio_vae_steady_chunk_patches "
+                "audio_decode.factory_args.steady_chunk_patches "
                 "must be a positive integer"
             )
         if "decode_mode" in audio_decode.factory_args or (

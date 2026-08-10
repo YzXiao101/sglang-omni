@@ -31,7 +31,7 @@ the checkpoint:
 hf download inclusionAI/Ming-omni-tts-16.8B-A3B
 ```
 
-The provided configuration is the recommended TP1 deployment and uses GPU 0.
+The provided configuration uses TP1 on GPU 0.
 
 ## Server Configuration
 
@@ -110,7 +110,7 @@ Streaming returns headerless mono signed 16-bit little-endian PCM (`s16le`) at 4
 sample rate, channel count, and bit depth; HTTP EOF ends the stream.
 
 Ming AudioVAE primes its lookahead with one latent patch, then decodes groups configured by
-`audio_decode.factory_args.audio_vae_steady_chunk_patches`; the provided configuration uses two.
+`audio_decode.factory_args.steady_chunk_patches`; the provided configuration uses two.
 The terminal step flushes any remainder. Pipe the response to `ffplay` to play it during generation:
 
 ```bash
@@ -135,8 +135,8 @@ with `ffmpeg -f s16le -ar 44100 -ac 1 -i output.pcm output.wav`.
 | `input` | (required) | Non-empty text to synthesize |
 | `references` | `null` | At most one local reference clip with non-empty `text` |
 | `ref_audio` / `ref_text` | `null` | Shorthand for the reference clip and transcript |
-| `max_new_tokens` | `200` (effective) | Maximum acoustic generation steps; the provided config caps this at `256` |
-| `temperature` | `0.0` (effective) | Non-negative SDE temperature used by the FlowLoss sampler |
+| `max_new_tokens` | `200` when omitted | Per-request upper bound on acoustic generation steps. The provided configuration accepts values from `1` to `256`; generation may stop earlier |
+| `temperature` | `0.0` when omitted | Non-negative SDE temperature used by the FlowLoss sampler |
 | `response_format` | `wav` | Use `pcm` when `stream` is enabled; `wav` is used by the reference benchmark |
 | `stream` | `false` | Streams raw PCM audio when enabled |
 | `voice` | `default` | Only the default voice selector is accepted |
