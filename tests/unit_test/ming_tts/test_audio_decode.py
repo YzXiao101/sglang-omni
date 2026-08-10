@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from sglang_omni.models.ming_omni.talker.audio_vae.configuration_audio_vae import (
@@ -35,6 +36,18 @@ class _FakeDecoder:
         return torch.empty((0,), dtype=torch.float32)
 
 
+class _RecordingDecoder:
+    sample_rate = 44100
+
+    def __init__(self, waveform: torch.Tensor) -> None:
+        self.waveform = waveform
+        self.calls: list[torch.Tensor] = []
+
+    def decode_nonstreaming(self, latents: torch.Tensor) -> torch.Tensor:
+        self.calls.append(latents.clone())
+        return self.waveform.clone()
+
+
 class _FailingAudioVAE(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -54,7 +67,7 @@ def test_ming_audio_decoder_skips_audio_vae_for_empty_latents() -> None:
     assert waveform.dtype == torch.float32
 
 
-def test_ming_audio_decoder_incremental_matches_full_sequence_on_cpu() -> None:
+def _make_tiny_audio_decoder() -> MingAudioDecoder:
     backbone = {
         "_attn_implementation": "sdpa",
         "attention_dropout": 0.0,
@@ -88,38 +101,105 @@ def test_ming_audio_decoder_incremental_matches_full_sequence_on_cpu() -> None:
         },
         patch_size=4,
     )
+    return MingAudioDecoder(AudioVAE(config).eval(), sample_rate=44100)
+
+
+def _assert_incremental_matches_full_sequence(
+    chunk_patches: tuple[int, ...],
+) -> list[torch.Tensor]:
+    assert chunk_patches and all(count > 0 for count in chunk_patches)
+    num_patches = sum(chunk_patches)
 
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
-        decoder = MingAudioDecoder(AudioVAE(config).eval(), sample_rate=44100)
-        latents = torch.randn(5, 4, 4)
+        decoder = _make_tiny_audio_decoder()
+        latents = torch.randn(num_patches, 4, 4)
 
         full = decoder.decode_nonstreaming(latents)
         state = MingAudioDecoderState()
-        incremental_parts = [
-            decoder.decode_streaming_step(
-                latents[0],
-                state=state,
-                is_last=False,
-            ),
-            decoder.decode_streaming_step(
-                latents[1:3].flatten(0, 1),
-                state=state,
-                is_last=False,
-            ),
-            decoder.decode_streaming_step(
-                latents[3:].flatten(0, 1),
-                state=state,
-                is_last=True,
-            ),
-        ]
+        incremental_parts = []
+        patch_start = 0
+        for chunk_index, patch_count in enumerate(chunk_patches):
+            patch_end = patch_start + patch_count
+            incremental_parts.append(
+                decoder.decode_streaming_step(
+                    latents[patch_start:patch_end].flatten(0, 1),
+                    state=state,
+                    is_last=chunk_index == len(chunk_patches) - 1,
+                )
+            )
+            patch_start = patch_end
 
     incremental = torch.cat(incremental_parts)
-    assert incremental_parts[0].numel() == 0
-    assert incremental_parts[-1].numel() > 0
     assert full.numel() > 0
     assert incremental.shape == full.shape
     torch.testing.assert_close(incremental, full, rtol=1e-4, atol=1e-6)
+    return incremental_parts
+
+
+def test_ming_audio_decoder_incremental_matches_full_sequence_on_cpu() -> None:
+    incremental_parts = _assert_incremental_matches_full_sequence((1, 2, 2))
+
+    assert incremental_parts[0].numel() == 0
+    assert incremental_parts[-1].numel() > 0
+
+
+def test_ming_audio_decoder_single_terminal_patch_matches_full_on_cpu() -> None:
+    incremental_parts = _assert_incremental_matches_full_sequence((1,))
+
+    assert incremental_parts[0].numel() > 0
+
+
+def test_ming_audio_decoder_matches_full_after_window_saturation_on_cpu() -> None:
+    # Eleven patches upsample to 176 decoder frames. With sliding_window=64,
+    # the fifth non-terminal call runs after the cache has crossed the window.
+    incremental_parts = _assert_incremental_matches_full_sequence((1, 2, 2, 2, 2, 2))
+
+    assert incremental_parts[0].numel() == 0
+    assert all(part.numel() > 0 for part in incremental_parts[1:])
+
+
+@pytest.mark.parametrize("keep_latents", [False, True])
+def test_ming_tts_nonstreaming_payload_decodes_full_sequence_once(
+    keep_latents: bool,
+) -> None:
+    latents = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    state = MingTTSState(
+        text="hello",
+        prompt_tokens=3,
+        completion_tokens=2,
+        generated_latents=latents,
+    )
+    payload = StagePayload(
+        request_id="req-ming-tts",
+        request=OmniRequest(inputs="hello"),
+        data=state.to_dict(),
+    )
+    waveform = torch.tensor([0.25, -0.5, 0.75, -1.0], dtype=torch.float32)
+    decoder = _RecordingDecoder(waveform)
+
+    result = decode_ming_tts_audio_payload(
+        payload,
+        decoder,
+        keep_latents=keep_latents,
+    )
+
+    assert len(decoder.calls) == 1
+    torch.testing.assert_close(decoder.calls[0], latents)
+    restored = MingTTSState.from_dict(result.data)
+    if keep_latents:
+        torch.testing.assert_close(restored.generated_latents, latents)
+    else:
+        assert restored.generated_latents is None
+    assert restored.sample_rate == 44100
+    assert restored.duration_s == pytest.approx(waveform.numel() / 44100)
+    assert result.data["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    audio = np.frombuffer(result.data["audio_waveform"], dtype=np.float32)
+    np.testing.assert_array_equal(audio, waveform.numpy())
 
 
 def test_ming_tts_audio_decode_accepts_empty_generated_latents() -> None:
