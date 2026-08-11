@@ -222,23 +222,23 @@ Streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | First Audio Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 1.00% | 0.3526 | 1.615 | 0.5454 | 4.945 | 23.492 |
-| text-only | ZH | 2020 | 0 | 0.67% | 0.3414 | 1.678 | 0.5215 | 4.762 | 23.845 |
-| reference | EN | 1088 | 0 | 1.26% | 0.3777 | 1.655 | 0.6270 | 4.826 | 21.888 |
-| reference | ZH | 2020 | 0 | 0.80% | 0.3474 | 1.962 | 0.6001 | 4.075 | 23.362 |
+| text-only | EN | 1088 | 0 | 0.93% | 0.2722 | 1.243 | 0.5701 | 6.429 | 30.235 |
+| text-only | ZH | 2020 | 0 | 0.68% | 0.2580 | 1.275 | 0.5579 | 6.269 | 31.524 |
+| reference | EN | 1088 | 0 | 1.13% | 0.3113 | 1.355 | 0.6968 | 5.899 | 26.659 |
+| reference | ZH | 2020 | 0 | 0.74% | 0.2683 | 1.513 | 0.6883 | 5.281 | 30.227 |
 
 Non-streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.89% | 0.1997 | 0.943 | 8.467 | 40.106 |
-| text-only | ZH | 2020 | 0 | 0.64% | 0.1964 | 0.986 | 8.104 | 40.787 |
-| reference | EN | 1088 | 0 | 1.10% | 0.2307 | 1.031 | 7.748 | 35.039 |
-| reference | ZH | 2020 | 0 | 0.73% | 0.1967 | 1.124 | 7.113 | 40.723 |
+| text-only | EN | 1088 | 0 | 0.91% | 0.2022 | 0.953 | 8.374 | 39.600 |
+| text-only | ZH | 2020 | 0 | 0.70% | 0.1979 | 0.991 | 8.069 | 40.489 |
+| reference | EN | 1088 | 0 | 0.95% | 0.2279 | 1.018 | 7.849 | 35.470 |
+| reference | ZH | 2020 | 0 | 0.75% | 0.1945 | 1.112 | 7.188 | 41.197 |
 
 All 12,432 requests completed successfully. Reference corpus WER includes a small
 near-silent tail from unseeded acoustic sampling. Streaming returned its first audio
-payload in 0.52-0.63 seconds, while non-streaming retained higher complete-response
+payload in 0.56-0.70 seconds, while non-streaming retained higher complete-response
 throughput.
 
 ## Known Limitations
