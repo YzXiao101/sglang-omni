@@ -23,6 +23,7 @@ AUDIO_DECODE_STAGE = "audio_decode"
 
 MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
 MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
+MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH = False
 MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP = 256
 MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES = 2
 MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES = 4
@@ -119,13 +120,11 @@ def validate_ming_tts_audio_decode_batch_config(
     if (
         isinstance(max_batch_size, bool)
         or not isinstance(max_batch_size, int)
-        or max_batch_size != MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE
+        or max_batch_size <= 0
     ):
         raise ValueError(
-            "Ming-Omni-TTS audio_decode currently supports "
-            f"max_batch_size={MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE} only; "
-            "cross-request AudioVAE batching is not implemented yet, got "
-            f"{max_batch_size!r}"
+            "Ming-Omni-TTS audio_decode max_batch_size must be a positive "
+            f"integer, got {max_batch_size!r}"
         )
     if (
         isinstance(max_batch_wait_ms, bool)
@@ -134,8 +133,8 @@ def validate_ming_tts_audio_decode_batch_config(
     ):
         raise ValueError(
             "Ming-Omni-TTS audio_decode currently supports "
-            f"max_batch_wait_ms={MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS} only "
-            "while cross-request AudioVAE batching is disabled, got "
+            f"max_batch_wait_ms={MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS} only; "
+            "streaming AudioVAE coalescing is nonblocking, got "
             f"{max_batch_wait_ms!r}"
         )
     return max_batch_size, max_batch_wait_ms
@@ -179,6 +178,7 @@ class MingTTSPreprocessingStageConfig(StageConfig):
 class MingTTSAudioDecodeFactoryArgs(FactoryArgs):
     """Audio-decode cadence knobs, typed like the shared ones."""
 
+    audio_vae_cuda_graph: bool | None = None
     initial_chunk_patches: int | None = Field(default=None, gt=0)
     steady_chunk_patches: int | None = Field(default=None, gt=0)
 
@@ -251,6 +251,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_audio_decode_executor",
             factory=MingTTSAudioDecodeFactoryArgs(
                 dtype="bfloat16",
+                audio_vae_cuda_graph=MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH,
                 initial_chunk_patches=MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
                 steady_chunk_patches=MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
                 max_batch_size=MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,

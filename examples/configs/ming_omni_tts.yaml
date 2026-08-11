@@ -49,6 +49,7 @@ stages:
     factory:
       dtype: bfloat16
       initial_chunk_patches: 2
+      audio_vae_cuda_graph: true
       steady_chunk_patches: 4
-      max_batch_size: 1
+      max_batch_size: 8
       max_batch_wait_ms: 0
