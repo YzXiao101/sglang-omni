@@ -36,7 +36,7 @@ class MingAudioDecoder:
         *,
         stream_capacity: int,
         max_stream_step_latents: int,
-        cuda_graph_required: bool,
+        streaming_cuda_graph_required: bool,
     ) -> None:
         self._audio_vae = audio_vae
         self._streaming_transition = _AudioVAEFixedStreamingTransition(
@@ -47,7 +47,7 @@ class MingAudioDecoder:
         self._streaming_transition.assert_rows_clean()
         self._streaming_runner = _MingAudioStreamingRunner(
             self._streaming_transition,
-            cuda_graph_required=cuda_graph_required,
+            cuda_graph_required=streaming_cuda_graph_required,
         )
 
     @property
@@ -1082,9 +1082,11 @@ class _MingAudioStreamingRunner:
         )
         logger.info(
             "ming_tts_audio_vae_runner stage=audio_decode "
-            "graph_backend=%s graph_ready=%s static_device_input_bytes=%d "
+            "streaming_backend=%s streaming_cuda_graph_required=%s "
+            "streaming_graph_ready=%s static_device_input_bytes=%d "
             "pinned_host_io_bytes=%d",
-            "cuda_graph_required" if self._cuda_graph_required else "eager",
+            "cuda_graph" if self._cuda_graph_required else "eager",
+            self._cuda_graph_required,
             self.is_ready,
             static_device_input_bytes,
             pinned_host_io_bytes,
@@ -1104,7 +1106,7 @@ class _MingAudioStreamingRunner:
         captured = self._captured_graph
         if self._cuda_graph_required and captured is None:
             raise RuntimeError(
-                "required Ming-Omni-TTS AudioVAE CUDA graph is not prepared"
+                "required Ming-Omni-TTS streaming AudioVAE CUDA graph is not prepared"
             )
 
         self._host_latents.zero_()
@@ -1174,7 +1176,9 @@ class _MingAudioStreamingRunner:
         if not self._cuda_graph_required:
             return
         if self._captured_graph is not None:
-            raise RuntimeError("Ming-Omni-TTS AudioVAE CUDA graph is already prepared")
+            raise RuntimeError(
+                "Ming-Omni-TTS streaming AudioVAE CUDA graph is already prepared"
+            )
 
         candidate_graph: torch.cuda.CUDAGraph | None = None
         try:
@@ -1233,7 +1237,8 @@ class _MingAudioStreamingRunner:
                 )
                 if replay_output_ptrs != output_ptrs:
                     raise RuntimeError(
-                        "Ming-Omni-TTS AudioVAE CUDA graph output addresses changed"
+                        "Ming-Omni-TTS streaming AudioVAE CUDA graph output "
+                        "addresses changed"
                     )
                 self._reset_transition()
                 allocated_after = int(
@@ -1254,11 +1259,12 @@ class _MingAudioStreamingRunner:
                 except Exception:
                     logger.exception(
                         "Failed to reset an unpublished Ming-Omni-TTS "
-                        "AudioVAE CUDA graph"
+                        "streaming AudioVAE CUDA graph"
                     )
             raise
         logger.info(
-            "ming_tts_audio_vae_graph stage=audio_decode graph_ready=true "
+            "ming_tts_audio_vae_streaming_graph stage=audio_decode "
+            "streaming_graph_ready=true "
             "allocator_allocated_before_bytes=%d "
             "allocator_allocated_after_bytes=%d "
             "allocator_allocated_delta_bytes=%d "
@@ -1283,7 +1289,8 @@ class _MingAudioStreamingRunner:
     ) -> None:
         if type(output) is not _AudioVAEFixedStreamingOutput:
             raise RuntimeError(
-                "Ming-Omni-TTS AudioVAE CUDA graph returned an invalid output type"
+                "Ming-Omni-TTS streaming AudioVAE CUDA graph returned an "
+                "invalid output type"
             )
 
         expected_waveform_shape = (
@@ -1299,7 +1306,7 @@ class _MingAudioStreamingRunner:
             or waveform.requires_grad
         ):
             raise RuntimeError(
-                "Ming-Omni-TTS AudioVAE CUDA graph returned an invalid "
+                "Ming-Omni-TTS streaming AudioVAE CUDA graph returned an invalid "
                 "waveform contract"
             )
 
@@ -1312,7 +1319,7 @@ class _MingAudioStreamingRunner:
             or sample_lengths.requires_grad
         ):
             raise RuntimeError(
-                "Ming-Omni-TTS AudioVAE CUDA graph returned an invalid "
+                "Ming-Omni-TTS streaming AudioVAE CUDA graph returned an invalid "
                 "sample-length contract"
             )
 

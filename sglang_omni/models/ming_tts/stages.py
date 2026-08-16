@@ -14,8 +14,8 @@ from sglang_omni.models.ming_tts.config import (
     MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
     MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
-    MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH,
     MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+    MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
     validate_ming_tts_audio_decode_batch_config,
     validate_ming_tts_audio_decode_cadence_config,
 )
@@ -224,8 +224,8 @@ def create_audio_decode_executor(
     dtype: str = "bfloat16",
     keep_latents: bool = False,
     initial_chunk_patches: int = MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
-    audio_vae_cuda_graph: bool = MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH,
     steady_chunk_patches: int = MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+    streaming_cuda_graph: bool = MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
     max_batch_size: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
     total_gpu_memory_fraction: float | None = None,
@@ -239,8 +239,8 @@ def create_audio_decode_executor(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
-    if not isinstance(audio_vae_cuda_graph, bool):
-        raise ValueError("Ming-Omni-TTS audio_vae_cuda_graph must be a boolean")
+    if not isinstance(streaming_cuda_graph, bool):
+        raise ValueError("Ming-Omni-TTS streaming_cuda_graph must be a boolean")
 
     import torch
 
@@ -267,9 +267,9 @@ def create_audio_decode_executor(
             component_fraction = value
         else:
             process_fraction = value
-    if audio_vae_cuda_graph and process_fraction is None:
+    if streaming_cuda_graph and process_fraction is None:
         raise ValueError(
-            "Ming-Omni-TTS AudioVAE CUDA graph requires "
+            "Ming-Omni-TTS streaming AudioVAE CUDA graph requires "
             "process_total_gpu_memory_fraction"
         )
     if (
@@ -358,7 +358,7 @@ def create_audio_decode_executor(
         audio_vae,
         stream_capacity=stream_capacity,
         max_stream_step_latents=max_step_latents,
-        cuda_graph_required=audio_vae_cuda_graph,
+        streaming_cuda_graph_required=streaming_cuda_graph,
     )
 
     logger.info(
@@ -421,7 +421,8 @@ def create_audio_decode_executor(
 
         logger.info(
             "ming_tts_audio_decode_ready stage=audio_decode device=%s dtype=%s "
-            "attention_backend=%s graph_backend=%s graph_required=%s capacity=%d "
+            "attention_backend=%s streaming_backend=%s "
+            "streaming_cuda_graph_required=%s capacity=%d "
             "initial_chunk_patches=%d steady_chunk_patches=%d "
             "audio_patch_size=%d max_step_latents=%d latent_dim=%d "
             "component_fraction=%s process_fraction=%s "
@@ -431,8 +432,8 @@ def create_audio_decode_executor(
             resolved_device,
             str(resolved_dtype).removeprefix("torch."),
             MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
-            "cuda_graph" if audio_vae_cuda_graph else "eager",
-            audio_vae_cuda_graph,
+            "cuda_graph" if streaming_cuda_graph else "eager",
+            streaming_cuda_graph,
             stream_capacity,
             initial_chunk_patches,
             steady_chunk_patches,

@@ -23,10 +23,10 @@ AUDIO_DECODE_STAGE = "audio_decode"
 
 MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
 MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
-MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH = False
 MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP = 256
 MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES = 2
 MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES = 4
+MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH = False
 
 
 def _validate_ming_tts_pipeline_contract(
@@ -178,7 +178,7 @@ class MingTTSPreprocessingStageConfig(StageConfig):
 class MingTTSAudioDecodeFactoryArgs(FactoryArgs):
     """Audio-decode cadence knobs, typed like the shared ones."""
 
-    audio_vae_cuda_graph: bool | None = None
+    streaming_cuda_graph: bool | None = None
     initial_chunk_patches: int | None = Field(default=None, gt=0)
     steady_chunk_patches: int | None = Field(default=None, gt=0)
 
@@ -251,9 +251,9 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_audio_decode_executor",
             factory=MingTTSAudioDecodeFactoryArgs(
                 dtype="bfloat16",
-                audio_vae_cuda_graph=MING_TTS_DEFAULT_AUDIO_VAE_CUDA_GRAPH,
                 initial_chunk_patches=MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
                 steady_chunk_patches=MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+                streaming_cuda_graph=MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
                 max_batch_size=MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
                 max_batch_wait_ms=MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
             ),

@@ -540,7 +540,7 @@ class MingTTSStreamingVocoderScheduler(
     def on_serving_start(self) -> None:
         if not self._decoder.streaming_ready:
             raise RuntimeError(
-                "required Ming-Omni-TTS AudioVAE CUDA graph was not prepared"
+                "required Ming-Omni-TTS streaming AudioVAE CUDA graph was not prepared"
             )
 
     def on_serving_stop(self) -> None:
