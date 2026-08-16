@@ -47,9 +47,12 @@ eager, and requests are non-streaming unless `stream` is set.
 
 For non-streaming requests, `audio_decode` sends the complete generated latent sequence through
 one full-sequence AudioVAE decode. Streaming requests use the separate incremental AudioVAE path
-with request-local cache and overlap state. Older configs must remove `decode_mode` from either
-`audio_decode.factory_args` or `runtime_overrides.audio_decode`; non-streaming chunked decode is
-no longer supported, and the server rejects the legacy setting during config loading.
+with request-local cache and overlap state. Older configs need three changes, all enforced
+during config loading: remove `decode_mode` from `audio_decode.factory_args` or
+`runtime_overrides.audio_decode`, because non-streaming chunked decode is no longer supported;
+set `tts_engine.stream_to` to `[audio_decode]` to declare the latent stream edge; and set
+`audio_decode.can_accept_stream_before_payload` to `true` so the consumer accepts latents that
+arrive while generation is still running. The provided YAML already carries all three.
 
 Cross-request AudioVAE batching is not implemented yet. The only supported audio-decode batch
 configuration is `max_batch_size: 1` with `max_batch_wait_ms: 0`, as shown in the provided YAML;

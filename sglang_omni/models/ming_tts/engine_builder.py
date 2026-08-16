@@ -13,6 +13,16 @@ from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph
 logger = logging.getLogger(__name__)
 
 
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
 class MingTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Ming-Omni-TTS"
     context_length = 0
@@ -107,14 +117,15 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         overrides.pop("context_length", None)
         overrides["tp_size"] = self.tp_size
 
-        if overrides["disable_overlap_schedule"] is not True:
+        if not _is_truthy(overrides["disable_overlap_schedule"]):
             raise ValueError(
                 "Ming-Omni-TTS does not currently support SGLang overlap "
                 "scheduling; set disable_overlap_schedule=true because the "
                 "continuous acoustic feedback state has no overlap-safe lifecycle"
             )
+        overrides["disable_overlap_schedule"] = True
 
-        if overrides["disable_radix_cache"] is not True:
+        if not _is_truthy(overrides["disable_radix_cache"]):
             raise ValueError(
                 "Ming-Omni-TTS requires disable_radix_cache=true because "
                 "prefix/radix cache is not currently supported"
@@ -130,7 +141,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
                 "continuous state does not have chunk rollback semantics"
             )
         overrides["chunked_prefill_size"] = 0
-        if bool(overrides.get("enable_torch_compile", False)):
+        if _is_truthy(overrides.get("enable_torch_compile", False)):
             raise ValueError("Ming-Omni-TTS torch.compile is not currently supported")
 
     def infra_kwargs(self) -> dict[str, Any]:
