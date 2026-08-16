@@ -51,17 +51,17 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/tts';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
-    <script src="../_static/js/qwen3_omni_server_generator.js?v=94f3a115"></script>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=66f6ff63"></script>
     <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="TTS Process Topology" href="tts_process_topology.html" />
-    <link rel="prev" title="Omni Model Usage" href="qwen3_omni.html" />
+    <link rel="prev" title="Audio Translations" href="audio_translations.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.1" />
-    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,6 +207,7 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/release_notes.html">Release Notes</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
@@ -219,6 +220,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts_local.html">MOSS-TTS-Local</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/dots_tts.html">dots.tts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/minimax_music3.html">MiniMax Music 3</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fun_asr.html">Fun-ASR-Nano</a></li>
@@ -232,6 +234,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">General Usage</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Omni Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="audio_translations.html">Audio Translations</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">TTS Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
@@ -1094,7 +1097,7 @@ the SGLang-Omni server:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code></p></td>
 <td><p>int</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
-<td><p>Optional first codec chunk size for streaming TTFA tuning. When omitted, each model applies its own default: Higgs TTS uses <code class="docutils literal notranslate"><span class="pre">20</span></code>, MOSS-TTS Local uses <code class="docutils literal notranslate"><span class="pre">5</span></code>, and ZONOS2 uses <code class="docutils literal notranslate"><span class="pre">40</span></code>. An explicit <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the model’s steady chunk size from the start</p></td>
+<td><p>Optional first codec chunk size for streaming TTFA / playback-continuity tuning. When omitted, each model applies its own default: Qwen3-TTS Base uses <code class="docutils literal notranslate"><span class="pre">8</span></code>, Higgs TTS uses <code class="docutils literal notranslate"><span class="pre">20</span></code>, MOSS-TTS Local uses <code class="docutils literal notranslate"><span class="pre">5</span></code>, and ZONOS2 uses <code class="docutils literal notranslate"><span class="pre">40</span></code>. An explicit <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the model’s steady chunk size from the start</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">references</span></code></p></td>
 <td><p>list</p></td>
@@ -1280,12 +1283,12 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="qwen3_omni.html"
+       href="audio_translations.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Omni Model Usage</p>
+        <p class="prev-next-title">Audio Translations</p>
       </div>
     </a>
     <a class="right-next"
@@ -1367,7 +1370,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 10, 2026.
+  Last updated on Aug 16, 2026.
   <br/>
 </p>
   </div>
