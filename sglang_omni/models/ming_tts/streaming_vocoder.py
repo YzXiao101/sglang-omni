@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class _AudioVAEStreamingStateManager:
-    """Own request-to-slot bindings and reset each slot before reuse."""
+    """Own request-to-slot bindings and enforce clean rows before reuse."""
 
     def __init__(
         self,
@@ -75,6 +75,13 @@ class _AudioVAEStreamingStateManager:
         slots = tuple(bindings.values())
         self._decoder.reset_stream_rows(slots)
         for request_id, slot in bindings.items():
+            del self._request_to_slot[request_id]
+            self._free_slots.append(slot)
+
+    def release_clean(self, request_ids: Sequence[str]) -> None:
+        """Release rows already cleaned by successful terminal transitions."""
+        slots = self.resolve_slots(request_ids)
+        for request_id, slot in zip(request_ids, slots, strict=True):
             del self._request_to_slot[request_id]
             self._free_slots.append(slot)
 
@@ -357,14 +364,6 @@ class MingTTSStreamingVocoderScheduler(
             patch_groups=tuple(item.patches for item in plan),
             terminal_flags=tuple(item.terminal for item in plan),
         )
-        self._state_manager.reset_and_release(
-            tuple(
-                request_id
-                for request_id, item in zip(request_ids, plan, strict=True)
-                if item.terminal
-            )
-        )
-
         decoded = {}
         for (request_id, state), item, waveform in zip(
             participants,
@@ -381,6 +380,14 @@ class MingTTSStreamingVocoderScheduler(
             state.emitted_samples += sample_count
             if sample_count > 0:
                 decoded[request_id] = waveform
+
+        self._state_manager.release_clean(
+            tuple(
+                request_id
+                for request_id, item in zip(request_ids, plan, strict=True)
+                if item.terminal
+            )
+        )
         return decoded
 
     def on_step_failure(

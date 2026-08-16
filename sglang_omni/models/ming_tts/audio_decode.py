@@ -11,11 +11,15 @@ from numbers import Integral
 from typing import cast
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import Cache, CacheLayerMixin
 
 from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import AudioVAE
-from sglang_omni.models.ming_omni.talker.audio_vae.vae_modules import Decoder
+from sglang_omni.models.ming_omni.talker.audio_vae.vae_modules import (
+    Decoder,
+    StreamingLinearUpsample,
+)
 from sglang_omni.models.ming_tts.payload_types import (
     load_ming_tts_state,
     store_ming_tts_state,
@@ -129,8 +133,7 @@ class _AudioVAEFixedStreamingOutput:
 class _AudioVAEFixedStreamingStateBank:
     upsample_pending: torch.Tensor
     upsample_pending_lengths: torch.Tensor
-    upsample_history: torch.Tensor
-    upsample_has_history: torch.Tensor
+    upsample_left_anchor: torch.Tensor
     qwen_keys: torch.Tensor
     qwen_values: torch.Tensor
     qwen_lengths: torch.Tensor
@@ -143,8 +146,7 @@ class _AudioVAEFixedStreamingStateBank:
         return (
             ("upsample_pending", self.upsample_pending, 0),
             ("upsample_pending_lengths", self.upsample_pending_lengths, 0),
-            ("upsample_history", self.upsample_history, 0),
-            ("upsample_has_history", self.upsample_has_history, 0),
+            ("upsample_left_anchor", self.upsample_left_anchor, 0),
             ("qwen_keys", self.qwen_keys, 1),
             ("qwen_values", self.qwen_values, 1),
             ("qwen_lengths", self.qwen_lengths, 0),
@@ -277,7 +279,32 @@ class _AudioVAEFixedStreamingTransition:
             if configured_head_dim is None
             else configured_head_dim
         )
-        upsampler = decoder.upsampling.upsampler
+        upsampling = getattr(decoder, "upsampling", None)
+        upsampler = getattr(upsampling, "upsampler", None)
+        if (
+            type(upsampling) is not StreamingLinearUpsample
+            or upsampling.scale_factor != patch_size
+            or type(upsampler) is not nn.Upsample
+            or upsampler.mode != "linear"
+            or upsampler.align_corners is not False
+            or upsampler.size is not None
+            or upsampler.scale_factor != patch_size
+            or upsampler.recompute_scale_factor is not None
+        ):
+            raise ValueError(
+                "AudioVAE fixed streaming requires exact "
+                "StreamingLinearUpsample(nn.Upsample) semantics matching "
+                f"decoder patch_size={patch_size}; got "
+                f"wrapper={type(upsampling).__name__}, "
+                f"wrapper_scale={getattr(upsampling, 'scale_factor', None)!r}, "
+                f"inner={type(upsampler).__name__}, "
+                f"mode={getattr(upsampler, 'mode', None)!r}, "
+                f"align_corners={getattr(upsampler, 'align_corners', None)!r}, "
+                f"size={getattr(upsampler, 'size', None)!r}, "
+                f"inner_scale={getattr(upsampler, 'scale_factor', None)!r}, "
+                "recompute_scale_factor="
+                f"{getattr(upsampler, 'recompute_scale_factor', None)!r}"
+            )
 
         istft = decoder.head.istft
         win_length = int(istft.win_length)
@@ -341,13 +368,10 @@ class _AudioVAEFixedStreamingTransition:
             upsample_pending_lengths=torch.zeros(
                 self.capacity, device=device, dtype=torch.long
             ),
-            upsample_history=torch.zeros(
+            upsample_left_anchor=torch.zeros(
                 (self.capacity, 1, hidden_size),
                 device=device,
                 dtype=input_dtype,
-            ),
-            upsample_has_history=torch.zeros(
-                self.capacity, device=device, dtype=torch.bool
             ),
             qwen_keys=torch.zeros(kv_shape, device=device, dtype=input_dtype),
             qwen_values=torch.zeros(kv_shape, device=device, dtype=input_dtype),
@@ -440,8 +464,7 @@ class _AudioVAEFixedStreamingTransition:
                 (
                     next_upsample_pending,
                     next_upsample_pending_lengths,
-                    next_upsample_history,
-                    next_upsample_has_history,
+                    next_upsample_left_anchor,
                 ),
             ) = self._upsample(
                 projected,
@@ -455,7 +478,7 @@ class _AudioVAEFixedStreamingTransition:
                 next_qwen_values,
                 next_qwen_lengths,
                 next_qwen_positions,
-            ) = self._qwen(frames, frame_lengths, qwen_exec)
+            ) = self._qwen(frames, frame_lengths)
             (
                 waveform,
                 sample_lengths,
@@ -473,8 +496,7 @@ class _AudioVAEFixedStreamingTransition:
             next_state = _AudioVAEFixedStreamingStateBank(
                 upsample_pending=next_upsample_pending,
                 upsample_pending_lengths=next_upsample_pending_lengths,
-                upsample_history=next_upsample_history,
-                upsample_has_history=next_upsample_has_history,
+                upsample_left_anchor=next_upsample_left_anchor,
                 qwen_keys=next_qwen_keys,
                 qwen_values=next_qwen_values,
                 qwen_lengths=next_qwen_lengths,
@@ -483,7 +505,7 @@ class _AudioVAEFixedStreamingTransition:
                 istft_window_overlap=next_istft_window_overlap,
                 istft_started=next_istft_started,
             )
-            self._commit(exec_mask, terminal_mask, next_state)
+            self._commit(exec_mask, qwen_exec, terminal_mask, next_state)
         return _AudioVAEFixedStreamingOutput(
             waveform=waveform,
             sample_lengths=sample_lengths,
@@ -579,138 +601,91 @@ class _AudioVAEFixedStreamingTransition:
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         state = self._state
         row = torch.arange(self.capacity, device=self.device)
-        current_last_index = torch.clamp(current_lengths - 1, min=0)
-        current_first = current[:, 0]
-
-        no_history_input = F.pad(state.upsample_pending, (0, 0, 0, 1))
-        lookahead_index = state.upsample_pending_lengths.reshape(
-            self.capacity, 1, 1
-        ).expand(-1, 1, self._hidden_size)
-        no_history_input = no_history_input.scatter(
-            1,
-            lookahead_index,
-            current_first.unsqueeze(1),
+        latent_index = torch.arange(
+            self.max_step_latents, device=self.device
+        ).unsqueeze(0)
+        has_pending = state.upsample_pending_lengths > 0
+        left_anchor = torch.where(
+            has_pending.reshape(self.capacity, 1, 1),
+            state.upsample_left_anchor,
+            current[:, :1],
         )
-        no_history_frames = self._upsampler(no_history_input.transpose(1, 2)).transpose(
-            1, 2
-        )[:, : self.max_step_latents * self._scale_factor]
 
-        history_input = torch.cat(
+        timeline = torch.cat(
             (
-                state.upsample_history,
+                left_anchor,
                 state.upsample_pending,
                 torch.zeros(
-                    (self.capacity, 1, self._hidden_size),
+                    (
+                        self.capacity,
+                        self.max_step_latents + 1,
+                        self._hidden_size,
+                    ),
                     device=self.device,
                     dtype=self.input_dtype,
                 ),
             ),
             dim=1,
         )
-        history_lookahead_index = (
-            (state.upsample_pending_lengths + 1)
-            .reshape(self.capacity, 1, 1)
-            .expand(-1, 1, self._hidden_size)
-        )
-        history_input = history_input.scatter(
+        current_destination = 1 + state.upsample_pending_lengths.unsqueeze(1)
+        current_destination = current_destination + latent_index
+        timeline.scatter_(
             1,
-            history_lookahead_index,
-            current_first.unsqueeze(1),
+            current_destination.unsqueeze(2).expand(-1, -1, self._hidden_size),
+            current,
         )
-        history_frames = self._upsampler(history_input.transpose(1, 2)).transpose(1, 2)[
-            :,
-            self._scale_factor : self._scale_factor
-            + self.max_step_latents * self._scale_factor,
-        ]
-        previous_frames = torch.where(
-            state.upsample_has_history.reshape(self.capacity, 1, 1),
-            history_frames,
-            no_history_frames,
-        )
-        has_pending = state.upsample_pending_lengths > 0
-        previous_lengths = state.upsample_pending_lengths * self._scale_factor
-        previous_mask = torch.arange(
-            self.max_step_latents * self._scale_factor,
-            device=self.device,
-        ).unsqueeze(0) < previous_lengths.unsqueeze(1)
-        previous_frames = previous_frames * previous_mask.unsqueeze(2)
-        previous_frames = previous_frames * has_pending.reshape(self.capacity, 1, 1)
 
-        current_index = torch.arange(
-            self.max_step_latents, device=self.device
-        ).unsqueeze(0)
-        repeated_current_index = torch.minimum(
-            current_index,
-            current_last_index.unsqueeze(1),
-        )
-        repeated_current = torch.gather(
+        current_last_index = torch.clamp(current_lengths - 1, min=0)
+        current_last = torch.gather(
             current,
             1,
-            repeated_current_index.unsqueeze(2).expand(-1, -1, self._hidden_size),
+            current_last_index.reshape(self.capacity, 1, 1).expand(
+                -1, -1, self._hidden_size
+            ),
         )
-        direct_terminal_frames = self._upsampler(
-            repeated_current.transpose(1, 2)
-        ).transpose(1, 2)
-
-        previous_last_index = torch.clamp(state.upsample_pending_lengths - 1, min=0)
-        history_after_previous = state.upsample_pending[
-            row, previous_last_index
-        ].unsqueeze(1)
-        terminal_input = torch.cat((history_after_previous, repeated_current), dim=1)
-        continued_terminal_frames = self._upsampler(
-            terminal_input.transpose(1, 2)
-        ).transpose(1, 2)[:, self._scale_factor :]
-        terminal_frames = torch.where(
-            has_pending.reshape(self.capacity, 1, 1),
-            continued_terminal_frames,
-            direct_terminal_frames,
+        right_boundary_destination = (
+            1 + state.upsample_pending_lengths + current_lengths
         )
-        current_frame_lengths = current_lengths * self._scale_factor
-        current_frame_mask = torch.arange(
-            self.max_step_latents * self._scale_factor,
-            device=self.device,
-        ).unsqueeze(0) < current_frame_lengths.unsqueeze(1)
-        terminal_frames = terminal_frames * current_frame_mask.unsqueeze(2)
-        terminal_frames = terminal_frames * terminal_mask.reshape(self.capacity, 1, 1)
-
-        frames = torch.zeros(
-            (self.capacity, self._max_frames, self._hidden_size),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        frames[:, : self.max_step_latents * self._scale_factor] = previous_frames
-        terminal_destination = previous_lengths.unsqueeze(1) + torch.arange(
-            self.max_step_latents * self._scale_factor,
-            device=self.device,
-        ).unsqueeze(0)
-        terminal_destination = torch.clamp(
-            terminal_destination, max=self._max_frames - 1
-        )
-        frames = frames.scatter_add(
+        timeline.scatter_(
             1,
-            terminal_destination.unsqueeze(2).expand(-1, -1, self._hidden_size),
-            terminal_frames,
+            right_boundary_destination.reshape(self.capacity, 1, 1).expand(
+                -1, -1, self._hidden_size
+            ),
+            current_last,
         )
-        frame_lengths = torch.where(
-            has_pending,
-            previous_lengths + terminal_mask * current_frame_lengths,
-            terminal_mask * current_frame_lengths,
-        )
-        frame_lengths = torch.where(exec_mask, frame_lengths, 0)
 
-        valid_current = torch.arange(
-            self.max_step_latents, device=self.device
-        ).unsqueeze(0) < current_lengths.unsqueeze(1)
-        next_pending = current * valid_current.unsqueeze(2)
-        next_has_history = state.upsample_has_history | has_pending
+        upsampled = self._upsampler(timeline.transpose(1, 2)).transpose(1, 2)
+        frames = upsampled[
+            :,
+            self._scale_factor : self._scale_factor + self._max_frames,
+        ].to(torch.float32)
+        frame_lengths = (
+            state.upsample_pending_lengths + terminal_mask * current_lengths
+        ) * self._scale_factor
+        frame_lengths = torch.where(exec_mask, frame_lengths, 0)
+        valid_frames = torch.arange(self._max_frames, device=self.device).unsqueeze(
+            0
+        ) < frame_lengths.unsqueeze(1)
+        frames = torch.where(
+            valid_frames.unsqueeze(2),
+            frames,
+            0,
+        )
+
+        valid_current = latent_index < current_lengths.unsqueeze(1)
+        next_pending = torch.where(
+            valid_current.unsqueeze(2),
+            current,
+            0,
+        )
+        next_left_anchor = timeline[row, state.upsample_pending_lengths].unsqueeze(1)
         return (
             frames,
             frame_lengths,
             (
                 next_pending,
                 current_lengths,
-                history_after_previous,
-                next_has_history,
+                next_left_anchor,
             ),
         )
 
@@ -718,7 +693,6 @@ class _AudioVAEFixedStreamingTransition:
         self,
         inputs: torch.Tensor,
         input_lengths: torch.Tensor,
-        exec_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         state = self._state
         position_ids = state.qwen_positions.unsqueeze(1) + torch.arange(
@@ -738,17 +712,16 @@ class _AudioVAEFixedStreamingTransition:
         new_values = torch.stack(
             [cast(torch.Tensor, layer.new_values) for layer in self._cache_layers]
         )
-        next_keys = self._advance_kv(state.qwen_keys, new_keys, input_lengths)
-        next_values = self._advance_kv(state.qwen_values, new_values, input_lengths)
+        next_keys = self._advance_kv(state.qwen_keys, new_keys, input_lengths).to(
+            state.qwen_keys.dtype
+        )
+        next_values = self._advance_kv(state.qwen_values, new_values, input_lengths).to(
+            state.qwen_values.dtype
+        )
         next_lengths = torch.clamp(
             state.qwen_lengths + input_lengths, max=self._cache_size
         )
         next_positions = state.qwen_positions + input_lengths
-        selector = exec_mask.reshape(1, self.capacity, 1, 1, 1)
-        next_keys = torch.where(selector, next_keys, state.qwen_keys)
-        next_values = torch.where(selector, next_values, state.qwen_values)
-        next_lengths = torch.where(exec_mask, next_lengths, state.qwen_lengths)
-        next_positions = torch.where(exec_mask, next_positions, state.qwen_positions)
         return outputs.last_hidden_state, (
             next_keys,
             next_values,
@@ -896,85 +869,97 @@ class _AudioVAEFixedStreamingTransition:
     def _commit(
         self,
         exec_mask: torch.Tensor,
+        qwen_exec: torch.Tensor,
         terminal_mask: torch.Tensor,
         next_state: _AudioVAEFixedStreamingStateBank,
     ) -> None:
         state = self._state
-        alive = exec_mask & ~terminal_mask
+        upsample_alive = exec_mask & ~terminal_mask
+        decoded_alive = qwen_exec & ~terminal_mask
         terminal = exec_mask & terminal_mask
 
-        state.upsample_pending.copy_(
+        def commit_field(
+            destination: torch.Tensor,
+            proposal: torch.Tensor,
+            alive_selector: torch.Tensor,
+            terminal_selector: torch.Tensor,
+        ) -> None:
             torch.where(
-                alive.reshape(-1, 1, 1),
-                next_state.upsample_pending,
-                state.upsample_pending,
+                alive_selector,
+                proposal,
+                destination,
+                out=destination,
             )
+            destination.masked_fill_(terminal_selector, 0)
+
+        upsample_selector = upsample_alive.reshape(-1, 1, 1)
+        upsample_terminal = terminal.reshape(-1, 1, 1)
+        commit_field(
+            state.upsample_pending,
+            next_state.upsample_pending,
+            upsample_selector,
+            upsample_terminal,
         )
-        state.upsample_pending_lengths.copy_(
-            torch.where(
-                alive,
-                next_state.upsample_pending_lengths,
-                state.upsample_pending_lengths,
-            )
+        commit_field(
+            state.upsample_pending_lengths,
+            next_state.upsample_pending_lengths,
+            upsample_alive,
+            terminal,
         )
-        state.upsample_history.copy_(
-            torch.where(
-                alive.reshape(-1, 1, 1),
-                next_state.upsample_history,
-                state.upsample_history,
-            )
-        )
-        state.upsample_has_history.copy_(
-            torch.where(
-                alive,
-                next_state.upsample_has_history,
-                state.upsample_has_history,
-            )
+        commit_field(
+            state.upsample_left_anchor,
+            next_state.upsample_left_anchor,
+            upsample_selector,
+            upsample_terminal,
         )
 
-        qwen_selector = alive.reshape(1, self.capacity, 1, 1, 1)
-        state.qwen_keys.copy_(
-            torch.where(qwen_selector, next_state.qwen_keys, state.qwen_keys)
+        qwen_selector = decoded_alive.reshape(1, self.capacity, 1, 1, 1)
+        qwen_terminal = terminal.reshape(1, self.capacity, 1, 1, 1)
+        commit_field(
+            state.qwen_keys,
+            next_state.qwen_keys,
+            qwen_selector,
+            qwen_terminal,
         )
-        state.qwen_values.copy_(
-            torch.where(qwen_selector, next_state.qwen_values, state.qwen_values)
+        commit_field(
+            state.qwen_values,
+            next_state.qwen_values,
+            qwen_selector,
+            qwen_terminal,
         )
-        state.qwen_lengths.copy_(
-            torch.where(alive, next_state.qwen_lengths, state.qwen_lengths)
+        commit_field(
+            state.qwen_lengths,
+            next_state.qwen_lengths,
+            decoded_alive,
+            terminal,
         )
-        state.qwen_positions.copy_(
-            torch.where(alive, next_state.qwen_positions, state.qwen_positions)
-        )
-
-        state.istft_audio_overlap.copy_(
-            torch.where(
-                alive.unsqueeze(1),
-                next_state.istft_audio_overlap,
-                state.istft_audio_overlap,
-            )
-        )
-        state.istft_window_overlap.copy_(
-            torch.where(
-                alive.unsqueeze(1),
-                next_state.istft_window_overlap,
-                state.istft_window_overlap,
-            )
-        )
-        state.istft_started.copy_(
-            torch.where(alive, next_state.istft_started, state.istft_started)
+        commit_field(
+            state.qwen_positions,
+            next_state.qwen_positions,
+            decoded_alive,
+            terminal,
         )
 
-        state.upsample_pending.masked_fill_(terminal.reshape(-1, 1, 1), 0)
-        state.upsample_pending_lengths.masked_fill_(terminal, 0)
-        state.upsample_history.masked_fill_(terminal.reshape(-1, 1, 1), 0)
-        state.upsample_has_history.masked_fill_(terminal, False)
-        state.qwen_keys.masked_fill_(terminal.reshape(1, -1, 1, 1, 1), 0)
-        state.qwen_values.masked_fill_(terminal.reshape(1, -1, 1, 1, 1), 0)
-        state.qwen_lengths.masked_fill_(terminal, 0)
-        state.qwen_positions.masked_fill_(terminal, 0)
-        state.istft_audio_overlap.masked_fill_(terminal.unsqueeze(1), 0)
-        state.istft_window_overlap.masked_fill_(terminal.unsqueeze(1), 0)
-        state.istft_started.masked_fill_(terminal, False)
+        decoded_selector = decoded_alive.unsqueeze(1)
+        decoded_terminal = terminal.unsqueeze(1)
+        commit_field(
+            state.istft_audio_overlap,
+            next_state.istft_audio_overlap,
+            decoded_selector,
+            decoded_terminal,
+        )
+        commit_field(
+            state.istft_window_overlap,
+            next_state.istft_window_overlap,
+            decoded_selector,
+            decoded_terminal,
+        )
+        commit_field(
+            state.istft_started,
+            next_state.istft_started,
+            decoded_alive,
+            terminal,
+        )
 
 
 @dataclass(frozen=True, slots=True)
