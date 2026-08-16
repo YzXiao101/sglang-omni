@@ -252,7 +252,9 @@ def preprocess_ming_tts_payload(
     if initial_codec_chunk_frames is not None:
         raise ValueError(
             "Ming-Omni-TTS does not support initial_codec_chunk_frames because "
-            "audio chunks follow the acoustic latent patch size"
+            "initial and steady AudioVAE cadence are configured by "
+            "audio_decode.factory_args.initial_chunk_patches and "
+            "audio_decode.factory_args.steady_chunk_patches"
         )
 
     explicit_fields = explicit_generation_fields(tts_params)

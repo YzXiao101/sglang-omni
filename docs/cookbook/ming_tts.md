@@ -112,9 +112,12 @@ Streaming returns headerless mono signed 16-bit little-endian PCM (`s16le`) at 4
 `Content-Type: audio/pcm`. The `X-Sample-Rate`, `X-Channels`, and `X-Bit-Depth` headers report the
 sample rate, channel count, and bit depth; HTTP EOF ends the stream.
 
-Ming AudioVAE primes its lookahead with one latent patch, then decodes groups configured by
-`audio_decode.factory_args.steady_chunk_patches`; the provided configuration uses four.
-The terminal step flushes any remainder. Pipe the response to `ffplay` to play it during generation:
+Ming AudioVAE uses separate initial and steady cadence settings. Its first non-terminal call
+buffers `audio_decode.factory_args.initial_chunk_patches` latent patches and emits no PCM; a
+later call supplies the right-hand context needed to emit that initial group. Subsequent calls
+consume `steady_chunk_patches` at a time. The provided configuration uses two initial patches and
+four steady patches, and the terminal step flushes any remainder. Pipe the response to `ffplay`
+to play it during generation:
 
 ```bash
 curl -sS --fail --no-buffer -X POST http://localhost:8000/v1/audio/speech \
@@ -218,31 +221,43 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 ### Recommended Single-H200 TP1
 
 The recommended TP1 configuration was evaluated on **1× H200 141 GB** with concurrency 8,
-eight warmup requests, and the full Seed-TTS-Eval EN and ZH splits. AR and acoustic-tail CUDA
-graphs were enabled, while AudioVAE decode remained eager.
+eight warmup requests, and the full Seed-TTS-Eval EN and ZH splits. Streaming used two initial
+patches and four steady patches. AR and acoustic-tail CUDA graphs were enabled, while AudioVAE
+decode remained eager.
 
 Streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | First Audio Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.93% | 0.2722 | 1.243 | 0.5701 | 6.429 | 30.235 |
-| text-only | ZH | 2020 | 0 | 0.68% | 0.2580 | 1.275 | 0.5579 | 6.269 | 31.524 |
-| reference | EN | 1088 | 0 | 1.13% | 0.3113 | 1.355 | 0.6968 | 5.899 | 26.659 |
-| reference | ZH | 2020 | 0 | 0.74% | 0.2683 | 1.513 | 0.6883 | 5.281 | 30.227 |
+| text-only | EN | 1088 | 0 | 0.90% | 0.2686 | 1.236 | 0.6208 | 6.462 | 30.617 |
+| text-only | ZH | 2020 | 0 | 0.71% | 0.2592 | 1.278 | 0.6131 | 6.253 | 31.417 |
+| reference | EN | 1088 | 0 | 1.09% | 0.3107 | 1.358 | 0.7471 | 5.883 | 26.622 |
+| reference | ZH | 2020 | 0 | 0.75% | 0.2670 | 1.507 | 0.7326 | 5.303 | 30.377 |
 
 Non-streaming:
 
 | Slice | Lang | Samples | Failed | Corpus WER | RTF Mean | Latency Mean (s) | Throughput (qps) | Audio s/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| text-only | EN | 1088 | 0 | 0.91% | 0.2022 | 0.953 | 8.374 | 39.600 |
-| text-only | ZH | 2020 | 0 | 0.70% | 0.1979 | 0.991 | 8.069 | 40.489 |
-| reference | EN | 1088 | 0 | 0.95% | 0.2279 | 1.018 | 7.849 | 35.470 |
-| reference | ZH | 2020 | 0 | 0.75% | 0.1945 | 1.112 | 7.188 | 41.197 |
+| text-only | EN | 1088 | 0 | 0.91% | 0.2035 | 0.959 | 8.328 | 39.369 |
+| text-only | ZH | 2020 | 0 | 0.69% | 0.1965 | 0.983 | 8.134 | 40.790 |
+| reference | EN | 1088 | 0 | 1.07% | 0.2308 | 1.031 | 7.742 | 35.021 |
+| reference | ZH | 2020 | 0 | 0.71% | 0.1966 | 1.125 | 7.103 | 40.737 |
 
-All 12,432 requests completed successfully. Reference corpus WER includes a small
-near-silent tail from unseeded acoustic sampling. Streaming returned its first audio
-payload in 0.56-0.70 seconds, while non-streaming retained higher complete-response
-throughput.
+All 12,432 requests completed successfully. Streaming returned its first audio payload in
+0.61-0.75 seconds, while non-streaming retained higher complete-response throughput.
+The worst corpus WER was 1.09%.
+
+Streaming playback continuity:
+
+| Slice | Lang | Scored | N/A | Underrun P95 (s) | Underrun P99 (s) | C50 | C100 | C200 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| text-only | EN | 1088 | 0 | 0.0000 | 0.0000 | 100.00% | 100.00% | 100.00% |
+| text-only | ZH | 2020 | 0 | 0.0000 | 0.0000 | 100.00% | 100.00% | 100.00% |
+| reference | EN | 1071 | 17 | 0.0000 | 0.0000 | 100.00% | 100.00% | 100.00% |
+| reference | ZH | 2020 | 0 | 0.0000 | 0.0000 | 100.00% | 100.00% | 100.00% |
+
+`N/A` means that a request returned one PCM payload, so it had no inter-payload seam to score.
+All 11,641 later seams had zero measured playback underrun.
 
 ## Known Limitations
 

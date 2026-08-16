@@ -15,7 +15,10 @@ from sglang_omni.models.ming_tts.audio_decode import (
     MingAudioDecoderState,
     decode_ming_tts_audio_payload,
 )
-from sglang_omni.models.ming_tts.config import MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
+from sglang_omni.models.ming_tts.config import (
+    MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
+    MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+)
 from sglang_omni.models.ming_tts.payload_types import MingTTSState
 from sglang_omni.proto import OmniRequest, StagePayload
 
@@ -161,10 +164,18 @@ def test_ming_audio_decoder_matches_full_after_window_saturation_on_cpu() -> Non
 
 
 def test_ming_audio_decoder_matches_full_at_shipped_cadence_on_cpu() -> None:
+    initial = MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
     steady = MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
     incremental_parts = _assert_incremental_matches_full_sequence(
-        (1, steady, steady, steady)
+        (initial, steady, steady, steady)
     )
+
+    assert incremental_parts[0].numel() == 0
+    assert all(part.numel() > 0 for part in incremental_parts[1:])
+
+
+def test_ming_audio_decoder_matches_full_when_initial_exceeds_steady() -> None:
+    incremental_parts = _assert_incremental_matches_full_sequence((4, 2, 2))
 
     assert incremental_parts[0].numel() == 0
     assert all(part.numel() > 0 for part in incremental_parts[1:])
@@ -172,7 +183,11 @@ def test_ming_audio_decoder_matches_full_at_shipped_cadence_on_cpu() -> None:
 
 def test_ming_audio_decoder_short_terminal_group_matches_full_on_cpu() -> None:
     incremental_parts = _assert_incremental_matches_full_sequence(
-        (1, MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES, 2)
+        (
+            MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
+            MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+            2,
+        )
     )
 
     assert incremental_parts[0].numel() == 0

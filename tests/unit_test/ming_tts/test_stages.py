@@ -9,12 +9,19 @@ import pytest
 
 
 def test_ming_tts_audio_decode_factory_exposes_only_supported_contract() -> None:
-    from sglang_omni.models.ming_tts.config import MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
+    from sglang_omni.models.ming_tts.config import (
+        MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
+        MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+    )
     from sglang_omni.models.ming_tts.stages import create_audio_decode_executor
 
     parameters = inspect.signature(create_audio_decode_executor).parameters
 
     assert "decode_mode" not in parameters
+    assert (
+        parameters["initial_chunk_patches"].default
+        == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+    )
     assert (
         parameters["steady_chunk_patches"].default
         == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
@@ -66,9 +73,11 @@ def test_ming_tts_audio_decode_factory_rejects_batch_config_before_checkpoint(
         stages.create_audio_decode_executor("unused", **factory_args)
 
 
-@pytest.mark.parametrize("value", [True, 1.5, "2", 0])
+@pytest.mark.parametrize("field", ["initial_chunk_patches", "steady_chunk_patches"])
+@pytest.mark.parametrize("value", [True, 1.5, "2", 0, -1])
 def test_audio_decode_factory_rejects_invalid_cadence_before_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
+    field: str,
     value: Any,
 ) -> None:
     from sglang_omni.models.ming_tts import stages
@@ -80,9 +89,9 @@ def test_audio_decode_factory_rejects_invalid_cadence_before_checkpoint(
 
     with pytest.raises(
         ValueError,
-        match="steady_chunk_patches must be a positive integer",
+        match=f"{field} must be a positive integer",
     ):
         stages.create_audio_decode_executor(
             "unused",
-            steady_chunk_patches=value,
+            **{field: value},
         )

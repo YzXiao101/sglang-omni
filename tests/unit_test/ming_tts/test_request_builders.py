@@ -130,7 +130,7 @@ def test_ming_tts_rejects_initial_codec_chunk_frames(
 ) -> None:
     with pytest.raises(
         ValueError,
-        match="does not support initial_codec_chunk_frames",
+        match="initial_chunk_patches.*steady_chunk_patches",
     ):
         preprocess_ming_tts_payload(
             _payload(params=params, tts_params=tts_params),

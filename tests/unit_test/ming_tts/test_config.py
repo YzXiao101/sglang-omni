@@ -10,6 +10,7 @@ import yaml
 
 from sglang_omni.models.ming_tts.config import (
     AUDIO_DECODE_STAGE,
+    MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
     MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     TTS_ENGINE_STAGE,
     MingTTSPipelineConfig,
@@ -44,6 +45,9 @@ def test_ming_tts_audio_decode_defaults_are_full_sequence_and_serial() -> None:
     factory_args = _audio_decode_stage(raw)["factory_args"]
 
     assert "decode_mode" not in factory_args
+    assert (
+        factory_args["initial_chunk_patches"] == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+    )
     assert factory_args["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
     assert factory_args["max_batch_size"] == 1
     assert factory_args["max_batch_wait_ms"] == 0
@@ -54,6 +58,10 @@ def test_ming_tts_example_config_uses_supported_audio_decode_contract() -> None:
     with config_path.open() as config_file:
         raw = yaml.safe_load(config_file)
     assert raw.pop("config_cls") == "MingTTSPipelineConfig"
+    assert (
+        _audio_decode_stage(raw)["factory_args"]["initial_chunk_patches"]
+        == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+    )
     config = MingTTSPipelineConfig.model_validate(raw)
     factory_args = next(
         stage.factory_args
@@ -62,9 +70,64 @@ def test_ming_tts_example_config_uses_supported_audio_decode_contract() -> None:
     )
 
     assert "decode_mode" not in factory_args
+    assert (
+        factory_args["initial_chunk_patches"] == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+    )
     assert factory_args["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
     assert factory_args["max_batch_size"] == 1
     assert factory_args["max_batch_wait_ms"] == 0
+
+
+def test_ming_tts_missing_initial_cadence_uses_default() -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    _audio_decode_stage(raw)["factory_args"].pop("initial_chunk_patches")
+
+    config = MingTTSPipelineConfig.model_validate(raw)
+    factory_args = next(
+        stage.factory_args
+        for stage in config.stages
+        if stage.name == AUDIO_DECODE_STAGE
+    )
+
+    assert (
+        factory_args["initial_chunk_patches"] == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+    )
+
+
+@pytest.mark.parametrize("field", ["initial_chunk_patches", "steady_chunk_patches"])
+def test_ming_tts_rejects_cadence_runtime_override(field: str) -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    raw["runtime_overrides"] = {AUDIO_DECODE_STAGE: {field: 1}}
+
+    with pytest.raises(ValueError, match=f"{field} is owned by"):
+        MingTTSPipelineConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("field", ["initial_chunk_patches", "steady_chunk_patches"])
+@pytest.mark.parametrize("value", [True, 1.5, "2", 0, -1])
+def test_ming_tts_rejects_invalid_cadence(field: str, value: Any) -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    _audio_decode_stage(raw)["factory_args"][field] = value
+
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        MingTTSPipelineConfig.model_validate(raw)
+
+
+def test_ming_tts_accepts_initial_cadence_larger_than_steady() -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    factory_args = _audio_decode_stage(raw)["factory_args"]
+    factory_args["initial_chunk_patches"] = 4
+    factory_args["steady_chunk_patches"] = 2
+
+    config = MingTTSPipelineConfig.model_validate(raw)
+    validated_args = next(
+        stage.factory_args
+        for stage in config.stages
+        if stage.name == AUDIO_DECODE_STAGE
+    )
+
+    assert validated_args["initial_chunk_patches"] == 4
+    assert validated_args["steady_chunk_patches"] == 2
 
 
 @pytest.mark.parametrize("source", ["factory_args", "runtime_overrides"])

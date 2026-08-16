@@ -36,6 +36,19 @@ def _payload() -> StagePayload:
     )
 
 
+def _stream_item(chunk_id: int, value: float, *, is_last: bool) -> StreamItem:
+    return StreamItem(
+        chunk_id=chunk_id,
+        data=torch.full((2, 3), value),
+        from_stage="tts_engine",
+        metadata={
+            "modality": "audio_latents",
+            "stream": True,
+            "is_last": is_last,
+        },
+    )
+
+
 def _request_adapter():
     request_adapter, _ = make_ming_tts_scheduler_adapters(
         model=SimpleNamespace(vocab_size=128),
@@ -88,6 +101,7 @@ def test_ming_tts_streaming_vocoder_rejects_discrete_audio_codes() -> None:
         _FakeStreamingDecoder(),
         patch_size=2,
         latent_dim=3,
+        initial_chunk_patches=2,
         steady_chunk_patches=2,
         max_batch_size=1,
         max_batch_wait_ms=0,
@@ -115,7 +129,8 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
         decoder,
         patch_size=2,
         latent_dim=3,
-        steady_chunk_patches=2,
+        initial_chunk_patches=2,
+        steady_chunk_patches=3,
         max_batch_size=1,
         max_batch_wait_ms=0,
     )
@@ -126,36 +141,31 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
     payload = _payload()
     payload.request.params["stream"] = True
 
-    def stream_item(chunk_id: int, value: float, *, is_last: bool) -> StreamItem:
-        return StreamItem(
-            chunk_id=chunk_id,
-            data=torch.full((2, 3), value),
-            from_stage="tts_engine",
-            metadata={
-                "modality": "audio_latents",
-                "stream": True,
-                "is_last": is_last,
-            },
-        )
+    scheduler._on_chunk(request_id, _stream_item(0, 1.0, is_last=False))
+    assert len(decoder.calls) == 0
+    assert scheduler.outbox.empty()
 
-    scheduler._on_chunk(request_id, stream_item(0, 1.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(1, 2.0, is_last=False))
     assert len(decoder.calls) == 1
     assert scheduler.outbox.empty()
 
-    scheduler._on_chunk(request_id, stream_item(1, 2.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(2, 3.0, is_last=False))
     assert len(decoder.calls) == 1
 
-    scheduler._on_chunk(request_id, stream_item(2, 3.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(3, 4.0, is_last=False))
+    assert len(decoder.calls) == 1
+
+    scheduler._on_chunk(request_id, _stream_item(4, 5.0, is_last=False))
     assert len(decoder.calls) == 2
 
-    scheduler._on_chunk(request_id, stream_item(3, 4.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(5, 6.0, is_last=False))
     assert len(decoder.calls) == 2
 
-    scheduler._on_chunk(request_id, stream_item(4, 5.0, is_last=True))
+    scheduler._on_chunk(request_id, _stream_item(6, 7.0, is_last=True))
     state = scheduler._stream_states[request_id]
     assert state.terminal_received is True
     assert state.pending_patches == []
-    assert state.emitted_samples == 8
+    assert state.emitted_samples == 10
 
     scheduler._on_done(request_id)
     assert request_id in scheduler._stream_states
@@ -163,20 +173,78 @@ def test_ming_tts_streaming_vocoder_initial_and_terminal_cadence() -> None:
     scheduler._on_streaming_new_request(request_id, payload)
 
     assert [(tuple(latent.shape), is_last) for latent, is_last in decoder.calls] == [
-        ((2, 3), False),
         ((4, 3), False),
+        ((6, 3), False),
         ((4, 3), True),
     ]
-    assert torch.equal(decoder.calls[1][0][:2], torch.full((2, 3), 2.0))
-    assert torch.equal(decoder.calls[1][0][2:], torch.full((2, 3), 3.0))
-    assert torch.equal(decoder.calls[2][0][:2], torch.full((2, 3), 4.0))
-    assert torch.equal(decoder.calls[2][0][2:], torch.full((2, 3), 5.0))
+    assert torch.equal(decoder.calls[0][0][:2], torch.full((2, 3), 1.0))
+    assert torch.equal(decoder.calls[0][0][2:], torch.full((2, 3), 2.0))
+    assert torch.equal(decoder.calls[1][0][:2], torch.full((2, 3), 3.0))
+    assert torch.equal(decoder.calls[1][0][2:4], torch.full((2, 3), 4.0))
+    assert torch.equal(decoder.calls[1][0][4:], torch.full((2, 3), 5.0))
+    assert torch.equal(decoder.calls[2][0][:2], torch.full((2, 3), 6.0))
+    assert torch.equal(decoder.calls[2][0][2:], torch.full((2, 3), 7.0))
     assert request_id not in scheduler._stream_states
 
     outputs = [scheduler.outbox.get_nowait() for _ in range(3)]
     assert [output.type for output in outputs] == ["stream", "stream", "result"]
-    assert outputs[-1].data.data["duration_s"] == pytest.approx(8 / 44100)
+    assert outputs[-1].data.data["duration_s"] == pytest.approx(10 / 44100)
     assert "audio_waveform" not in outputs[-1].data.data
+    assert scheduler.outbox.empty()
+
+
+def test_ming_tts_streaming_vocoder_allows_initial_larger_than_steady() -> None:
+    decoder = _FakeStreamingDecoder(first_call_empty=True)
+    scheduler = MingTTSStreamingVocoderScheduler(
+        decoder,
+        patch_size=2,
+        latent_dim=3,
+        initial_chunk_patches=3,
+        steady_chunk_patches=1,
+        max_batch_size=1,
+        max_batch_wait_ms=0,
+    )
+    request_id = "req-ming-tts"
+
+    scheduler._on_chunk(request_id, _stream_item(0, 1.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(1, 2.0, is_last=False))
+    assert decoder.calls == []
+
+    scheduler._on_chunk(request_id, _stream_item(2, 3.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(3, 4.0, is_last=False))
+    scheduler._on_chunk(request_id, _stream_item(4, 5.0, is_last=True))
+
+    assert [(tuple(latent.shape), is_last) for latent, is_last in decoder.calls] == [
+        ((6, 3), False),
+        ((2, 3), False),
+        ((2, 3), True),
+    ]
+
+
+def test_ming_tts_streaming_vocoder_terminal_bypasses_initial_threshold() -> None:
+    decoder = _FakeStreamingDecoder()
+    scheduler = MingTTSStreamingVocoderScheduler(
+        decoder,
+        patch_size=2,
+        latent_dim=3,
+        initial_chunk_patches=3,
+        steady_chunk_patches=2,
+        max_batch_size=1,
+        max_batch_wait_ms=0,
+    )
+    request_id = "req-ming-tts"
+    payload = _payload()
+    payload.request.params["stream"] = True
+    scheduler._on_streaming_new_request(request_id, payload)
+
+    scheduler._on_chunk(request_id, _stream_item(0, 1.0, is_last=True))
+    scheduler._on_done(request_id)
+
+    assert [(tuple(latent.shape), is_last) for latent, is_last in decoder.calls] == [
+        ((2, 3), True)
+    ]
+    outputs = [scheduler.outbox.get_nowait() for _ in range(2)]
+    assert [output.type for output in outputs] == ["stream", "result"]
     assert scheduler.outbox.empty()
 
 
@@ -194,6 +262,7 @@ def test_ming_tts_streaming_retraction_preserves_latent_and_decoder_state() -> N
         decoder,
         patch_size=2,
         latent_dim=3,
+        initial_chunk_patches=1,
         steady_chunk_patches=2,
         max_batch_size=1,
         max_batch_wait_ms=0,

@@ -17,6 +17,7 @@ AUDIO_DECODE_STAGE = "audio_decode"
 MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE = 1
 MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS = 0
 MING_TTS_DEFAULT_MAX_DECODE_STEPS_CAP = 256
+MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES = 2
 MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES = 4
 
 
@@ -133,6 +134,29 @@ def validate_ming_tts_audio_decode_batch_config(
     return max_batch_size, max_batch_wait_ms
 
 
+def validate_ming_tts_audio_decode_cadence_config(
+    *,
+    initial_chunk_patches: int,
+    steady_chunk_patches: int,
+) -> None:
+    if (
+        isinstance(initial_chunk_patches, bool)
+        or not isinstance(initial_chunk_patches, int)
+        or initial_chunk_patches <= 0
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS initial_chunk_patches must be a positive integer"
+        )
+    if (
+        isinstance(steady_chunk_patches, bool)
+        or not isinstance(steady_chunk_patches, int)
+        or steady_chunk_patches <= 0
+    ):
+        raise ValueError(
+            "Ming-Omni-TTS steady_chunk_patches must be a positive integer"
+        )
+
+
 class MingTTSPipelineConfig(PipelineConfig):
     """Ming-Omni-TTS pipeline.
 
@@ -211,6 +235,7 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_audio_decode_executor",
             factory_args={
                 "dtype": "bfloat16",
+                "initial_chunk_patches": MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
                 "steady_chunk_patches": MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
                 "max_batch_size": MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
                 "max_batch_wait_ms": MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
@@ -247,24 +272,22 @@ class MingTTSPipelineConfig(PipelineConfig):
             )
 
         audio_decode_overrides = self.runtime_overrides.get(AUDIO_DECODE_STAGE, {})
-        if "steady_chunk_patches" in audio_decode_overrides:
-            raise ValueError(
-                "Ming-Omni-TTS steady_chunk_patches is owned by "
-                "audio_decode.factory_args, not runtime_overrides"
-            )
+        for field_name in ("initial_chunk_patches", "steady_chunk_patches"):
+            if field_name in audio_decode_overrides:
+                raise ValueError(
+                    f"Ming-Omni-TTS {field_name} is owned by "
+                    "audio_decode.factory_args, not runtime_overrides"
+                )
+        initial_chunk_patches = audio_decode.factory_args.setdefault(
+            "initial_chunk_patches", MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
+        )
         steady_chunk_patches = audio_decode.factory_args.setdefault(
             "steady_chunk_patches", MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
         )
-        if (
-            isinstance(steady_chunk_patches, bool)
-            or not isinstance(steady_chunk_patches, int)
-            or steady_chunk_patches <= 0
-        ):
-            raise ValueError(
-                "Ming-Omni-TTS "
-                "audio_decode.factory_args.steady_chunk_patches "
-                "must be a positive integer"
-            )
+        validate_ming_tts_audio_decode_cadence_config(
+            initial_chunk_patches=initial_chunk_patches,
+            steady_chunk_patches=steady_chunk_patches,
+        )
         if "decode_mode" in audio_decode.factory_args or (
             "decode_mode" in audio_decode_overrides
         ):

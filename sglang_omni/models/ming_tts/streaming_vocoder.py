@@ -27,7 +27,7 @@ class _StreamState:
     expected_chunk_id: int = 0
     pending_patches: list[torch.Tensor] = field(default_factory=list)
     terminal_received: bool = False
-    initial_patch_consumed: bool = False
+    initial_group_consumed: bool = False
     emitted_samples: int = 0
 
 
@@ -40,6 +40,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         *,
         patch_size: int,
         latent_dim: int,
+        initial_chunk_patches: int,
         steady_chunk_patches: int,
         max_batch_size: int,
         max_batch_wait_ms: int,
@@ -48,6 +49,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         self._decoder = decoder
         self._patch_size = int(patch_size)
         self._latent_dim = int(latent_dim)
+        self._initial_chunk_patches = int(initial_chunk_patches)
         self._steady_chunk_patches = int(steady_chunk_patches)
         super().__init__(
             partial(
@@ -140,8 +142,12 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         del is_final
         if state.terminal_received:
             return True
-        target = self._steady_chunk_patches if state.initial_patch_consumed else 1
-        return len(state.pending_patches) >= target
+        return len(state.pending_patches) >= self._next_chunk_patches(state)
+
+    def _next_chunk_patches(self, state: _StreamState) -> int:
+        if state.initial_group_consumed:
+            return self._steady_chunk_patches
+        return self._initial_chunk_patches
 
     def decode_delta(
         self,
@@ -166,9 +172,7 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         if terminal:
             patch_count = len(state.pending_patches)
         else:
-            patch_count = (
-                self._steady_chunk_patches if state.initial_patch_consumed else 1
-            )
+            patch_count = self._next_chunk_patches(state)
         latent_sequence = torch.cat(
             state.pending_patches[:patch_count],
             dim=0,
@@ -180,8 +184,8 @@ class MingTTSStreamingVocoderScheduler(StreamingVocoderBase[_StreamState, None])
         )
 
         del state.pending_patches[:patch_count]
-        if not state.initial_patch_consumed and not terminal:
-            state.initial_patch_consumed = True
+        if not state.initial_group_consumed and not terminal:
+            state.initial_group_consumed = True
         if waveform.numel() == 0:
             return None
         state.emitted_samples += int(waveform.numel())
