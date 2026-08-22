@@ -116,7 +116,7 @@ def validate_ming_tts_audio_decode_batch_config(
     *,
     max_batch_size: int,
     max_batch_wait_ms: int,
-) -> tuple[int, int]:
+) -> None:
     if (
         isinstance(max_batch_size, bool)
         or not isinstance(max_batch_size, int)
@@ -137,7 +137,6 @@ def validate_ming_tts_audio_decode_batch_config(
             "streaming AudioVAE coalescing is nonblocking, got "
             f"{max_batch_wait_ms!r}"
         )
-    return max_batch_size, max_batch_wait_ms
 
 
 def validate_ming_tts_audio_decode_cadence_config(
@@ -166,7 +165,7 @@ def validate_ming_tts_audio_decode_cadence_config(
 class MingTTSPreprocessingFactoryArgs(FactoryArgs):
     """Preprocessing constructor knobs, typed like the shared ones."""
 
-    max_decode_steps_cap: int | None = Field(default=None, gt=0)
+    max_decode_steps_cap: int | None = Field(default=None, gt=0, strict=True)
 
 
 class MingTTSPreprocessingStageConfig(StageConfig):
@@ -178,9 +177,11 @@ class MingTTSPreprocessingStageConfig(StageConfig):
 class MingTTSAudioDecodeFactoryArgs(FactoryArgs):
     """Audio-decode cadence knobs, typed like the shared ones."""
 
-    streaming_cuda_graph: bool | None = None
-    initial_chunk_patches: int | None = Field(default=None, gt=0)
-    steady_chunk_patches: int | None = Field(default=None, gt=0)
+    streaming_cuda_graph: bool | None = Field(default=None, strict=True)
+    initial_chunk_patches: int | None = Field(default=None, gt=0, strict=True)
+    steady_chunk_patches: int | None = Field(default=None, gt=0, strict=True)
+    max_batch_size: int | None = Field(default=None, ge=1, strict=True)
+    max_batch_wait_ms: int | None = Field(default=None, ge=0, strict=True)
 
 
 class MingTTSAudioDecodeStageConfig(StageConfig):
@@ -205,17 +206,6 @@ class MingTTSPipelineConfig(PipelineConfig):
         TTS_ENGINE_STAGE: EngineStageConfig,
         AUDIO_DECODE_STAGE: MingTTSAudioDecodeStageConfig,
     }
-
-    @classmethod
-    def process_local_edges(cls) -> frozenset[tuple[str, str]]:
-        # Note (kaige): both payloads are transport-complete, but preserve the
-        # previous process-split allowlist in this PR and relax it separately.
-        return frozenset(
-            {
-                (PREPROCESSING_STAGE, REFERENCE_ENCODE_STAGE),
-                (REFERENCE_ENCODE_STAGE, TTS_ENGINE_STAGE),
-            }
-        )
 
     entry_stage: str = PREPROCESSING_STAGE
     stages: list[StageConfig] = [
@@ -283,10 +273,6 @@ class MingTTSPipelineConfig(PipelineConfig):
         max_batch_wait_ms = audio_decode.factory.max_batch_wait_ms
         if max_batch_wait_ms is None:
             max_batch_wait_ms = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS
-        elif float(max_batch_wait_ms).is_integer():
-            # The factory group declares the wait as a float; the batch
-            # contract below is written against whole milliseconds.
-            max_batch_wait_ms = int(max_batch_wait_ms)
         validate_ming_tts_audio_decode_batch_config(
             max_batch_size=(
                 audio_decode.factory.max_batch_size

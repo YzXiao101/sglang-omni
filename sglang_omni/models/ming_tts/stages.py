@@ -235,7 +235,7 @@ def create_audio_decode_executor(
         initial_chunk_patches=initial_chunk_patches,
         steady_chunk_patches=steady_chunk_patches,
     )
-    max_batch_size, max_batch_wait_ms = validate_ming_tts_audio_decode_batch_config(
+    validate_ming_tts_audio_decode_batch_config(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
@@ -375,8 +375,6 @@ def create_audio_decode_executor(
             initial_chunk_patches=initial_chunk_patches,
             steady_chunk_patches=steady_chunk_patches,
             keep_latents=keep_latents,
-            max_batch_size=max_batch_size,
-            max_batch_wait_ms=max_batch_wait_ms,
         )
     except Exception:
         try:

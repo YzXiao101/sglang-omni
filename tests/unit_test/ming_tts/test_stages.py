@@ -53,7 +53,7 @@ def test_ming_tts_legacy_engine_factory_alias_forwards(
 @pytest.mark.parametrize(
     ("factory_args", "error"),
     [
-        ({"max_batch_size": 2}, "max_batch_size=1 only"),
+        ({"max_batch_size": 0}, "max_batch_size must be a positive integer"),
         ({"max_batch_wait_ms": 1}, "max_batch_wait_ms=0 only"),
     ],
 )
