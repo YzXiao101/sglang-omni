@@ -51,5 +51,6 @@ stages:
       initial_chunk_patches: 2
       steady_chunk_patches: 4
       streaming_cuda_graph: true
-      max_batch_size: 8
+      stream_slots: 8
+      max_batch_size: 1
       max_batch_wait_ms: 0

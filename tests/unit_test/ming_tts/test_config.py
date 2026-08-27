@@ -13,6 +13,7 @@ from sglang_omni.models.ming_tts.config import (
     AUDIO_DECODE_STAGE,
     MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
     MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+    MING_TTS_DEFAULT_STREAM_SLOTS,
     TTS_ENGINE_STAGE,
     MingTTSPipelineConfig,
 )
@@ -48,6 +49,7 @@ def test_ming_tts_audio_decode_defaults_are_full_sequence_and_serial() -> None:
     assert "decode_mode" not in factory
     assert factory["initial_chunk_patches"] == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
     assert factory["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
+    assert factory["stream_slots"] == MING_TTS_DEFAULT_STREAM_SLOTS
     assert factory["max_batch_size"] == 1
     assert factory["max_batch_wait_ms"] == 0
 
@@ -64,7 +66,8 @@ def test_ming_tts_example_config_uses_supported_audio_decode_contract() -> None:
     assert "decode_mode" not in (factory.model_extra or {})
     assert factory.initial_chunk_patches == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
     assert factory.steady_chunk_patches == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
-    assert factory.max_batch_size == 8
+    assert factory.stream_slots == 8
+    assert factory.max_batch_size == 1
     assert factory.max_batch_wait_ms == 0
 
 
@@ -125,19 +128,27 @@ def test_ming_tts_rejects_legacy_audio_decode_mode() -> None:
         MingTTSPipelineConfig.model_validate(raw)
 
 
-def test_ming_tts_accepts_positive_audio_decode_capacity() -> None:
+def test_ming_tts_accepts_positive_audio_decode_stream_slots() -> None:
     raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
-    _audio_decode_stage(raw)["factory"]["max_batch_size"] = 2
+    _audio_decode_stage(raw)["factory"]["stream_slots"] = 2
 
     MingTTSPipelineConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize("value", [True, 1.5, "2", 0, -1])
-def test_ming_tts_rejects_invalid_audio_decode_capacity(value: Any) -> None:
+def test_ming_tts_rejects_invalid_audio_decode_stream_slots(value: Any) -> None:
     raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
-    _audio_decode_stage(raw)["factory"]["max_batch_size"] = value
+    _audio_decode_stage(raw)["factory"]["stream_slots"] = value
 
-    with pytest.raises(ValueError, match="max_batch_size"):
+    with pytest.raises(ValueError, match="stream_slots"):
+        MingTTSPipelineConfig.model_validate(raw)
+
+
+def test_ming_tts_rejects_cross_request_audio_decode_batching() -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    _audio_decode_stage(raw)["factory"]["max_batch_size"] = 2
+
+    with pytest.raises(ValueError, match="max_batch_size=1 only"):
         MingTTSPipelineConfig.model_validate(raw)
 
 

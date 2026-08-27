@@ -251,6 +251,7 @@ class MingTTSStreamingVocoderScheduler(
         return self._initial_chunk_patches
 
     def select_step_participants(self) -> list[tuple[str, _StreamState]]:
+        self._drain_pending_releases()
         participants = []
         for request_id, state in self._stream_state_items():
             if self._is_aborted(request_id) or not self._has_executable_work(state):
@@ -281,6 +282,48 @@ class MingTTSStreamingVocoderScheduler(
                 )
             )
         return tuple(plan)
+
+    def run_step(
+        self,
+        participants: list[tuple[str, _StreamState]],
+        plan: _StreamingStepPlan,
+    ) -> dict[str, torch.Tensor]:
+        request_ids = tuple(request_id for request_id, _ in participants)
+        slot_ids = self._slot_bindings.resolve_slots(request_ids)
+        waveforms = self._decoder.run_streaming(
+            slot_ids=slot_ids,
+            patch_groups=tuple(item.patches for item in plan),
+            terminal_flags=tuple(item.terminal for item in plan),
+        )
+        step_results = tuple(zip(participants, plan, waveforms, strict=True))
+        for (_, state), item, waveform in step_results:
+            del state.pending_patches[: len(item.patches)]
+            if item.terminal:
+                state.terminal_committed = True
+            elif not state.initial_group_consumed:
+                state.initial_group_consumed = True
+            state.emitted_samples += int(waveform.numel())
+
+        terminal_request_ids = tuple(
+            request_id for (request_id, _), item, _ in step_results if item.terminal
+        )
+        if terminal_request_ids:
+            self._slot_bindings.release_clean(terminal_request_ids)
+
+        return {
+            request_id: waveform
+            for (request_id, _), _, waveform in step_results
+            if waveform.numel() > 0
+        }
+
+    def on_step_failure(
+        self,
+        participants: list[tuple[str, _StreamState]],
+        exc: BaseException,
+    ) -> list[str]:
+        failed = super().on_step_failure(participants, exc)
+        self._drain_pending_releases()
+        return failed
 
     def decode_delta(
         self,
@@ -338,53 +381,6 @@ class MingTTSStreamingVocoderScheduler(
             )
         finally:
             self._pending_release_ids.difference_update(pending)
-
-    def _pump_streams(self) -> list[str]:
-        """Own Ming's fixed transaction and exact-request publication policy."""
-        failed: list[str] = []
-        while True:
-            self._drain_pending_releases()
-            participants = self.select_step_participants()
-            if not participants:
-                break
-            try:
-                plan = self.build_step_plan(participants)
-                request_ids = tuple(request_id for request_id, _ in participants)
-                slot_ids = self._slot_bindings.resolve_slots(request_ids)
-                waveforms = self._decoder.run_streaming(
-                    slot_ids=slot_ids,
-                    patch_groups=tuple(item.patches for item in plan),
-                    terminal_flags=tuple(item.terminal for item in plan),
-                )
-                step_results = tuple(zip(participants, plan, waveforms, strict=True))
-                for (_, state), item, waveform in step_results:
-                    del state.pending_patches[: len(item.patches)]
-                    if item.terminal:
-                        state.terminal_committed = True
-                    elif not state.initial_group_consumed:
-                        state.initial_group_consumed = True
-                    state.emitted_samples += int(waveform.numel())
-
-                terminal_request_ids = tuple(
-                    request_id
-                    for (request_id, _), item, _ in step_results
-                    if item.terminal
-                )
-                if terminal_request_ids:
-                    self._slot_bindings.release_clean(terminal_request_ids)
-            except Exception as exc:
-                failed.extend(self.on_step_failure(participants, exc))
-                self._drain_pending_releases()
-                break
-
-            for (request_id, _), _, waveform in step_results:
-                sample_count = int(waveform.numel())
-                if sample_count == 0 or self._is_aborted(request_id):
-                    continue
-                message = self._stream_chunk_message(request_id, waveform)
-                self.outbox.put(message)
-                self._mark_stream_emitted(request_id)
-        return failed
 
     def release_stream_resources(
         self,

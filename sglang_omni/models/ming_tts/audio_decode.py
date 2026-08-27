@@ -357,7 +357,7 @@ class _AudioVAEFixedStreamingTransition:
                 device=device,
                 dtype=torch.complex64,
             )
-            _, reference_envelope = istft._overlap_add(reference_spectrum)
+            _, reference_envelope = istft.overlap_add_components(reference_spectrum)
         tail_start = frames_per_patch * hop_length
         window_envelope_tail = reference_envelope[
             :, tail_start : tail_start + overlap
@@ -778,11 +778,11 @@ class _AudioVAEFixedStreamingTransition:
         terminal_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         head = self._decoder.head
-        spectrum, _ = head._predict_spectrum(hidden)
+        spectrum, _ = head.predict_spectrum(hidden)
         frame_mask = torch.arange(self._max_frames, device=self.device).unsqueeze(
             0
         ) < frame_lengths.unsqueeze(1)
-        numerator, denominator = head.istft._overlap_add(
+        numerator, denominator = head.istft.overlap_add_components(
             spectrum, valid_frame_mask=frame_mask
         )
 
@@ -1076,6 +1076,19 @@ class _MingAudioStreamingRunner:
                     non_blocking=True,
                 )
                 torch.cuda.current_stream(self._transition.device).synchronize()
+
+            sample_counts: list[int] = []
+            for slot in slot_ids:
+                sample_count = int(self._host_sample_lengths[slot])
+                if (
+                    sample_count < 0
+                    or sample_count > self._transition.max_output_samples
+                ):
+                    raise RuntimeError(
+                        "AudioVAE fixed streaming returned invalid sample length "
+                        f"{sample_count} for slot {slot}"
+                    )
+                sample_counts.append(sample_count)
         except Exception:
             if graph_attempted:
                 self._captured_graph = None
@@ -1086,13 +1099,7 @@ class _MingAudioStreamingRunner:
             raise
 
         waveforms = []
-        for slot in slot_ids:
-            sample_count = int(self._host_sample_lengths[slot])
-            if sample_count < 0 or sample_count > self._transition.max_output_samples:
-                raise RuntimeError(
-                    "AudioVAE fixed streaming returned invalid sample length "
-                    f"{sample_count} for slot {slot}"
-                )
+        for slot, sample_count in zip(slot_ids, sample_counts, strict=True):
             waveforms.append(self._host_waveform[slot, :sample_count].clone())
         return tuple(waveforms)
 

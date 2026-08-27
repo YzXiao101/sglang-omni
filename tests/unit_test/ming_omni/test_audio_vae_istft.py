@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from sglang_omni.models.ming_omni.talker.audio_vae.istft import ISTFT, ISTFTHead
 
 
-def test_spectrum_primitive_matches_pre_refactor_inline_math() -> None:
+def test_predict_spectrum_matches_pre_refactor_inline_math() -> None:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
         head = ISTFTHead(dim=3, n_fft=8, hop_length=2)
@@ -30,7 +30,7 @@ def test_spectrum_primitive_matches_pre_refactor_inline_math() -> None:
         torch.cos(phase) + 1j * torch.sin(phase)
     )
 
-    spectrum, projection = head._predict_spectrum(hidden)
+    spectrum, projection = head.predict_spectrum(hidden)
 
     assert bool((unclipped_magnitude > 1e2).any())
     assert projection.shape == expected_projection.shape
@@ -41,7 +41,7 @@ def test_spectrum_primitive_matches_pre_refactor_inline_math() -> None:
     assert torch.equal(spectrum, expected_spectrum)
 
 
-def test_overlap_add_primitive_matches_pre_refactor_inline_math() -> None:
+def test_overlap_add_components_match_pre_refactor_inline_math() -> None:
     istft = ISTFT(n_fft=8, hop_length=2, win_length=8)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
@@ -73,7 +73,7 @@ def test_overlap_add_primitive_matches_pre_refactor_inline_math() -> None:
         .squeeze(0)
     )
 
-    numerator, denominator = istft._overlap_add(spectrum)
+    numerator, denominator = istft.overlap_add_components(spectrum)
 
     assert numerator.shape == expected_numerator.shape
     assert numerator.dtype == expected_numerator.dtype

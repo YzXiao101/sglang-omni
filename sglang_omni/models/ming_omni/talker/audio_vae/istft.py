@@ -52,11 +52,12 @@ class ISTFT(nn.Module):
 
         return x, buffer
 
-    def _overlap_add(
+    def overlap_add_components(
         self,
         spec: torch.Tensor,
         valid_frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the unnormalized audio numerator and window denominator."""
         assert spec.dim() == 3, "Expected a 3D tensor as input"
         _, _, frame_count = spec.shape
 
@@ -124,7 +125,7 @@ class ISTFT(nn.Module):
         else:
             raise ValueError("Padding must be 'center' or 'same'.")
 
-        y, window_envelope = self._overlap_add(spec)
+        y, window_envelope = self.overlap_add_components(spec)
 
         y, audio_buffer = self.__buffer_process(
             y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming
@@ -181,7 +182,8 @@ class ISTFTHead(FourierHead):
             n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding
         )
 
-    def _predict_spectrum(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def predict_spectrum(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project hidden states into a complex spectrum and raw head output."""
         x_pred = self.out(x).transpose(1, 2)
         mag, phase = x_pred.chunk(2, dim=1)
         mag = torch.clip(torch.exp(mag), max=1e2)
@@ -206,7 +208,7 @@ class ISTFTHead(FourierHead):
         Returns:
             Tensor: Reconstructed time-domain audio signal of shape (B, T), where T is the length of the output signal.
         """
-        spectrum, x_pred = self._predict_spectrum(x)
+        spectrum, x_pred = self.predict_spectrum(x)
         audio, audio_buffer, window_buffer = self.istft(
             spectrum,
             audio_buffer=audio_buffer,

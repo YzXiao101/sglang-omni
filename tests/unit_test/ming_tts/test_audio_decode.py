@@ -359,10 +359,10 @@ def test_host_staging_error_does_not_disable_graph(
     assert transition.decode_calls == 0
 
 
-def test_post_sync_output_validation_error_does_not_disable_graph(
+def test_graph_output_validation_failure_drops_graph_and_next_call_runs_eager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner, _transition, graph, _stream = _make_scripted_runner(monkeypatch)
+    runner, transition, graph, _stream = _make_scripted_runner(monkeypatch)
     captured = _CapturedAudioVAEGraph(
         graph=graph,
         output=_runner_output(sample_lengths=(5, 0)),
@@ -370,6 +370,32 @@ def test_post_sync_output_validation_error_does_not_disable_graph(
     runner._captured_graph = captured
 
     with pytest.raises(RuntimeError, match="invalid sample length"):
+        _run_scripted_runner(runner)
+
+    assert runner.is_ready
+    assert runner._captured_graph is None
+    assert graph.replay_calls == 1
+
+    transition.decode_actions.append(_runner_output())
+    (waveform,) = _run_scripted_runner(runner)
+
+    assert transition.decode_calls == 1
+    assert graph.replay_calls == 1
+    torch.testing.assert_close(waveform, torch.tensor([1.0, 2.0]))
+
+
+def test_owned_waveform_clone_failure_does_not_disable_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _transition, graph, _stream = _make_scripted_runner(monkeypatch)
+    captured = runner._captured_graph
+
+    def fail_clone(_tensor: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("owned waveform clone failed")
+
+    monkeypatch.setattr(torch.Tensor, "clone", fail_clone)
+
+    with pytest.raises(RuntimeError, match="owned waveform clone failed"):
         _run_scripted_runner(runner)
 
     assert runner.is_ready

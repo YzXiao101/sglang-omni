@@ -15,9 +15,11 @@ from sglang_omni.models.ming_tts.config import (
     MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
     MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
     MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
+    MING_TTS_DEFAULT_STREAM_SLOTS,
     MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
     validate_ming_tts_audio_decode_batch_config,
     validate_ming_tts_audio_decode_cadence_config,
+    validate_ming_tts_audio_decode_stream_slots,
 )
 from sglang_omni.models.ming_tts.hf_config import (
     MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
@@ -226,6 +228,7 @@ def create_audio_decode_executor(
     initial_chunk_patches: int = MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
     steady_chunk_patches: int = MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     streaming_cuda_graph: bool = MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
+    stream_slots: int = MING_TTS_DEFAULT_STREAM_SLOTS,
     max_batch_size: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
     total_gpu_memory_fraction: float | None = None,
@@ -239,6 +242,7 @@ def create_audio_decode_executor(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
+    validate_ming_tts_audio_decode_stream_slots(stream_slots)
     if not isinstance(streaming_cuda_graph, bool):
         raise ValueError("Ming-Omni-TTS streaming_cuda_graph must be a boolean")
 
@@ -249,7 +253,6 @@ def create_audio_decode_executor(
         MingTTSStreamingVocoderScheduler,
     )
 
-    stream_capacity = max_batch_size
     component_fraction = total_gpu_memory_fraction
     process_fraction = process_total_gpu_memory_fraction
     for name, value in (
@@ -356,17 +359,11 @@ def create_audio_decode_executor(
 
     decoder = MingAudioDecoder(
         audio_vae,
-        stream_capacity=stream_capacity,
+        stream_capacity=stream_slots,
         max_stream_step_latents=max_step_latents,
         streaming_cuda_graph_required=streaming_cuda_graph,
     )
 
-    logger.info(
-        "Ming-Omni-TTS AudioVAE streaming cadence: "
-        "initial_patches=%d steady_patches=%d",
-        initial_chunk_patches,
-        steady_chunk_patches,
-    )
     try:
         scheduler = MingTTSStreamingVocoderScheduler(
             decoder,
@@ -420,7 +417,7 @@ def create_audio_decode_executor(
         logger.info(
             "ming_tts_audio_decode_ready stage=audio_decode device=%s dtype=%s "
             "attention_backend=%s streaming_backend=%s "
-            "streaming_cuda_graph_required=%s capacity=%d "
+            "streaming_cuda_graph_required=%s stream_slots=%d "
             "initial_chunk_patches=%d steady_chunk_patches=%d "
             "audio_patch_size=%d max_step_latents=%d latent_dim=%d "
             "component_fraction=%s process_fraction=%s "
@@ -432,7 +429,7 @@ def create_audio_decode_executor(
             MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
             "cuda_graph" if streaming_cuda_graph else "eager",
             streaming_cuda_graph,
-            stream_capacity,
+            stream_slots,
             initial_chunk_patches,
             steady_chunk_patches,
             patch_size,

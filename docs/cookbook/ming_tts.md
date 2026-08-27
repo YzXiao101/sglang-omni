@@ -42,8 +42,9 @@ sgl-omni serve \
   --port 8000
 ```
 
-The provided configuration enables the AR and acoustic-tail CUDA graphs. AudioVAE decode remains
-eager, and requests are non-streaming unless `stream` is set.
+The provided configuration enables the AR and acoustic-tail CUDA graphs and a fixed-width CUDA
+graph for streaming AudioVAE transitions. Non-streaming full-sequence AudioVAE decode remains
+compact eager, and requests are non-streaming unless `stream` is set.
 
 For non-streaming requests, `audio_decode` sends the complete generated latent sequence through
 one full-sequence AudioVAE decode. Streaming requests use the separate incremental AudioVAE path
@@ -54,10 +55,14 @@ set `tts_engine.stream_to` to `[audio_decode]` to declare the latent stream edge
 `audio_decode.can_accept_stream_before_payload` to `true` so the consumer accepts latents that
 arrive while generation is still running. The provided YAML already carries all three.
 
-Cross-request AudioVAE batching is not implemented yet. The only supported audio-decode batch
-configuration is `max_batch_size: 1` with `max_batch_wait_ms: 0`, as shown in the provided YAML;
-other values are rejected before the server starts. A future batching change can expand this
-configuration only after it implements and validates a real multi-request AudioVAE decode.
+Cross-request non-streaming AudioVAE batching is not implemented yet. The only supported
+non-streaming batch configuration is `max_batch_size: 1` with `max_batch_wait_ms: 0`, as shown in
+the provided YAML; other values are rejected before the server starts. Streaming capacity is
+configured separately with `stream_slots`: it bounds concurrent request-local AudioVAE state and
+sets both the fixed streaming transition width and the nonblocking stream-chunk collector cap. The
+provided performance configuration uses `stream_slots: 8`; the built-in fallback is 1. A future
+non-streaming batching change can expand the existing batch fields only after it implements and
+validates a real multi-request decode.
 
 ## Synthesizing Speech
 
