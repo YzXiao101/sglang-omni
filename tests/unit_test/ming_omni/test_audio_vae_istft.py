@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical contracts for the shared Ming AudioVAE ISTFT primitives."""
 
 from __future__ import annotations
 
@@ -21,8 +20,6 @@ def test_predict_spectrum_matches_pre_refactor_inline_math() -> None:
         head.out.weight[0].zero_()
         head.out.bias[0] = math.log(200.0)
 
-    # This is the inline computation used by ISTFTHead.forward before the
-    # shared primitive was extracted.
     expected_projection = head.out(hidden).transpose(1, 2)
     magnitude, phase = expected_projection.chunk(2, dim=1)
     unclipped_magnitude = torch.exp(magnitude)
@@ -47,8 +44,6 @@ def test_overlap_add_components_match_pre_refactor_inline_math() -> None:
         torch.manual_seed(0)
         spectrum = torch.complex(torch.randn(2, 5, 4), torch.randn(2, 5, 4))
 
-    # This is the inline computation used by ISTFT.forward before the shared
-    # primitive was extracted.
     inverse = torch.fft.irfft(spectrum, istft.n_fft, dim=1, norm="backward")
     inverse = inverse * istft.window[None, :, None]
     output_size = (spectrum.shape[-1] - 1) * istft.hop_length + istft.win_length
@@ -81,3 +76,55 @@ def test_overlap_add_components_match_pre_refactor_inline_math() -> None:
     assert denominator.dtype == expected_denominator.dtype
     assert torch.equal(numerator, expected_numerator)
     assert torch.equal(denominator, expected_denominator)
+
+
+def test_overlap_add_components_masks_audio_and_window_envelope() -> None:
+    istft = ISTFT(n_fft=8, hop_length=2, win_length=8)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1)
+        spectrum = torch.complex(torch.randn(2, 5, 4), torch.randn(2, 5, 4))
+    valid_frame_mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, True, False],
+        ]
+    )
+
+    masked_spectrum = spectrum * valid_frame_mask.unsqueeze(1)
+    inverse = torch.fft.irfft(masked_spectrum, istft.n_fft, dim=1, norm="backward")
+    inverse = inverse * istft.window[None, :, None]
+    output_size = (spectrum.shape[-1] - 1) * istft.hop_length + istft.win_length
+    expected_numerator = F.fold(
+        inverse,
+        output_size=(1, output_size),
+        kernel_size=(1, istft.win_length),
+        stride=(1, istft.hop_length),
+    )[:, 0, 0, :]
+    window_frames = (
+        istft.window.square()
+        .expand(spectrum.shape[0], spectrum.shape[-1], -1)
+        .transpose(1, 2)
+    )
+    window_frames = window_frames * valid_frame_mask.unsqueeze(1)
+    expected_denominator = F.fold(
+        window_frames,
+        output_size=(1, output_size),
+        kernel_size=(1, istft.win_length),
+        stride=(1, istft.hop_length),
+    )[:, 0, 0, :]
+
+    numerator, denominator = istft.overlap_add_components(
+        spectrum,
+        valid_frame_mask=valid_frame_mask,
+    )
+
+    assert torch.equal(numerator, expected_numerator)
+    assert torch.equal(denominator, expected_denominator)
+    invalid_values = torch.full_like(spectrum, complex(1e6, -1e6))
+    corrupted = torch.where(valid_frame_mask.unsqueeze(1), spectrum, invalid_values)
+    corrupted_numerator, corrupted_denominator = istft.overlap_add_components(
+        corrupted,
+        valid_frame_mask=valid_frame_mask,
+    )
+    assert torch.equal(corrupted_numerator, numerator)
+    assert torch.equal(corrupted_denominator, denominator)

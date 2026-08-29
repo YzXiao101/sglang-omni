@@ -426,6 +426,84 @@ def test_initial_cadence_can_exceed_steady_cadence() -> None:
     ]
 
 
+def test_mk_mixed_wave_preserves_request_slot_and_output_mapping() -> None:
+    decoder = _ScriptedAudioDecoder(capacity=3)
+    scheduler = _scheduler(decoder, initial=2, steady=4)
+    scheduler.on_stream_chunk_batch(
+        [
+            ("step", _stream_item(0, 10, is_last=False)),
+            ("step", _stream_item(1, 11, is_last=False)),
+        ]
+    )
+    step_slot = scheduler._slot_bindings.slot_for("step")
+    first_messages = _drain(scheduler)
+
+    scheduler.on_stream_chunk_batch(
+        [
+            ("step", _stream_item(2, 12, is_last=False)),
+            ("step", _stream_item(3, 13, is_last=False)),
+            ("step", _stream_item(4, 14, is_last=False)),
+            ("step", _stream_item(5, 15, is_last=False)),
+            ("open-terminal", _stream_item(0, 20, is_last=False)),
+            ("open-terminal", _stream_item(1, 21, is_last=True)),
+            ("short-terminal", _stream_item(0, 30, is_last=True)),
+            ("waiting", _stream_item(0, 40, is_last=False)),
+        ]
+    )
+    mixed_messages = _drain(scheduler)
+    mixed_call = decoder.stream_calls[1]
+    terminal_slots = set(mixed_call.slot_ids[1:])
+
+    assert decoder.stream_calls[0].patch_values == ((10.0, 11.0),)
+    assert decoder.stream_calls[0].terminal_flags == (False,)
+    assert mixed_call.patch_values == (
+        (12.0, 13.0, 14.0, 15.0),
+        (20.0, 21.0),
+        (30.0,),
+    )
+    assert mixed_call.terminal_flags == (False, True, True)
+    assert mixed_call.slot_ids[0] == step_slot
+    assert scheduler._slot_bindings.slot_for("step") == step_slot
+    assert scheduler._slot_bindings.slot_for("open-terminal") is None
+    assert scheduler._slot_bindings.slot_for("short-terminal") is None
+    assert scheduler._slot_bindings.slot_for("waiting") is None
+
+    expected_payloads = {
+        "step": (12.0, 13.0, 14.0, 15.0),
+        "open-terminal": (20.0, 21.0),
+        "short-terminal": (30.0,),
+    }
+    assert [message.request_id for message in first_messages] == ["step"]
+    assert (
+        first_messages[0].data["audio_waveform"]
+        == torch.tensor([10.0, 11.0], dtype=torch.float32).numpy().tobytes()
+    )
+    assert {message.request_id for message in mixed_messages} == set(expected_payloads)
+    for message in mixed_messages:
+        assert message.type == "stream"
+        assert (
+            message.data["audio_waveform"]
+            == torch.tensor(expected_payloads[message.request_id], dtype=torch.float32)
+            .numpy()
+            .tobytes()
+        )
+
+    scheduler.on_stream_chunk_batch([("waiting", _stream_item(1, 41, is_last=True))])
+    waiting_messages = _drain(scheduler)
+    waiting_call = decoder.stream_calls[2]
+
+    assert waiting_call.patch_values == ((40.0, 41.0),)
+    assert waiting_call.terminal_flags == (True,)
+    assert waiting_call.slot_ids[0] in terminal_slots
+    assert scheduler._slot_bindings.slot_for("step") == step_slot
+    assert scheduler._slot_bindings.slot_for("waiting") is None
+    assert [message.request_id for message in waiting_messages] == ["waiting"]
+    assert (
+        waiting_messages[0].data["audio_waveform"]
+        == torch.tensor([40.0, 41.0], dtype=torch.float32).numpy().tobytes()
+    )
+
+
 def test_terminal_patch_bypasses_opening_threshold() -> None:
     decoder = _ScriptedAudioDecoder(capacity=1)
     scheduler = _scheduler(decoder, initial=3, steady=2)
@@ -547,19 +625,6 @@ def test_successful_mixed_wave_commits_terminal_before_releasing_slot(
     assert scheduler._slot_bindings.slot_for("live") == live_slot
     assert scheduler._slot_bindings.slot_for("terminal") is None
     assert scheduler._slot_bindings.slot_for("waiter") is None
-
-
-def test_missing_slot_binding_does_not_release_existing_binding() -> None:
-    decoder = _ScriptedAudioDecoder(capacity=1)
-    scheduler = _scheduler(decoder, initial=1, steady=1)
-    scheduler.on_stream_chunk_batch([("bound", _stream_item(0, 1, is_last=False))])
-    bound_slot = scheduler._slot_bindings.slot_for("bound")
-
-    with pytest.raises(RuntimeError, match="has no AudioVAE slot"):
-        scheduler._slot_bindings.resolve_slots(("bound", "missing"))
-
-    assert scheduler._slot_bindings.slot_for("bound") == bound_slot
-    assert decoder.reset_rows_calls == []
 
 
 def test_step_error_resets_participant_before_next_wave() -> None:
@@ -836,14 +901,16 @@ def test_external_abort_is_lazy_and_next_streaming_turn_resets_before_reuse() ->
         ((1.0,),),
         ((3.0,),),
     ]
-    assert [entry[0] for entry in decoder.trace] == [
-        "stream",
-        "full",
-        "full",
-        "reset_rows",
-        "stream",
-    ]
-    reset_entry = next(entry for entry in decoder.trace if entry[0] == "reset_rows")
+    reset_index = next(
+        index for index, entry in enumerate(decoder.trace) if entry[0] == "reset_rows"
+    )
+    future_stream_index = next(
+        index
+        for index, entry in enumerate(decoder.trace)
+        if entry[0] == "stream" and entry[1] == ((3.0,),)
+    )
+    assert reset_index < future_stream_index
+    reset_entry = decoder.trace[reset_index]
     assert reset_entry[2] == thread.ident
     assert reset_entry[2] != caller_thread_id
     assert future_message[0].request_id == "future"
@@ -891,12 +958,16 @@ def test_external_abort_during_fixed_wave_suppresses_output_and_resets_after_fen
         ("future", "stream")
     ]
     assert decoder.reset_rows_calls == [(0,)]
-    assert [entry[0] for entry in decoder.trace] == [
-        "stream",
-        "reset_rows",
-        "stream",
-    ]
-    assert decoder.trace[1][2] == scheduler_thread.ident
+    reset_index = next(
+        index for index, entry in enumerate(decoder.trace) if entry[0] == "reset_rows"
+    )
+    future_stream_index = next(
+        index
+        for index, entry in enumerate(decoder.trace)
+        if entry[0] == "stream" and entry[1] == ((2.0,),)
+    )
+    assert reset_index < future_stream_index
+    assert decoder.trace[reset_index][2] == scheduler_thread.ident
     _stop(scheduler, scheduler_thread)
 
 

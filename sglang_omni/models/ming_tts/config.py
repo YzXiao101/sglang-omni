@@ -178,8 +178,6 @@ def validate_ming_tts_audio_decode_cadence_config(
 
 
 class MingTTSPreprocessingFactoryArgs(FactoryArgs):
-    """Preprocessing constructor knobs, typed like the shared ones."""
-
     max_decode_steps_cap: int | None = Field(default=None, gt=0, strict=True)
 
 
@@ -190,8 +188,6 @@ class MingTTSPreprocessingStageConfig(StageConfig):
 
 
 class MingTTSAudioDecodeFactoryArgs(FactoryArgs):
-    """Audio-decode streaming and non-streaming batch knobs."""
-
     streaming_cuda_graph: bool | None = Field(default=None, strict=True)
     initial_chunk_patches: int | None = Field(default=None, gt=0, strict=True)
     steady_chunk_patches: int | None = Field(default=None, gt=0, strict=True)

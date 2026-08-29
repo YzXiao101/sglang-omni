@@ -70,7 +70,6 @@ def _load_ming_tts_audio_vae(
     device: str | torch.device,
     dtype: str | torch.dtype,
 ) -> AudioVAE:
-    """Return a loaded eval model on its final execution device and dtype."""
     import torch
 
     from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import (

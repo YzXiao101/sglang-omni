@@ -14,6 +14,7 @@ from sglang_omni.models.ming_tts.config import (
     MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
     MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
     MING_TTS_DEFAULT_STREAM_SLOTS,
+    MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
     TTS_ENGINE_STAGE,
     MingTTSPipelineConfig,
 )
@@ -49,6 +50,7 @@ def test_ming_tts_audio_decode_defaults_are_full_sequence_and_serial() -> None:
     assert "decode_mode" not in factory
     assert factory["initial_chunk_patches"] == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
     assert factory["steady_chunk_patches"] == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
+    assert factory["streaming_cuda_graph"] is MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH
     assert factory["stream_slots"] == MING_TTS_DEFAULT_STREAM_SLOTS
     assert factory["max_batch_size"] == 1
     assert factory["max_batch_wait_ms"] == 0
@@ -66,12 +68,13 @@ def test_ming_tts_example_config_uses_supported_audio_decode_contract() -> None:
     assert "decode_mode" not in (factory.model_extra or {})
     assert factory.initial_chunk_patches == MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES
     assert factory.steady_chunk_patches == MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES
+    assert factory.streaming_cuda_graph is True
     assert factory.stream_slots == 8
     assert factory.max_batch_size == 1
     assert factory.max_batch_wait_ms == 0
 
 
-def test_ming_tts_missing_initial_cadence_uses_default() -> None:
+def test_ming_tts_missing_initial_cadence_remains_unset() -> None:
     raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
     _audio_decode_stage(raw)["factory"].pop("initial_chunk_patches")
 
@@ -79,7 +82,6 @@ def test_ming_tts_missing_initial_cadence_uses_default() -> None:
     factory = config.stage_named(AUDIO_DECODE_STAGE).factory
 
     assert factory.initial_chunk_patches is None
-    # None means unset: the default applies at the consumer.
 
 
 @pytest.mark.parametrize("field", ["initial_chunk_patches", "steady_chunk_patches"])

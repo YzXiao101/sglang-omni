@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 class MingAudioDecoder:
-    """Own the loaded AudioVAE and all audio-decode execution resources."""
-
     def __init__(
         self,
         audio_vae: AudioVAE,
@@ -43,6 +41,8 @@ class MingAudioDecoder:
         streaming_cuda_graph_required: bool,
     ) -> None:
         self._audio_vae = audio_vae
+        # Note (yzxiao): Keep the fixed transition Ming-TTS-private while reusing
+        # the shared Decoder, so Ming-Omni and full decode keep their existing paths.
         self._streaming_transition = _AudioVAEFixedStreamingTransition(
             audio_vae.decoder,
             capacity=stream_capacity,
@@ -205,17 +205,6 @@ class _FixedQwenCacheLayer(CacheLayerMixin):
 
 
 class _AudioVAEFixedStreamingTransition:
-    """Ming-private fixed-shape AudioVAE streaming state transition.
-
-    This object must be created after the shared ``Decoder`` module reaches its
-    final device and dtype. That module must not be moved or mutated during the
-    transition's lifetime.
-    CPU FP32 execution is available only for internal numerical verification;
-    Ming-TTS serving remains CUDA BF16-only. ``decode`` accepts trusted
-    fixed-envelope tensors and returns borrowed device tensors whose contents
-    may be replaced by the next execution.
-    """
-
     def __init__(
         self,
         decoder: Decoder,
@@ -335,7 +324,8 @@ class _AudioVAEFixedStreamingTransition:
         self._decoder = decoder
         self._upsampler = upsampler
         self._scale_factor = patch_size
-        # A terminal step can emit both the saved group and the current group.
+        # Note (yzxiao): A terminal transition flushes the saved and final groups
+        # together. The 2P envelope keeps that flush in one device transaction.
         self._max_frames = 2 * self.max_step_latents * patch_size
         self._hidden_size = hidden_size
         self._sliding_window = sliding_window
@@ -458,7 +448,6 @@ class _AudioVAEFixedStreamingTransition:
         exec_mask: torch.Tensor,
         terminal_mask: torch.Tensor,
     ) -> _AudioVAEFixedStreamingOutput:
-        """Advance every active slot by one trusted fixed-envelope step."""
         execution_context = (
             torch.autocast(device_type="cuda", dtype=self.input_dtype)
             if self.device.type == "cuda"
@@ -904,8 +893,6 @@ class _CapturedAudioVAEGraph:
 
 
 class _MingAudioStreamingRunner:
-    """Own fixed AudioVAE I/O and materialize each device result on CPU."""
-
     _CUDA_GRAPH_WARMUP_ITERATIONS = 3
 
     def __init__(
@@ -1050,6 +1037,9 @@ class _MingAudioStreamingRunner:
             self._host_exec_mask[slot] = True
             self._host_terminal_mask[slot] = terminal
 
+        # Note (yzxiao): Replay through length validation is one graph transaction.
+        # Retire on any post-replay failure and never retry a possibly-mutated wave;
+        # CPU cloning stays outside because it cannot invalidate the graph.
         graph_attempted = False
         try:
             with torch.cuda.device(self._transition.device):

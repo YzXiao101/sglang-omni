@@ -27,8 +27,6 @@ logger = logging.getLogger(__name__)
 
 
 class _AudioVAEStreamingSlotBindings:
-    """Own request-to-slot bindings and enforce clean rows before reuse."""
-
     def __init__(
         self,
         decoder: MingAudioDecoder,
@@ -81,7 +79,6 @@ class _AudioVAEStreamingSlotBindings:
             self._free_slots.append(slot)
 
     def release_clean(self, request_ids: Sequence[str]) -> None:
-        """Release rows already cleaned by successful terminal transitions."""
         slots = self.resolve_slots(request_ids)
         for request_id, slot in zip(request_ids, slots, strict=True):
             del self._request_to_slot[request_id]
@@ -115,8 +112,6 @@ _StreamingStepPlan = tuple[_StreamingStepItem, ...]
 class MingTTSStreamingVocoderScheduler(
     StreamingVocoderBase[_StreamState, _StreamingStepPlan]
 ):
-    """Schedule Ming acoustic latents over one fixed-shape AudioVAE decoder."""
-
     _can_batch_stream_chunks = True
 
     def __init__(
@@ -251,6 +246,8 @@ class MingTTSStreamingVocoderScheduler(
         return self._initial_chunk_patches
 
     def select_step_participants(self) -> list[tuple[str, _StreamState]]:
+        # Note (yzxiao): External abort only marks a binding dirty; the scheduler
+        # thread resets its CUDA row before that slot can be reused.
         self._drain_pending_releases()
         participants = []
         for request_id, state in self._stream_state_items():
@@ -290,6 +287,9 @@ class MingTTSStreamingVocoderScheduler(
     ) -> dict[str, torch.Tensor]:
         request_ids = tuple(request_id for request_id, _ in participants)
         slot_ids = self._slot_bindings.resolve_slots(request_ids)
+        # Note (yzxiao): The decoder returns owned CPU waveforms all-or-error, so
+        # request progress is committed only after it succeeds. Terminal transitions
+        # already clean their rows and need no second reset.
         waveforms = self._decoder.run_streaming(
             slot_ids=slot_ids,
             patch_groups=tuple(item.patches for item in plan),
