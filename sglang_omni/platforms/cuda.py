@@ -87,6 +87,19 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
 
         return fused_qk_norm_rope
 
+    def get_qk_rotary_embedding_with_cos_sin_cache(self):
+        try:
+            from sgl_kernel import rotary_embedding
+        except ImportError as exc:
+            logger.info(
+                "CUDA sgl_kernel has no Q/K cos/sin-cache RoPE kernel (%s); "
+                "falling back to the native RoPE path",
+                exc,
+            )
+            return None
+
+        return rotary_embedding
+
     def apply_model_worker_backend_policy(
         self,
         server_args: ServerArgs,

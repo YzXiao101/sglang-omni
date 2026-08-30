@@ -10,6 +10,7 @@ from torch import nn
 
 from sglang_omni.models.ming_omni.talker.talker_module.cfm import get_epss_timesteps
 from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
+from sglang_omni.models.ming_omni.talker.talker_module.modules import RoPEProvider
 
 
 def build_cfm_timesteps(
@@ -216,6 +217,7 @@ class FlowLoss(nn.Module):
         llm_cond_dim: int,
         patch_size: int | None = None,
         history_patch_size: int | None = None,
+        rope_provider: RoPEProvider | None = None,
         **dit_kwargs,
     ) -> None:
         super().__init__()
@@ -225,6 +227,7 @@ class FlowLoss(nn.Module):
             model=DiT(
                 in_channels=z_channels,
                 llm_cond_dim=llm_cond_dim,
+                rope_provider=rope_provider,
                 **dit_kwargs,
             )
         )

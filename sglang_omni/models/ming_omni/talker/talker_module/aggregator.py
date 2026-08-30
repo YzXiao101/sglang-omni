@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from x_transformers.x_transformers import RotaryEmbedding
 
-from .modules import DiTBlock, FinalLayer
+from .modules import DiTBlock, FinalLayer, RoPEProvider
 
 
 class Aggregator(nn.Module):
@@ -29,6 +29,7 @@ class Aggregator(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         llm_input_dim=896,
+        rope_provider: RoPEProvider | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -44,7 +45,13 @@ class Aggregator(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs)
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    rope_provider=rope_provider,
+                    **kwargs,
+                )
                 for _ in range(depth)
             ]
         )

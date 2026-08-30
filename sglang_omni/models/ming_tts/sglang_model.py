@@ -23,6 +23,7 @@ from sglang_omni.models.ming_tts.flow_matching import (
     build_cfm_timesteps,
 )
 from sglang_omni.models.ming_tts.hf_config import MING_TTS_TAIL_ATTN_BACKEND
+from sglang_omni.models.ming_tts.rope import SGLKernelRoPEProvider
 from sglang_omni.models.ming_tts.weight_loading import (
     MING_TTS_LM_HEAD_SKIP_REASON,
     MING_TTS_ROTARY_BUFFER_SKIP_REASON,
@@ -36,6 +37,7 @@ from sglang_omni.models.ming_tts.weight_loading import (
     classify_ming_tts_weight,
 )
 from sglang_omni.models.weight_loader import default_weight_loader
+from sglang_omni.platforms import current_platform
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import (
     get_tensor_model_parallel_world_size,
@@ -807,11 +809,19 @@ class MingTTSSGLangModel(nn.Module):
             self.config.ditar_config.get("history_patch_size", self.patch_size)
         )
         self.tail_attn_backend = tail_attn_backend
+        rope_kernel = current_platform.get_qk_rotary_embedding_with_cos_sin_cache()
+        aggregator_rope_provider = (
+            SGLKernelRoPEProvider(rope_kernel) if rope_kernel is not None else None
+        )
+        dit_rope_provider = (
+            SGLKernelRoPEProvider(rope_kernel) if rope_kernel is not None else None
+        )
         aggregator_config = dict(self.config.aggregator_config)
         aggregator_config["attn_backend"] = tail_attn_backend
         self.linear_proj_audio = Aggregator(
             in_channels=self.latent_dim,
             llm_input_dim=self.hidden_size,
+            rope_provider=aggregator_rope_provider,
             **aggregator_config,
         )
         ditar_config = dict(self.config.ditar_config)
@@ -819,7 +829,33 @@ class MingTTSSGLangModel(nn.Module):
         self.flowloss = FlowLoss(
             z_channels=self.latent_dim,
             llm_cond_dim=self.hidden_size,
+            rope_provider=dit_rope_provider,
             **ditar_config,
+        )
+        aggregator_rope_layers = (
+            sum(
+                block.attn.rope_provider is aggregator_rope_provider
+                for block in self.linear_proj_audio.blocks
+            )
+            if aggregator_rope_provider is not None
+            else 0
+        )
+        dit_rope_layers = (
+            sum(
+                block.attn.rope_provider is dit_rope_provider
+                for block in self.flowloss.cfm.model.blocks
+            )
+            if dit_rope_provider is not None
+            else 0
+        )
+        logger.info(
+            "Ming TTS Q/K RoPE: kernel_available=%s "
+            "aggregator_provider_layers=%d/%d dit_provider_layers=%d/%d",
+            rope_kernel is not None,
+            aggregator_rope_layers,
+            len(self.linear_proj_audio.blocks),
+            dit_rope_layers,
+            len(self.flowloss.cfm.model.blocks),
         )
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(192, self.hidden_size, bias=True)

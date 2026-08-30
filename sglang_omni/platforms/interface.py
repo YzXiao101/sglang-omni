@@ -43,6 +43,10 @@ class OmniPlatform(DeviceMixin):
         """
         return None
 
+    def get_qk_rotary_embedding_with_cos_sin_cache(self):
+        """Get the in-place Q/K cos/sin-cache RoPE kernel, else return None."""
+        return None
+
     def apply_model_worker_backend_policy(
         self,
         server_args: ServerArgs,

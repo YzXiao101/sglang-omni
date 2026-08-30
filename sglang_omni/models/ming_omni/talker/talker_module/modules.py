@@ -1,9 +1,18 @@
+from collections.abc import Callable
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from x_transformers.x_transformers import apply_rotary_pos_emb
+
+# Returning None is permitted only before mutating query or key. Once a provider
+# starts an in-place kernel, failures must propagate instead of falling back to
+# native RoPE with potentially modified inputs.
+RoPEProvider = Callable[
+    [torch.Tensor, torch.Tensor, tuple[torch.Tensor, object]],
+    tuple[torch.Tensor, torch.Tensor] | None,
+]
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
 flash_attn_func = None
@@ -92,6 +101,7 @@ class Attention(nn.Module):
         ) = None,  # number of attention head to apply rope, None for all
         attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
+        rope_provider: RoPEProvider | None = None,
     ):
         super().__init__()
 
@@ -124,10 +134,16 @@ class Attention(nn.Module):
         if attn_backend == "flash_attn":
             if not is_flash_attn_available():
                 _raise_flash_attn_unavailable()
-
+        provider_is_compatible = (
+            qk_norm is None
+            and pe_attn_head is None
+            and attn_backend == "torch"
+            and dim_head == 64
+        )
         self.pe_attn_head = pe_attn_head
         self.attn_backend = attn_backend
         self.attn_mask_enabled = attn_mask_enabled
+        self.rope_provider = rope_provider if provider_is_compatible else None
 
     def forward(
         self,
@@ -146,18 +162,25 @@ class Attention(nn.Module):
         # attention
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
-        query = query.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
+        query = query.view(batch_size, -1, self.heads, head_dim)
+        key = key.view(batch_size, -1, self.heads, head_dim)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
-        # qk norm
-        if self.q_norm is not None:
+        rotated = None
+        if self.rope_provider is not None and rope is not None:
+            rotated = self.rope_provider(query, key, rope)
+        if rotated is not None:
+            query, key = rotated
+
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+
+        if rotated is None and self.q_norm is not None:
             query = self.q_norm(query)
-        if self.k_norm is not None:
+        if rotated is None and self.k_norm is not None:
             key = self.k_norm(key)
 
-        # apply rotary position embedding
-        if rope is not None:
+        if rotated is None and rope is not None:
             freqs, xpos_scale = rope
             q_xpos_scale, k_xpos_scale = (
                 (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
@@ -260,6 +283,7 @@ class DiTBlock(nn.Module):
         pe_attn_head=None,
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
+        rope_provider: RoPEProvider | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -273,6 +297,7 @@ class DiTBlock(nn.Module):
             pe_attn_head=pe_attn_head,
             attn_backend=attn_backend,
             attn_mask_enabled=attn_mask_enabled,
+            rope_provider=rope_provider,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.mlp = FeedForward(

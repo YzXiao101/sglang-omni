@@ -650,6 +650,8 @@ that happened to contain an older version of the test.
     finish, SGLang length finish, max-step length finish, and terminal cleanup
   - TP tail-failure propagation and idempotent abort cleanup without loading a
     model checkpoint
+  - Ming shared-attention RoPE provider dispatch, native fallback, source-local
+    cache ownership, platform capability fallback, and unchanged state-dict keys
   - reference-audio content-cache identity and invalidation
   - audio decode behavior for zero generated latents without invoking AudioVAE.
 

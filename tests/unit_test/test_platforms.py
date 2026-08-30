@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -69,6 +70,31 @@ def test_rocm_platform_uses_conservative_omni_capabilities() -> None:
 
     assert platform.get_intra_node_transport() is TransportKind.SHM
     assert platform.get_fused_qk_norm_rope() is None
+    assert platform.get_qk_rotary_embedding_with_cos_sin_cache() is None
+
+
+def test_cuda_platform_exposes_the_qk_cos_sin_cache_rope_kernel(
+    monkeypatch,
+) -> None:
+    kernel = object()
+    sgl_kernel = ModuleType("sgl_kernel")
+    sgl_kernel.rotary_embedding = kernel
+    monkeypatch.setitem(sys.modules, "sgl_kernel", sgl_kernel)
+
+    assert CUDAOmniPlatform().get_qk_rotary_embedding_with_cos_sin_cache() is kernel
+
+
+def test_cuda_platform_falls_back_when_the_rope_symbol_is_missing(
+    monkeypatch,
+    caplog,
+) -> None:
+    monkeypatch.setitem(sys.modules, "sgl_kernel", ModuleType("sgl_kernel"))
+
+    with caplog.at_level("INFO", logger="sglang_omni.platforms.cuda"):
+        kernel = CUDAOmniPlatform().get_qk_rotary_embedding_with_cos_sin_cache()
+
+    assert kernel is None
+    assert "falling back to the native RoPE path" in caplog.text
 
 
 def test_rocm_talker_keeps_auto_moe_backend() -> None:

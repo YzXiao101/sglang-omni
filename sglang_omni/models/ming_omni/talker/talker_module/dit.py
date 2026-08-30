@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from x_transformers.x_transformers import RotaryEmbedding
 
-from .modules import DiTBlock, FinalLayer
+from .modules import DiTBlock, FinalLayer, RoPEProvider
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -105,6 +105,7 @@ class DiT(nn.Module):
         llm_cond_dim=896,
         cfg_dropout_prob=0.1,
         grad_checkpointing=False,
+        rope_provider: RoPEProvider | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -127,7 +128,13 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs)
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    rope_provider=rope_provider,
+                    **kwargs,
+                )
                 for _ in range(depth)
             ]
         )
