@@ -57,7 +57,7 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
-from sglang_omni.config import ResolvedAudioChunking
+from sglang_omni.config import ResolvedAudioChunking, TTSRequestPolicy
 from sglang_omni.config.schema import MAX_SPEECH_INPUT_CHARS
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
@@ -176,8 +176,9 @@ def create_app(
     client: Client,
     *,
     model_name: str | None = None,
-    requires_uploaded_voice_for_named_voice: bool = False,
-    supports_uploaded_voice_references: bool = True,
+    tts_request_policy: TTSRequestPolicy | None = None,
+    requires_uploaded_voice_for_named_voice: bool | None = None,
+    supports_uploaded_voice_references: bool | None = None,
     supports_audio_translation: bool = False,
     required_speech_reference_count: int | None = None,
     speech_reference_text_required: bool = False,
@@ -198,10 +199,14 @@ def create_app(
     Args:
         client: Client instance connected to the pipeline coordinator.
         model_name: Default model name to report in responses and /v1/models.
+        tts_request_policy: Model-specific TTS request rules. Mutually exclusive with
+            the two legacy uploaded-voice options below.
         requires_uploaded_voice_for_named_voice: Whether non-default TTS voice
             names must resolve to uploaded voices before reaching the model.
+            Defaults to False when no policy is supplied.
         supports_uploaded_voice_references: Whether uploaded voice names can be
-            lowered into backend reference-audio requests.
+            lowered into backend reference-audio requests. Defaults to True when
+            no policy is supplied.
         supports_audio_translation: Whether the configured pipeline supports
             ``/v1/audio/translations``.
         required_speech_reference_count: Exact reference count required before
@@ -254,6 +259,7 @@ def create_app(
     app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
         default_model=app.state.model_name,
+        tts_request_policy=tts_request_policy,
         requires_uploaded_voice_for_named_voice=(
             requires_uploaded_voice_for_named_voice
         ),
@@ -300,7 +306,13 @@ def _register_voices(app: FastAPI) -> None:
             return JSONResponse(
                 content={"uploaded_voice_names": voice_store.uploaded_voice_names()}
             )
-        response = VoiceListResponse.model_validate(voice_store.list_response())
+        voice_list = voice_store.list_response()
+        policy: TTSRequestPolicy = app.state.speech_service.request_policy
+        if policy.allowed_voices is not None:
+            voices = {name.casefold(): name for name in policy.allowed_voices}
+            voices["default"] = "default"
+            voice_list["voices"] = sorted(voices.values(), key=str.casefold)
+        response = VoiceListResponse.model_validate(voice_list)
         return JSONResponse(content=response.model_dump(exclude_none=True))
 
     @app.post("/v1/audio/voices")

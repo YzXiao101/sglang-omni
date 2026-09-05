@@ -10,6 +10,9 @@ from sglang_omni.config.placement import (
 )
 from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.config.schema import (
+    UPLOADED_VOICE_MODE_DISABLED,
+    UPLOADED_VOICE_MODE_OPTIONAL,
+    UPLOADED_VOICE_MODE_REQUIRED,
     AudioChunkingConfig,
     CommConfig,
     EndpointsConfig,
@@ -21,6 +24,7 @@ from sglang_omni.config.schema import (
     ProcessConfig,
     ResolvedAudioChunking,
     StageConfig,
+    TTSRequestPolicy,
 )
 from sglang_omni.config.topology import (
     LogicalProcess,
@@ -51,6 +55,10 @@ __all__ = [
     "build_process_topology_plan",
     "AudioChunkingConfig",
     "ResolvedAudioChunking",
+    "TTSRequestPolicy",
+    "UPLOADED_VOICE_MODE_DISABLED",
+    "UPLOADED_VOICE_MODE_OPTIONAL",
+    "UPLOADED_VOICE_MODE_REQUIRED",
     "compile_logical_processes",
     "PipelineConfig",
     "ProcessConfig",

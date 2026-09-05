@@ -16,7 +16,12 @@ from pydantic import ValidationError
 
 from sglang_omni.client import ClientError, GenerateRequest, SamplingParams
 from sglang_omni.client.audio import audio_encoding_unavailable_reason
-from sglang_omni.config.schema import MAX_SPEECH_INPUT_CHARS
+from sglang_omni.config.schema import (
+    MAX_SPEECH_INPUT_CHARS,
+    UPLOADED_VOICE_MODE_DISABLED,
+    UPLOADED_VOICE_MODE_REQUIRED,
+    TTSRequestPolicy,
+)
 from sglang_omni.preprocessing.base import MediaIO
 from sglang_omni.preprocessing.resource_connector import MultiModalResourceConnector
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -81,8 +86,9 @@ class SpeechRequestValidator:
         self,
         *,
         default_model: str,
-        requires_uploaded_voice_for_named_voice: bool = False,
-        supports_uploaded_voice_references: bool = True,
+        tts_request_policy: TTSRequestPolicy | None = None,
+        requires_uploaded_voice_for_named_voice: bool | None = None,
+        supports_uploaded_voice_references: bool | None = None,
         required_speech_reference_count: int | None = None,
         speech_reference_text_required: bool = False,
         speech_reference_text_excludes_instructions: bool = False,
@@ -109,12 +115,32 @@ class SpeechRequestValidator:
                 "max_speech_input_chars must be a positive integer or None"
             )
         self.default_model = default_model
-        self.requires_uploaded_voice_for_named_voice = (
-            requires_uploaded_voice_for_named_voice
-        )
-        self.supports_uploaded_voice_references = (
-            supports_uploaded_voice_references
-            or requires_uploaded_voice_for_named_voice
+        if tts_request_policy is not None:
+            if (
+                requires_uploaded_voice_for_named_voice is not None
+                or supports_uploaded_voice_references is not None
+            ):
+                raise ValueError(
+                    "Pass tts_request_policy or uploaded voice options, not both"
+                )
+            self.request_policy = tts_request_policy
+        else:
+            self.request_policy = TTSRequestPolicy.from_uploaded_voice_options(
+                requires_uploaded_voice_for_named_voice=(
+                    False
+                    if requires_uploaded_voice_for_named_voice is None
+                    else requires_uploaded_voice_for_named_voice
+                ),
+                supports_uploaded_voice_references=(
+                    True
+                    if supports_uploaded_voice_references is None
+                    else supports_uploaded_voice_references
+                ),
+            )
+        self._allowed_voice_keys = (
+            frozenset(voice.casefold() for voice in self.request_policy.allowed_voices)
+            if self.request_policy.allowed_voices is not None
+            else None
         )
         self.required_speech_reference_count = required_speech_reference_count
         self.speech_reference_text_required = speech_reference_text_required
@@ -250,6 +276,7 @@ class SpeechRequestValidator:
 
         if request.task_type is not None:
             updates["task_type"] = _normalize_task_type(request.task_type)
+        self._validate_request_policy(request, task_type=updates.get("task_type"))
         if request.language is not None:
             updates["language"] = self._normalize_language(request.language)
 
@@ -262,6 +289,43 @@ class SpeechRequestValidator:
         )
         _validate_non_negative_int(request.seed, param="seed")
         return updates
+
+    def _validate_request_policy(
+        self,
+        request: CreateSpeechRequest | CreateSpeechBatchRequest,
+        *,
+        task_type: str | None,
+    ) -> None:
+        policy = self.request_policy
+        if (
+            task_type is not None
+            and policy.allowed_task_types is not None
+            and task_type not in policy.allowed_task_types
+        ):
+            supported = ", ".join(sorted(policy.allowed_task_types))
+            raise bad_request(
+                f"task_type must be one of: {supported}", param="task_type"
+            )
+        if not policy.accepts_reference_inputs:
+            for field in ("ref_audio", "ref_text", "x_vector_only_mode"):
+                if getattr(request, field) is not None:
+                    raise bad_request(
+                        f"{field} is not supported by this model", param=field
+                    )
+            if request.references:
+                raise bad_request(
+                    "references are not supported by this model", param="references"
+                )
+        if self._allowed_voice_keys is None:
+            return
+        name = request.voice.strip().casefold()
+        if name in {"", "default"} or name in self._allowed_voice_keys:
+            return
+        supported = ", ".join(("default", *policy.allowed_voices))
+        raise bad_request(
+            f"Unknown voice '{request.voice}'. Supported voices: {supported}",
+            param="voice",
+        )
 
     def _normalize_language(self, value: str) -> str:
         normalized = self._tts_language_aliases.get(value.strip().lower())
@@ -582,6 +646,7 @@ class SpeechRequestValidator:
             if batch.task_type is not None
             else None
         )
+        self._validate_request_policy(batch, task_type=task_type)
         if batch.language is not None:
             self._normalize_language(batch.language)
         _validate_positive_int(batch.max_new_tokens, param="max_new_tokens")
@@ -594,14 +659,18 @@ class SpeechRequestValidator:
         _validate_non_negative_int(batch.seed, param="seed")
         if (
             self.voice_store is not None
-            and self.supports_uploaded_voice_references
+            and self.request_policy.uploaded_voice_mode != UPLOADED_VOICE_MODE_DISABLED
             and batch.ref_audio is None
             and not batch.references
             and batch.voice
             and batch.voice.lower() != "default"
         ):
             uploaded_voice = self.voice_store.resolve_reference(batch.voice)
-            if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
+            if (
+                uploaded_voice is None
+                and self.request_policy.uploaded_voice_mode
+                == UPLOADED_VOICE_MODE_REQUIRED
+            ):
                 raise bad_request(
                     f"Unknown voice '{batch.voice}'. Upload a voice first via "
                     "POST /v1/audio/voices, or use ref_audio + ref_text.",
@@ -622,7 +691,7 @@ class SpeechRequestValidator:
     ) -> "UploadedVoiceReference | None":
         if (
             self.voice_store is None
-            or not self.supports_uploaded_voice_references
+            or self.request_policy.uploaded_voice_mode == UPLOADED_VOICE_MODE_DISABLED
             or request.ref_audio is not None
             or request.references
         ):
@@ -630,7 +699,10 @@ class SpeechRequestValidator:
         if not request.voice or request.voice.lower() == "default":
             return None
         uploaded_voice = self.voice_store.resolve_reference(request.voice)
-        if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
+        if (
+            uploaded_voice is None
+            and self.request_policy.uploaded_voice_mode == UPLOADED_VOICE_MODE_REQUIRED
+        ):
             raise bad_request(
                 f"Unknown voice '{request.voice}'. Upload a voice first via "
                 "POST /v1/audio/voices, or use ref_audio + ref_text.",

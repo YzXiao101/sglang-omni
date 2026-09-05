@@ -12,9 +12,11 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from sglang_omni.client import GenerateChunk
 from sglang_omni.client.types import SpeechResult
+from sglang_omni.config import TTSRequestPolicy
 from sglang_omni.serve import create_app
 from sglang_omni.serve import speech_ws as speech_ws_module
 from sglang_omni.serve.protocol import SpeechStreamSessionConfig
+from sglang_omni.serve.speech_errors import SpeechAPIError
 from sglang_omni.serve.speech_service import (
     MAX_SPEECH_INPUT_CHARS,
     SpeechRequestValidator,
@@ -380,6 +382,40 @@ def test_speech_websocket_commit_flushes_segments_without_closing() -> None:
         assert session_done["total_sentences"] == 2
 
     assert client_impl.generated_prompts == ["First segment.", "Second segment"]
+
+
+@pytest.mark.asyncio
+async def test_custom_voice_websocket_uses_shared_policy() -> None:
+    policy = TTSRequestPolicy(
+        allowed_voices=("speaker",),
+        allowed_task_types=frozenset({"CustomVoice"}),
+        accepts_reference_inputs=False,
+    )
+    service = SpeechRequestValidator(default_model="tts", tts_request_policy=policy)
+    client = StreamingSpeechClient()
+    session = SpeechWebSocketSession(
+        RecordingWebSocket(), client=client, speech_service=service
+    )
+    with pytest.raises(SpeechAPIError) as exc:
+        await session._parse_config(
+            {
+                "type": "session.config",
+                "response_format": "pcm",
+                "voice": "missing",
+            }
+        )
+    assert exc.value.param == "voice"
+    config = await session._parse_config(
+        {
+            "type": "session.config",
+            "response_format": "pcm",
+            "speaker": "SPEAKER",
+        }
+    )
+    assert config.voice == "SPEAKER"
+    assert config.task_type is None
+    assert session.config_prepared_request.reference_descriptors == []
+    assert not client.generated_prompts and not client.speech_prompts
 
 
 def test_speech_websocket_config_uses_served_model_and_default_voice() -> None:

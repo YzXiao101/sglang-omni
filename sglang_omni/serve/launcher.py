@@ -424,12 +424,7 @@ async def _run_server(
         app = create_app(
             client,
             model_name=model_name or pipeline_config.name,
-            requires_uploaded_voice_for_named_voice=(
-                pipeline_config.requires_uploaded_voice_for_named_voice()
-            ),
-            supports_uploaded_voice_references=(
-                pipeline_config.supports_uploaded_voice_references()
-            ),
+            tts_request_policy=pipeline_config.resolve_tts_request_policy(),
             supports_audio_translation=(pipeline_config.supports_audio_translation()),
             required_speech_reference_count=(
                 pipeline_config.required_speech_reference_count

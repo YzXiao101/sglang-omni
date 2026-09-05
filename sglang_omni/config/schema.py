@@ -533,6 +533,43 @@ class ResolvedAudioChunking:
         return max(int(self.max_audio_clip_s * sample_rate), 1)
 
 
+UploadedVoiceMode = Literal["disabled", "optional", "required"]
+UPLOADED_VOICE_MODE_DISABLED: UploadedVoiceMode = "disabled"
+UPLOADED_VOICE_MODE_OPTIONAL: UploadedVoiceMode = "optional"
+UPLOADED_VOICE_MODE_REQUIRED: UploadedVoiceMode = "required"
+
+
+@dataclass(frozen=True)
+class TTSRequestPolicy:
+    allowed_voices: tuple[str, ...] | None = None
+    allowed_task_types: frozenset[str] | None = None
+    accepts_reference_inputs: bool = True
+    uploaded_voice_mode: UploadedVoiceMode = UPLOADED_VOICE_MODE_DISABLED
+
+    def __post_init__(self) -> None:
+        if self.uploaded_voice_mode != UPLOADED_VOICE_MODE_DISABLED and (
+            self.allowed_voices is not None
+            or self.allowed_task_types is not None
+            or not self.accepts_reference_inputs
+        ):
+            raise ValueError(
+                "Uploaded voices cannot be combined with speech input restrictions"
+            )
+
+    @classmethod
+    def from_uploaded_voice_options(
+        cls,
+        *,
+        requires_uploaded_voice_for_named_voice: bool,
+        supports_uploaded_voice_references: bool,
+    ) -> TTSRequestPolicy:
+        if requires_uploaded_voice_for_named_voice:
+            return cls(uploaded_voice_mode=UPLOADED_VOICE_MODE_REQUIRED)
+        if supports_uploaded_voice_references:
+            return cls(uploaded_voice_mode=UPLOADED_VOICE_MODE_OPTIONAL)
+        return cls()
+
+
 class PipelineConfig(BaseModel):
     """Top-level pipeline configuration.
 
@@ -760,6 +797,14 @@ class PipelineConfig(BaseModel):
     def supports_uploaded_voice_references(self) -> bool:
         """Return whether uploaded voices can be lowered as reference audio."""
         return False
+
+    def resolve_tts_request_policy(self) -> TTSRequestPolicy:
+        return TTSRequestPolicy.from_uploaded_voice_options(
+            requires_uploaded_voice_for_named_voice=(
+                self.requires_uploaded_voice_for_named_voice()
+            ),
+            supports_uploaded_voice_references=self.supports_uploaded_voice_references(),
+        )
 
     def supports_audio_translation(self) -> bool:
         """Return whether this pipeline can serve /v1/audio/translations."""
