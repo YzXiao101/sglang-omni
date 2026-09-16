@@ -121,6 +121,7 @@ class DiT(nn.Module):
         )
         if execution_config.attn_backend is not None:
             kwargs["attn_backend"] = execution_config.attn_backend
+        rms_norm_factory = execution_config.rms_norm_factory
 
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -145,11 +146,21 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs)
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    rms_norm_factory=rms_norm_factory,
+                    **kwargs,
+                )
                 for _ in range(depth)
             ]
         )
-        self.final_layer = FinalLayer(hidden_size, self.out_channels)
+        self.final_layer = FinalLayer(
+            hidden_size,
+            self.out_channels,
+            rms_norm_factory=rms_norm_factory,
+        )
         self.initialize_weights()
 
     def initialize_weights(self):
