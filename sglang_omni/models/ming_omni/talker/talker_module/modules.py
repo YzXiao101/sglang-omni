@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang_omni.models.weight_loader import default_weight_loader
+
 from .rotary import apply_rotary_embedding
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
@@ -84,6 +86,28 @@ class FeedForward(nn.Module):
         return self.ff(x)
 
 
+class PackedQKVLinear(nn.Linear):
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__(input_size, 3 * output_size)
+        self.output_size = output_size
+        self.weight.weight_loader = self.weight_loader
+        self.bias.weight_loader = self.weight_loader
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+    ) -> None:
+        shard_index = {"q": 0, "k": 1, "v": 2}[shard_id]
+        shard = param.data.narrow(
+            0,
+            shard_index * self.output_size,
+            self.output_size,
+        )
+        default_weight_loader(shard, loaded_weight)
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -97,6 +121,7 @@ class Attention(nn.Module):
         ) = None,  # number of attention head to apply rope, None for all
         attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
+        qkv_layer: Callable[[int, int], nn.Module] | None = None,
     ):
         super().__init__()
 
@@ -112,9 +137,11 @@ class Attention(nn.Module):
         self.inner_dim = dim_head * heads
         self.dropout = dropout
 
-        self.to_q = nn.Linear(dim, self.inner_dim)
-        self.to_k = nn.Linear(dim, self.inner_dim)
-        self.to_v = nn.Linear(dim, self.inner_dim)
+        self.to_qkv = qkv_layer(dim, self.inner_dim) if qkv_layer is not None else None
+        if self.to_qkv is None:
+            self.to_q = nn.Linear(dim, self.inner_dim)
+            self.to_k = nn.Linear(dim, self.inner_dim)
+            self.to_v = nn.Linear(dim, self.inner_dim)
         if qk_norm is None:
             self.q_norm = None
             self.k_norm = None
@@ -150,9 +177,12 @@ class Attention(nn.Module):
         batch_size = x.shape[0]
 
         # `sample` projections
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        if self.to_qkv is None:
+            query = self.to_q(x)
+            key = self.to_k(x)
+            value = self.to_v(x)
+        else:
+            query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
         # attention
         inner_dim = key.shape[-1]
@@ -269,6 +299,7 @@ class DiTBlock(nn.Module):
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
         norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
+        qkv_layer: Callable[[int, int], nn.Module] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -282,6 +313,7 @@ class DiTBlock(nn.Module):
             pe_attn_head=pe_attn_head,
             attn_backend=attn_backend,
             attn_mask_enabled=attn_mask_enabled,
+            qkv_layer=qkv_layer,
         )
         self.norm2 = norm_layer(hidden_size, 1e-6)
         self.mlp = FeedForward(

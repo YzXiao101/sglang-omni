@@ -23,3 +23,4 @@ class TalkerExecutionConfig:
     rope_seq_len: int | None = None
     rope_max_batch_size: int | None = None
     norm_layer: Callable[[int, float], "nn.Module"] | None = None
+    qkv_layer: Callable[[int, int], "nn.Module"] | None = None

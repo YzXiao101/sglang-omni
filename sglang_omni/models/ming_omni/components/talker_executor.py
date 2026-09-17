@@ -67,15 +67,10 @@ class MingTalkerExecutor:
         """Load talker model and VAE (runs in thread pool)."""
         from transformers import AutoTokenizer
 
-        from sglang_omni.models.ming_omni.talker import (
-            MingOmniTalker,
-            MingOmniTalkerConfig,
-            SpkembExtractor,
-        )
+        from sglang_omni.models.ming_omni.talker import MingOmniTalker, SpkembExtractor
         from sglang_omni.models.ming_omni.talker.audio_vae.modeling_audio_vae import (
             AudioVAE,
         )
-        from sglang_omni.models.weight_loader import load_weights_by_prefix
 
         logger.info(
             "[TALKER] Loading MingOmniTalker from %s (device=%s)",
@@ -83,31 +78,17 @@ class MingTalkerExecutor:
             self.device,
         )
 
-        # 1. Load config from checkpoint
         t0 = time.time()
-        config = MingOmniTalkerConfig.from_pretrained_dir(self.talker_model_path)
-        if torch.device(self.device).type == "npu":
-            config.use_torch_attention()
-        else:
-            pass
-
-        # 2. Create model (no weights yet)
-        self.talker = MingOmniTalker(config)
-        self.talker.eval()
-
-        # 3. Stream weights, then move to device with bf16
-        weights = load_weights_by_prefix(self.talker_model_path, prefix="")
-        self.talker.load_weights(weights.items())
-        self.talker.to(device=self.device, dtype=torch.bfloat16)
+        self.talker = MingOmniTalker.from_pretrained(
+            self.talker_model_path, device=self.device
+        )
         logger.info("[TALKER] MingOmniTalker loaded in %.1fs", time.time() - t0)
 
-        # 4. Load tokenizer externally
         tokenizer = AutoTokenizer.from_pretrained(
             str(Path(self.talker_model_path) / "llm")
         )
         self.talker.set_tokenizer(tokenizer)
 
-        # 5. Load voice presets
         voice_json_path = os.path.join(
             self.talker_model_path, "data", "voice_name.json"
         )
@@ -128,7 +109,6 @@ class MingTalkerExecutor:
                 "[TALKER] no voice_name.json at %s; presets disabled", voice_json_path
             )
 
-        # 6. Load speaker embedding extractor (optional)
         campplus_path = os.path.join(self.talker_model_path, "campplus.onnx")
         try:
             extractor = SpkembExtractor(campplus_path)

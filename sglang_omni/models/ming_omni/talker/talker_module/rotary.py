@@ -67,6 +67,7 @@ class CachedRotaryEmbedding(RotaryEmbedding):
             cache = torch.cat((phase.cos(), phase.sin()), dim=-1).contiguous()
 
         self.kernel = kernel
+        self._master_cos_sin_cache = cache.cpu()
         self.register_buffer("cos_sin_cache", cache, persistent=False)
         self.register_buffer(
             "positions",
@@ -75,6 +76,13 @@ class CachedRotaryEmbedding(RotaryEmbedding):
             ).repeat(max_batch_size),
             persistent=False,
         )
+
+    def _apply(self, fn, recurse: bool = True):  # noqa: leading-underscore
+        result = super()._apply(fn, recurse)
+        # Note(yzxiao): The CUDA kernel requires the cache produced from the
+        # canonical FP32 frequencies even when the surrounding model is BF16.
+        self.cos_sin_cache = self._master_cos_sin_cache.to(self.positions.device)
+        return result
 
     def for_batch(self, batch_size: int) -> RotaryInputs:
         seq_len = self.cos_sin_cache.shape[0]
