@@ -831,7 +831,7 @@ class MingTTSSGLangModel(nn.Module):
         aggregator_config = dict(self.config.aggregator_config)
         ditar_config = dict(self.config.ditar_config)
         # Note(yzxiao): Preserve Ming's cast-before-weight-multiply RMSNorm semantics.
-        rms_norm_factory = partial(RMSNorm, cast_x_before_out_mul=True)
+        norm_layer = partial(RMSNorm, cast_x_before_out_mul=True)
         # Note(yzxiao): Runtime policy overrides any checkpoint-provided
         # execution config. Other shared-component callers keep native.
         aggregator_config["execution_config"] = TalkerExecutionConfig(
@@ -839,14 +839,14 @@ class MingTTSSGLangModel(nn.Module):
             rope_kernel=rope_kernel,
             rope_seq_len=1 + self.patch_size,
             rope_max_batch_size=aggregator_batch_capacity,
-            rms_norm_factory=rms_norm_factory,
+            norm_layer=norm_layer,
         )
         ditar_config["execution_config"] = TalkerExecutionConfig(
             attn_backend=tail_attn_backend,
             rope_kernel=rope_kernel,
             rope_seq_len=1 + self.history_patch_size + self.patch_size,
             rope_max_batch_size=2 * tail_batch_capacity,
-            rms_norm_factory=rms_norm_factory,
+            norm_layer=norm_layer,
         )
 
         self.linear_proj_audio = Aggregator(

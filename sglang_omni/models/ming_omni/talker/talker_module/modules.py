@@ -1,10 +1,9 @@
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .execution import RMSNormFactory
 from .rotary import apply_rotary_embedding
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
@@ -61,16 +60,6 @@ class RMSNorm(nn.Module):
             x = x * self.weight
 
         return x
-
-
-def _build_rms_norm(
-    hidden_size: int,
-    eps: float,
-    factory: RMSNormFactory | None,
-) -> nn.Module:
-    if factory is None:
-        return RMSNorm(hidden_size, eps)
-    return factory(hidden_size, eps)
 
 
 class FeedForward(nn.Module):
@@ -257,11 +246,11 @@ class DiTBlock(nn.Module):
         pe_attn_head=None,
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
-        rms_norm_factory: RMSNormFactory | None = None,
+        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
         **kwargs,
     ):
         super().__init__()
-        self.norm1 = _build_rms_norm(hidden_size, 1e-6, rms_norm_factory)
+        self.norm1 = norm_layer(hidden_size, 1e-6)
         self.attn = Attention(
             dim=hidden_size,
             heads=num_heads,
@@ -272,7 +261,7 @@ class DiTBlock(nn.Module):
             attn_backend=attn_backend,
             attn_mask_enabled=attn_mask_enabled,
         )
-        self.norm2 = _build_rms_norm(hidden_size, 1e-6, rms_norm_factory)
+        self.norm2 = norm_layer(hidden_size, 1e-6)
         self.mlp = FeedForward(
             dim=hidden_size, mult=mlp_ratio, dropout=dropout, approximate="tanh"
         )
@@ -292,10 +281,10 @@ class FinalLayer(nn.Module):
         self,
         hidden_size,
         out_channels,
-        rms_norm_factory: RMSNormFactory | None = None,
+        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
     ):
         super().__init__()
-        self.norm_final = _build_rms_norm(hidden_size, 1e-6, rms_norm_factory)
+        self.norm_final = norm_layer(hidden_size, 1e-6)
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
     def forward(self, x):

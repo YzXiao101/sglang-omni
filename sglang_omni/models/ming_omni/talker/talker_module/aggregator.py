@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from .execution import TalkerExecutionConfig
-from .modules import DiTBlock, FinalLayer
+from .modules import DiTBlock, FinalLayer, RMSNorm
 from .rotary import build_rotary_embedding, get_rotary_inputs, validate_rotary_config
 
 
@@ -44,7 +44,7 @@ class Aggregator(nn.Module):
         )
         if execution_config.attn_backend is not None:
             kwargs["attn_backend"] = execution_config.attn_backend
-        rms_norm_factory = execution_config.rms_norm_factory
+        norm_layer = execution_config.norm_layer or RMSNorm
 
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -67,7 +67,7 @@ class Aggregator(nn.Module):
                     hidden_size,
                     num_heads,
                     mlp_ratio=mlp_ratio,
-                    rms_norm_factory=rms_norm_factory,
+                    norm_layer=norm_layer,
                     **kwargs,
                 )
                 for _ in range(depth)
@@ -76,7 +76,7 @@ class Aggregator(nn.Module):
         self.final_layer = FinalLayer(
             hidden_size,
             llm_input_dim,
-            rms_norm_factory=rms_norm_factory,
+            norm_layer=norm_layer,
         )
         self.initialize_weights()
 

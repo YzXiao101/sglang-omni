@@ -10,8 +10,6 @@ if TYPE_CHECKING:
 
     from sglang_omni.platforms.interface import JointRopeInplaceKernel
 
-RMSNormFactory = Callable[[int, float], "nn.Module"]
-
 
 @dataclass(frozen=True)
 class TalkerExecutionConfig:
@@ -22,4 +20,4 @@ class TalkerExecutionConfig:
     rope_kernel: JointRopeInplaceKernel | None = None
     rope_seq_len: int | None = None
     rope_max_batch_size: int | None = None
-    rms_norm_factory: RMSNormFactory | None = None
+    norm_layer: Callable[[int, float], "nn.Module"] | None = None
