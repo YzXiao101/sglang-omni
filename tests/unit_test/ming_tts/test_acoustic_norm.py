@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Tests for Ming-TTS acoustic RMSNorm backend selection."""
 
 from functools import partial
 
@@ -13,7 +14,7 @@ from sglang_omni.models.ming_omni.talker.talker_module.execution import (
 from sglang_omni.models.ming_omni.talker.talker_module.modules import (
     RMSNorm as MingRMSNorm,
 )
-from sglang_omni.models.ming_tts.sglang_model import RMSNorm as SGLangRMSNorm
+from sglang_omni.vendor.sglang.layers import RMSNorm as SGLangRMSNorm
 
 
 def test_ming_tts_acoustic_rms_norm_preserves_bf16_semantics() -> None:
@@ -32,7 +33,7 @@ def test_ming_tts_acoustic_rms_norm_preserves_bf16_semantics() -> None:
         legacy.weight.copy_(weight)
         optimized.weight.copy_(weight)
         expected = legacy(inputs)
-        actual = optimized.forward_native(inputs)
+        actual = optimized(inputs)
 
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
