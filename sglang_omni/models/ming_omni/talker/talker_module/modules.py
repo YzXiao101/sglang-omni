@@ -1,12 +1,9 @@
-from typing import Callable, Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang_omni.models.weight_loader import default_weight_loader
-
-from .rotary import apply_rotary_embedding
+from .execution import NormLayerFactory
+from .rotary import RotaryInputs, apply_rotary_embedding
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
 flash_attn_func = None
@@ -18,7 +15,7 @@ try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import pad_input, unpad_input
 except (ImportError, ModuleNotFoundError) as exc:
-    # Note:(Chenchen Hong) FlashAttention is optional; keep this for backend errors.
+    # Note(Chenchen Hong): Preserve the cause of an unavailable backend.
     _FLASH_ATTN_IMPORT_ERROR = exc
 
 
@@ -86,28 +83,6 @@ class FeedForward(nn.Module):
         return self.ff(x)
 
 
-class PackedQKVLinear(nn.Linear):
-    def __init__(self, input_size: int, output_size: int):
-        super().__init__(input_size, 3 * output_size)
-        self.output_size = output_size
-        self.weight.weight_loader = self.weight_loader
-        self.bias.weight_loader = self.weight_loader
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-    ) -> None:
-        shard_index = {"q": 0, "k": 1, "v": 2}[shard_id]
-        shard = param.data.narrow(
-            0,
-            shard_index * self.output_size,
-            self.output_size,
-        )
-        default_weight_loader(shard, loaded_weight)
-
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -115,13 +90,11 @@ class Attention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        qk_norm: Optional[str] = None,
-        pe_attn_head: (
-            int | None
-        ) = None,  # number of attention head to apply rope, None for all
-        attn_backend: str = "torch",  # "torch" or "flash_attn"
+        qk_norm: str | None = None,
+        pe_attn_head: int | None = None,
+        attn_backend: str = "torch",
         attn_mask_enabled: bool = True,
-        qkv_layer: Callable[[int, int], nn.Module] | None = None,
+        qkv_layer: type[nn.Module] | None = None,
     ):
         super().__init__()
 
@@ -142,6 +115,8 @@ class Attention(nn.Module):
             self.to_q = nn.Linear(dim, self.inner_dim)
             self.to_k = nn.Linear(dim, self.inner_dim)
             self.to_v = nn.Linear(dim, self.inner_dim)
+        else:
+            pass
         if qk_norm is None:
             self.q_norm = None
             self.k_norm = None
@@ -169,14 +144,15 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        x: float,  # noised input x
-        mask=None,
-        rope=None,  # rotary position embedding for x
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        rope: (
+            RotaryInputs | tuple[torch.Tensor, float | torch.Tensor | None] | None
+        ) = None,
     ) -> torch.Tensor:
 
         batch_size = x.shape[0]
 
-        # `sample` projections
         if self.to_qkv is None:
             query = self.to_q(x)
             key = self.to_k(x)
@@ -184,14 +160,12 @@ class Attention(nn.Module):
         else:
             query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
-        # attention
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
         query = query.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
-        # qk norm
         if self.q_norm is not None:
             query = self.q_norm(query)
         else:
@@ -206,7 +180,6 @@ class Attention(nn.Module):
         )
 
         if self.attn_backend == "torch":
-            # mask. e.g. inference got a batch with different target durations, mask out the padding
             if self.attn_mask_enabled and mask is not None:
                 valid_sample_indices = mask.any(dim=1)
                 final_output = torch.zeros_like(query).to(query.device)
@@ -215,7 +188,7 @@ class Attention(nn.Module):
                 query = query[valid_sample_indices]
                 key = key[valid_sample_indices]
                 value = value[valid_sample_indices]
-                attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)  # 'b n -> b 1 1 n'
+                attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
                 attn_mask = attn_mask.expand(
                     valid_sample_indices.sum().item(),
                     self.heads,
@@ -241,7 +214,7 @@ class Attention(nn.Module):
                 raise_flash_attn_unavailable()
             else:
                 pass
-            query = query.transpose(1, 2)  # [b, h, n, d] -> [b, n, h, d]
+            query = query.transpose(1, 2)
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
             if self.attn_mask_enabled and mask is not None:
@@ -269,9 +242,7 @@ class Attention(nn.Module):
 
         x = x.to(query.dtype)
 
-        # linear proj
         x = self.to_out[0](x)
-        # dropout
         x = self.to_out[1](x)
 
         if mask is not None:
@@ -298,8 +269,8 @@ class DiTBlock(nn.Module):
         pe_attn_head=None,
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
-        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
-        qkv_layer: Callable[[int, int], nn.Module] | None = None,
+        norm_layer: NormLayerFactory = RMSNorm,
+        qkv_layer: type[nn.Module] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -335,7 +306,7 @@ class FinalLayer(nn.Module):
         self,
         hidden_size,
         out_channels,
-        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
+        norm_layer: NormLayerFactory = RMSNorm,
     ):
         super().__init__()
         self.norm_final = norm_layer(hidden_size, 1e-6)

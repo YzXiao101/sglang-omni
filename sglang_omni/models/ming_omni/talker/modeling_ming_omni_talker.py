@@ -38,7 +38,11 @@ from .talker_module.aggregator import Aggregator
 from .talker_module.cfm import CFM, get_epss_timesteps
 from .talker_module.dit import DiT
 from .talker_module.execution import TalkerExecutionConfig
-from .talker_module.modules import PackedQKVLinear
+from .talker_module.packed_qkv import (
+    PACKED_QKV_SHARD_IDS,
+    PackedQKVLinear,
+    load_packed_qkv_shard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +181,7 @@ class CFMGraphExecutor:
             raise asyncio.CancelledError()
         else:
             pass
-        # Python abort checks inside CFM.sample run during capture; replay is
-        # bounded by explicit checks before and after the device graph replay.
+        # Note(yzxiao): Replay does not execute Python abort checks.
         self.graph.replay()
         if abort_event is not None and abort_event.is_set():
             raise asyncio.CancelledError()
@@ -206,9 +209,7 @@ class CFMGraphExecutor:
         )
         self.sde_rnd_placeholder = sde_rnd.clone()
 
-        # (wenyao) Aborting CFM.sample during graph capture corrupts the
-        # partial graph. Pass abort_event=None during capture; the caller
-        # (execute) checks abort before graph initialization and on every replay.
+        # Note(wenyao): Capture must finish before an abort can discard its graph.
         graph_backend = current_platform.get_device_graph_backend(input_tensor.device)
         if graph_backend is None:
             raise RuntimeError(
@@ -226,6 +227,8 @@ class CFMGraphExecutor:
                     for _ in range(2):
                         self.compute_tail()
                     runtime.synchronize()
+            else:
+                pass
             with graph_backend.capture(thread_local_errors=True) as graph:
                 self.graph = graph
                 (
@@ -343,6 +346,11 @@ class MingOmniTalker(nn.Module):
             execution_config=aggregator_execution_config,
             **config.aggregator,
         )
+        self.reference_patch_capacity = (
+            aggregator_execution_config.rope_max_batch_size
+            if aggregator_execution_config is not None
+            else None
+        )
 
         self.stop_head = nn.Linear(self.model.config.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(
@@ -393,6 +401,8 @@ class MingOmniTalker(nn.Module):
         config = MingOmniTalkerConfig.from_pretrained_dir(model_path)
         if device.type == "npu":
             config.use_torch_attention()
+        else:
+            pass
 
         dit_execution_config = None
         aggregator_execution_config = None
@@ -407,23 +417,28 @@ class MingOmniTalker(nn.Module):
                     f"kernel, but {type(current_platform).__name__} does not "
                     "provide one."
                 )
+            else:
+                pass
             norm_layer = partial(RMSNorm, cast_x_before_out_mul=True)
-            # Note(yzxiao): CFG doubles the DiT batch. Reference patches become
-            # Aggregator batch rows and cannot exceed the talker cache capacity.
+            qkv_layer = PackedQKVLinear
+            # Note(yzxiao): CFG doubles DiT batch; reference aggregation is
+            # capped by the 512-token AR cache's upper bound.
             dit_execution_config = TalkerExecutionConfig(
                 rope_kernel=rope_kernel,
                 rope_seq_len=1 + config.history_patch_size + config.patch_size,
                 rope_max_batch_size=2,
                 norm_layer=norm_layer,
-                qkv_layer=PackedQKVLinear,
+                qkv_layer=qkv_layer,
             )
             aggregator_execution_config = TalkerExecutionConfig(
                 rope_kernel=rope_kernel,
                 rope_seq_len=1 + config.patch_size,
                 rope_max_batch_size=_MAX_CACHE_LEN,
                 norm_layer=norm_layer,
-                qkv_layer=PackedQKVLinear,
+                qkv_layer=qkv_layer,
             )
+        else:
+            pass
         model = cls(
             config,
             dit_execution_config=dit_execution_config,
@@ -454,44 +469,42 @@ class MingOmniTalker(nn.Module):
         from sglang_omni.models.weight_loader import default_weight_loader
 
         params_dict = dict(self.named_parameters())
-        stacked_params_mapping = (
-            (".to_qkv.", ".to_q.", "q"),
-            (".to_qkv.", ".to_k.", "k"),
-            (".to_qkv.", ".to_v.", "v"),
-        )
-
-        loaded = set()
+        loaded_param_names: set[str] = set()
         loaded_shards: dict[str, set[str]] = {}
+        required_shards = set(PACKED_QKV_SHARD_IDS)
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                target_name = name.replace(weight_name, param_name)
-                if target_name not in params_dict:
-                    continue
-                param = params_dict[target_name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded.add(target_name)
+            packed_shard = load_packed_qkv_shard(name, loaded_weight, params_dict)
+            if packed_shard is not None:
+                target_name, shard_id = packed_shard
+                loaded_param_names.add(target_name)
                 loaded_shards.setdefault(target_name, set()).add(shard_id)
-                break
+                continue
             else:
-                if name not in params_dict:
-                    logger.warning("Unexpected weight: %s", name)
-                    continue
-                default_weight_loader(params_dict[name], loaded_weight)
-                loaded.add(name)
-                if ".to_qkv." in name:
-                    loaded_shards[name] = {"q", "k", "v"}
+                pass
+
+            if name not in params_dict:
+                logger.warning("Unexpected weight: %s", name)
+                continue
+            else:
+                pass
+            default_weight_loader(params_dict[name], loaded_weight)
+            loaded_param_names.add(name)
+            if ".to_qkv." in name:
+                loaded_shards[name] = required_shards.copy()
+            else:
+                pass
 
         packed_params = {name for name in params_dict if ".to_qkv." in name}
         missing_shards = {
-            name: sorted({"q", "k", "v"} - loaded_shards.get(name, set()))
+            name: sorted(required_shards - loaded_shards.get(name, set()))
             for name in packed_params
-            if loaded_shards.get(name, set()) != {"q", "k", "v"}
+            if loaded_shards.get(name, set()) != required_shards
         }
         if missing_shards:
             raise ValueError(f"Missing packed QKV shards: {missing_shards}")
-        missing = params_dict.keys() - loaded
+        else:
+            pass
+        missing = params_dict.keys() - loaded_param_names
         if missing:
             logger.warning(
                 "Missing weights (%d): %s", len(missing), sorted(missing)[:20]
@@ -1284,6 +1297,17 @@ class MingOmniTalker(nn.Module):
             torch.tensor([speech.size(1)], dtype=torch.long, device=self.device),
         )
         assert prompt_wav_lat.shape[1] % self.patch_size == 0
+        reference_patch_count = prompt_wav_lat.shape[1] // self.patch_size
+        if (
+            self.reference_patch_capacity is not None
+            and reference_patch_count > self.reference_patch_capacity
+        ):
+            raise ValueError(
+                f"Reference audio has {reference_patch_count} patches; "
+                f"the acoustic kernel supports at most {self.reference_patch_capacity}."
+            )
+        else:
+            pass
         prompt_wav_lat = prompt_wav_lat.reshape(
             -1, self.patch_size, prompt_wav_lat.shape[-1]
         )

@@ -19,10 +19,6 @@ from .execution import TalkerExecutionConfig
 from .modules import DiTBlock, FinalLayer, RMSNorm
 from .rotary import build_rotary_embedding, get_rotary_inputs, validate_rotary_config
 
-#################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
-#################################################################################
-
 
 class SinusPositionEmbedding(nn.Module):
     def __init__(self, dim):
@@ -50,14 +46,12 @@ class TimestepEmbedder(nn.Module):
     def forward(self, timestep):
         time_hidden = self.time_embed(timestep)
         time_hidden = time_hidden.to(timestep.dtype)
-        time = self.time_mlp(time_hidden)  # b d
+        time = self.time_mlp(time_hidden)
         return time
 
 
 class CondEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles llm hidden dropout for classifier-free guidance.
-    """
+    """Project LLM conditioning with optional classifier-free dropout."""
 
     def __init__(self, input_feature_size, hidden_size, dropout_prob):
         super().__init__()
@@ -65,9 +59,7 @@ class CondEmbedder(nn.Module):
         self.cond_embedder = nn.Linear(input_feature_size, hidden_size)
 
     def cond_drop(self, llm_cond):
-        """
-        Drops llm hidden to enable classifier-free guidance.
-        """
+        """Drop LLM conditioning for classifier-free guidance."""
         bsz = llm_cond.shape[0]
         drop_latent_mask = torch.rand(bsz) < self.dropout_prob
         drop_latent_mask = (
@@ -169,7 +161,6 @@ class DiT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
@@ -182,39 +173,30 @@ class DiT(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w_x = self.x_embedder.weight.data
         nn.init.xavier_uniform_(w_x.view([w_x.shape[0], -1]))
         nn.init.constant_(self.x_embedder.bias, 0)
 
-        # Initialize label embedding table:
         w_c = self.c_embedder.cond_embedder.weight.data
         nn.init.xavier_uniform_(w_c.view([w_c.shape[0], -1]))
         nn.init.constant_(self.c_embedder.cond_embedder.bias, 0)
 
-        # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.time_mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.time_mlp[2].weight, std=0.02)
 
-        # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def forward(self, x, t, c, latent_history, spk_emb=None):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
+        """Predict acoustic flow from current and historical latents."""
         x = torch.cat([latent_history, x], dim=1)
         x = self.x_embedder(x)
-        t = self.t_embedder(t).unsqueeze(1)  # (N, D)
-        c = self.c_embedder(c, self.training)  # (N, 1, 896) -> (N, 1, D)
+        t = self.t_embedder(t).unsqueeze(1)
+        c = self.c_embedder(c, self.training)
         y = t + c
         if spk_emb is None:
             assert self.spk_embedder is None
-            x = torch.cat([y, x], dim=1)  # # (N, 1 + patch_size *2, D)
+            x = torch.cat([y, x], dim=1)
         else:
             x = torch.cat([self.spk_embedder(spk_emb), y, x], dim=1)
         rope = get_rotary_inputs(self.rotary_embed, x.shape[0], x.shape[1])
@@ -224,10 +206,8 @@ class DiT(nn.Module):
                 x = checkpoint(block, x, None, rope, use_reentrant=True)
         else:
             for block in self.blocks:
-                x = block(x, None, rope)  # (N, T, D)
-        # self.hid_state = x
-        x = self.final_layer(x)  # (N, T, patch_size ** 2 * out_channels)
-        # x = self.unpatchify(x)                   # (N, out_channels, H, W)
+                x = block(x, None, rope)
+        x = self.final_layer(x)
         return x
 
     def forward_with_cfg(self, x, t, c, latent_history, spk_emb=None):

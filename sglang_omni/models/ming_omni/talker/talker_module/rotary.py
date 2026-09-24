@@ -67,7 +67,7 @@ class CachedRotaryEmbedding(RotaryEmbedding):
             cache = torch.cat((phase.cos(), phase.sin()), dim=-1).contiguous()
 
         self.kernel = kernel
-        self._master_cos_sin_cache = cache.cpu()
+        self.master_cos_sin_cache = cache.cpu()
         self.register_buffer("cos_sin_cache", cache, persistent=False)
         self.register_buffer(
             "positions",
@@ -81,7 +81,7 @@ class CachedRotaryEmbedding(RotaryEmbedding):
         result = super()._apply(fn, recurse)
         # Note(yzxiao): The CUDA kernel requires the cache produced from the
         # canonical FP32 frequencies even when the surrounding model is BF16.
-        self.cos_sin_cache = self._master_cos_sin_cache.to(self.positions.device)
+        self.cos_sin_cache = self.master_cos_sin_cache.to(self.positions.device)
         return result
 
     def for_batch(self, batch_size: int) -> RotaryInputs:
@@ -152,8 +152,7 @@ def apply_rotary_inplace(
     query: torch.Tensor, key: torch.Tensor, rope: RotaryInputs
 ) -> None:
     batch_size, heads, seq_len, head_dim = query.shape
-    # Note(yzxiao): Undo the attention head view to recover the Linear outputs'
-    # token-major layout. view must alias the original Q/K, never copy them.
+    # Note(yzxiao): Preserve the packed Q/K views so RoPE writes to their source.
     query_tokens = query.transpose(1, 2).view(batch_size * seq_len, heads, head_dim)
     key_tokens = key.transpose(1, 2).view(batch_size * seq_len, heads, head_dim)
     rope.kernel(

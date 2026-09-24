@@ -84,7 +84,6 @@ class Aggregator(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
@@ -97,25 +96,17 @@ class Aggregator(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w_x = self.x_embedder.weight.data
         nn.init.xavier_uniform_(w_x.view([w_x.shape[0], -1]))
         nn.init.constant_(self.x_embedder.bias, 0)
 
-        # Initialize word embedding table:
         nn.init.normal_(self.word_embedder.weight, std=0.02)
 
-        # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def forward(self, x, mask=None):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
+        """Aggregate each batch row of acoustic latents into one embedding."""
         x = self.x_embedder(x)
         cls_embed = self.word_embedder(
             torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device)
@@ -130,7 +121,7 @@ class Aggregator(nn.Module):
             pass
         for block in self.blocks:
             x = block(x, mask, rope)  # (N, T, D)
-        x = self.final_layer(x)  # (N, T, patch_size ** 2 * out_channels)
+        x = self.final_layer(x)
         x = x[:, :1, :]
         return x
 
@@ -142,7 +133,6 @@ class PoolAgg(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -159,7 +149,6 @@ class AggLinear(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Zero-out output layers:
         nn.init.constant_(self.fc.weight, 0)
         nn.init.constant_(self.fc.bias, 0)
 

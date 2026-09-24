@@ -22,10 +22,8 @@ from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
 from sglang_omni.models.ming_omni.talker.talker_module.execution import (
     TalkerExecutionConfig,
 )
-from sglang_omni.models.ming_omni.talker.talker_module.modules import (
-    Attention,
-    PackedQKVLinear,
-)
+from sglang_omni.models.ming_omni.talker.talker_module.modules import Attention
+from sglang_omni.models.ming_omni.talker.talker_module.packed_qkv import PackedQKVLinear
 from sglang_omni.models.ming_omni.talker.talker_module.rotary import (
     CachedRotaryEmbedding,
 )
@@ -150,6 +148,48 @@ def test_packed_qkv_loads_checkpoint_shards_and_matches_native_attention() -> No
         )
 
 
+@pytest.mark.parametrize(
+    ("reference_patch_capacity", "should_reject"), [(2, True), (None, False)]
+)
+def test_reference_audio_checks_only_configured_rotary_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    reference_patch_capacity: int | None,
+    should_reject: bool,
+) -> None:
+    monkeypatch.setattr(
+        talker_model.torchaudio,
+        "load",
+        lambda path, backend: (torch.zeros(1, 8), 24000),
+    )
+    audio_detokenizer = SimpleNamespace(
+        config=SimpleNamespace(sample_rate=24000),
+        encoder=SimpleNamespace(hop_size=1, patch_size=1),
+        encode_latent=lambda speech, lengths: (torch.zeros(1, 12, 4), None),
+    )
+    aggregator = Mock(return_value=torch.zeros(3, 1, 6))
+    talker = SimpleNamespace(
+        spkemb_extractor=None,
+        patch_size=4,
+        device=torch.device("cpu"),
+        reference_patch_capacity=reference_patch_capacity,
+        aggregator=aggregator,
+        registered_prompt={},
+    )
+
+    if should_reject:
+        with pytest.raises(ValueError, match="3 patches.*at most 2"):
+            talker_model.MingOmniTalker.register_prompt_wav(
+                talker, "reference.wav", audio_detokenizer
+            )
+        aggregator.assert_not_called()
+    else:
+        talker_model.MingOmniTalker.register_prompt_wav(
+            talker, "reference.wav", audio_detokenizer
+        )
+        aggregator.assert_called_once()
+        assert "reference.wav" in talker.registered_prompt
+
+
 def test_dit_forward_uses_configured_norm_packing_and_joint_rope() -> None:
     norm_calls: list[torch.Size] = []
     rope_positions: list[list[int]] = []
@@ -172,6 +212,7 @@ def test_dit_forward_uses_configured_norm_packing_and_joint_rope() -> None:
         is_neox: bool,
     ) -> None:
         assert query.shape == key.shape == (12, 2, 4)
+        assert query.stride() == key.stride() == (24, 4, 1)
         assert cache.dtype == torch.float32
         assert is_neox is False
         rope_positions.append(positions.tolist())
