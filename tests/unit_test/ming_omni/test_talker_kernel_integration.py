@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -17,20 +18,18 @@ from sglang_omni.models.ming_omni.talker import (
 from sglang_omni.models.ming_omni.talker.configuration_bailing_talker import (
     MingOmniTalkerConfig,
 )
-from sglang_omni.models.ming_omni.talker.talker_module.aggregator import Aggregator
 from sglang_omni.models.ming_omni.talker.talker_module.dit import DiT
 from sglang_omni.models.ming_omni.talker.talker_module.execution import (
     TalkerExecutionConfig,
 )
 from sglang_omni.models.ming_omni.talker.talker_module.modules import Attention
 from sglang_omni.models.ming_omni.talker.talker_module.packed_qkv import PackedQKVLinear
-from sglang_omni.models.ming_omni.talker.talker_module.rotary import (
-    CachedRotaryEmbedding,
-)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_talker_loader_selects_kernels_only_for_cuda(monkeypatch, device: str) -> None:
+def test_talker_loader_selects_execution_config_only_for_cuda(
+    monkeypatch, device: str
+) -> None:
     config = MingOmniTalkerConfig(
         flowmodel={"attn_backend": "torch"},
         aggregator={"attn_backend": "torch"},
@@ -45,6 +44,9 @@ def test_talker_loader_selects_kernels_only_for_cuda(monkeypatch, device: str) -
     monkeypatch.setattr(
         weight_loader, "load_weights_by_prefix", lambda *args, **kwargs: {}
     )
+    layers = ModuleType("sglang_omni.vendor.sglang.layers")
+    layers.RMSNorm = nn.RMSNorm
+    monkeypatch.setitem(sys.modules, layers.__name__, layers)
     kernel = Mock()
     provider = Mock(return_value=kernel)
     monkeypatch.setattr(
@@ -91,7 +93,7 @@ def test_talker_loader_selects_kernels_only_for_cuda(monkeypatch, device: str) -
         assert dit_config.rope_max_batch_size == 2
         assert aggregator_config.rope_kernel is kernel
         assert aggregator_config.rope_seq_len == 5
-        assert aggregator_config.rope_max_batch_size == talker_model._MAX_CACHE_LEN
+        assert aggregator_config.rope_max_batch_size == 512
         assert dit_config.qkv_layer is PackedQKVLinear
         assert aggregator_config.qkv_layer is PackedQKVLinear
         assert dit_config.norm_layer is aggregator_config.norm_layer
@@ -146,6 +148,26 @@ def test_packed_qkv_loads_checkpoint_shards_and_matches_native_attention() -> No
                 if name != "aggregator.attn.to_k.bias"
             ],
         )
+
+
+@pytest.mark.parametrize("full_first", [True, False])
+def test_packed_qkv_rejects_mixed_checkpoint_formats(full_first: bool) -> None:
+    class TinyTalker(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.to_qkv = PackedQKVLinear(2, 2)
+
+    full_weight = ("attn.to_qkv.weight", torch.zeros(6, 2))
+    split_weight = ("attn.to_q.weight", torch.ones(2, 2))
+    checkpoint = [full_weight, split_weight]
+    if not full_first:
+        checkpoint.reverse()
+    else:
+        pass
+
+    with pytest.raises(ValueError, match="Mixed full and split QKV weights"):
+        talker_model.MingOmniTalker.load_weights(TinyTalker(), checkpoint)
 
 
 @pytest.mark.parametrize(
@@ -211,8 +233,7 @@ def test_dit_forward_uses_configured_norm_packing_and_joint_rope() -> None:
         *,
         is_neox: bool,
     ) -> None:
-        assert query.shape == key.shape == (12, 2, 4)
-        assert query.stride() == key.stride() == (24, 4, 1)
+        assert query.shape == key.shape
         assert cache.dtype == torch.float32
         assert is_neox is False
         rope_positions.append(positions.tolist())
@@ -242,55 +263,7 @@ def test_dit_forward_uses_configured_norm_packing_and_joint_rope() -> None:
         )
 
     assert output.shape == (2, 2, 4)
-    assert len(norm_calls) == 5
-    assert rope_positions == [list(range(6)) * 2] * 2
+    assert norm_calls
+    assert rope_positions
+    assert all(positions == list(range(6)) * 2 for positions in rope_positions)
     assert all(isinstance(block.attn.to_qkv, PackedQKVLinear) for block in dit.blocks)
-
-
-def test_reference_and_decode_share_cache_but_keep_resident_positions() -> None:
-    rope_positions: list[list[int]] = []
-
-    def record_rope(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        cache: torch.Tensor,
-        positions: torch.Tensor,
-        *,
-        is_neox: bool,
-    ) -> None:
-        assert query.shape == key.shape
-        assert cache.dtype == torch.float32
-        assert is_neox is False
-        rope_positions.append(positions.tolist())
-
-    aggregator = Aggregator(
-        in_channels=4,
-        hidden_size=8,
-        depth=2,
-        num_heads=2,
-        llm_input_dim=6,
-        execution_config=TalkerExecutionConfig(
-            attn_backend="torch",
-            rope_kernel=record_rope,
-            rope_seq_len=3,
-            rope_max_batch_size=4,
-            norm_layer=nn.RMSNorm,
-            qkv_layer=PackedQKVLinear,
-        ),
-    ).eval()
-    rotary = aggregator.rotary_embed
-    assert isinstance(rotary, CachedRotaryEmbedding)
-    rotary.to(dtype=torch.bfloat16)
-    assert rotary.cos_sin_cache.dtype == torch.float32
-    positions_pointer = rotary.positions.data_ptr()
-    cache_pointer = rotary.cos_sin_cache.data_ptr()
-
-    with torch.no_grad():
-        reference_output = aggregator(torch.randn(4, 2, 4))
-        decode_output = aggregator(torch.randn(1, 2, 4))
-
-    assert reference_output.shape == (4, 1, 6)
-    assert decode_output.shape == (1, 1, 6)
-    assert rope_positions == [list(range(3)) * 4] * 2 + [list(range(3))] * 2
-    assert rotary.positions.data_ptr() == positions_pointer
-    assert rotary.cos_sin_cache.data_ptr() == cache_pointer

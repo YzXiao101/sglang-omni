@@ -15,7 +15,7 @@ try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import pad_input, unpad_input
 except (ImportError, ModuleNotFoundError) as exc:
-    # Note(Chenchen Hong): Preserve the cause of an unavailable backend.
+    # Note:(Chenchen Hong) FlashAttention is optional; keep this for backend errors.
     _FLASH_ATTN_IMPORT_ERROR = exc
 
 
@@ -91,8 +91,10 @@ class Attention(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         qk_norm: str | None = None,
-        pe_attn_head: int | None = None,
-        attn_backend: str = "torch",
+        pe_attn_head: (
+            int | None
+        ) = None,  # number of attention head to apply rope, None for all
+        attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
         qkv_layer: type[nn.Module] | None = None,
     ):
@@ -144,15 +146,16 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # noised input x
         mask: torch.Tensor | None = None,
         rope: (
             RotaryInputs | tuple[torch.Tensor, float | torch.Tensor | None] | None
-        ) = None,
+        ) = None,  # rotary position embedding for x
     ) -> torch.Tensor:
 
         batch_size = x.shape[0]
 
+        # `sample` projections
         if self.to_qkv is None:
             query = self.to_q(x)
             key = self.to_k(x)
@@ -160,12 +163,14 @@ class Attention(nn.Module):
         else:
             query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
+        # attention
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
         query = query.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
+        # qk norm
         if self.q_norm is not None:
             query = self.q_norm(query)
         else:
@@ -175,11 +180,13 @@ class Attention(nn.Module):
         else:
             pass
 
+        # apply rotary position embedding
         query, key = apply_rotary_embedding(
             query, key, rope, pe_attn_head=self.pe_attn_head
         )
 
         if self.attn_backend == "torch":
+            # mask. e.g. inference got a batch with different target durations, mask out the padding
             if self.attn_mask_enabled and mask is not None:
                 valid_sample_indices = mask.any(dim=1)
                 final_output = torch.zeros_like(query).to(query.device)
@@ -188,7 +195,7 @@ class Attention(nn.Module):
                 query = query[valid_sample_indices]
                 key = key[valid_sample_indices]
                 value = value[valid_sample_indices]
-                attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
+                attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)  # 'b n -> b 1 1 n'
                 attn_mask = attn_mask.expand(
                     valid_sample_indices.sum().item(),
                     self.heads,
@@ -214,7 +221,7 @@ class Attention(nn.Module):
                 raise_flash_attn_unavailable()
             else:
                 pass
-            query = query.transpose(1, 2)
+            query = query.transpose(1, 2)  # [b, h, n, d] -> [b, n, h, d]
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
             if self.attn_mask_enabled and mask is not None:
@@ -242,7 +249,9 @@ class Attention(nn.Module):
 
         x = x.to(query.dtype)
 
+        # linear proj
         x = self.to_out[0](x)
+        # dropout
         x = self.to_out[1](x)
 
         if mask is not None:

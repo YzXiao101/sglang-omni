@@ -488,18 +488,14 @@ Streaming speech is a low-concurrency UX path: it trades some throughput for muc
 
 At c=1 streaming delivers first audio ~2.2× sooner at a ~38% throughput cost. The crossover is around c≈4; past it, single-stream queuing makes streaming's first chunk arrive later than the non-streaming full response. Each streaming request emits ~20 chunks at ~19 ms intervals. The streaming measurements are from PR/local-patch evidence, not a release-wide guarantee; cite streaming as a low-concurrency first-audio win rather than a universal throughput win.
 
-### CFM Kernel Optimization (SeedTTS EN)
+### SeedTTS English Speech Results
 
-This comparison uses 3× H200 (Thinker TP=2 and a dedicated Talker GPU), the full 1,088-sample English SeedTTS split, concurrency 4, four warmup requests, temperature 0.7, and voice `DB30`. Each mode and arm completed all 1,088 requests. WER is corpus WER from Qwen3-ASR-1.7B. These results use one generation pass per arm.
+Results for the full 1,088-sample English SeedTTS split on 3× H200 (Thinker TP=2 and a dedicated Talker GPU), at concurrency 4 with voice `DB30` and temperature 0.7. WER is corpus WER from Qwen3-ASR-1.7B.
 
 | Mode | Throughput (req/s) | Mean latency (s) | First audio (s) | Audio throughput (audio-s/s) | EN WER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Non-streaming, main | 2.291 | 1.743 | — | 14.854 | 1.608% |
-| Non-streaming, optimized | 4.039 (**+76.3%**) | 0.988 | — | 26.128 | 1.474% |
-| Streaming, main | 0.856 | 4.664 | 3.617 | 5.525 | 1.574% |
-| Streaming, optimized | 0.960 (**+12.2%**) | 4.159 | 3.243 | 6.253 | 1.716% |
-
-The streaming WER point estimate rises by 0.142 percentage points; this single pass does not establish statistical noninferiority.
+| Non-streaming | 4.039 | 0.988 | — | 26.128 | 1.474% |
+| Streaming | 0.960 | 4.159 | 3.243 | 6.253 | 1.716% |
 
 ### Audio Equivalence
 

@@ -181,7 +181,8 @@ class CFMGraphExecutor:
             raise asyncio.CancelledError()
         else:
             pass
-        # Note(yzxiao): Replay does not execute Python abort checks.
+        # Python abort checks inside CFM.sample run during capture; replay is
+        # bounded by explicit checks before and after the device graph replay.
         self.graph.replay()
         if abort_event is not None and abort_event.is_set():
             raise asyncio.CancelledError()
@@ -209,7 +210,9 @@ class CFMGraphExecutor:
         )
         self.sde_rnd_placeholder = sde_rnd.clone()
 
-        # Note(wenyao): Capture must finish before an abort can discard its graph.
+        # (wenyao) Aborting CFM.sample during graph capture corrupts the
+        # partial graph. Pass abort_event=None during capture; the caller
+        # (execute) checks abort before initialize_graph and on every replay.
         graph_backend = current_platform.get_device_graph_backend(input_tensor.device)
         if graph_backend is None:
             raise RuntimeError(
@@ -398,6 +401,7 @@ class MingOmniTalker(nn.Module):
         from sglang_omni.models.weight_loader import load_weights_by_prefix
 
         device = torch.device(device)
+        # 1. Load config from checkpoint
         config = MingOmniTalkerConfig.from_pretrained_dir(model_path)
         if device.type == "npu":
             config.use_torch_attention()
@@ -439,11 +443,13 @@ class MingOmniTalker(nn.Module):
             )
         else:
             pass
+        # 2. Create model (no weights yet)
         model = cls(
             config,
             dit_execution_config=dit_execution_config,
             aggregator_execution_config=aggregator_execution_config,
         )
+        # 3. Stream weights, then move to device with bf16
         weights = load_weights_by_prefix(model_path, prefix="")
         model.load_weights(weights.items())
         model.to(device=device, dtype=torch.bfloat16).eval()
@@ -469,15 +475,18 @@ class MingOmniTalker(nn.Module):
         from sglang_omni.models.weight_loader import default_weight_loader
 
         params_dict = dict(self.named_parameters())
-        loaded_param_names: set[str] = set()
-        loaded_shards: dict[str, set[str]] = {}
+        loaded: dict[str, set[str]] = {}
+        full_packed: set[str] = set()
         required_shards = set(PACKED_QKV_SHARD_IDS)
         for name, loaded_weight in weights:
             packed_shard = load_packed_qkv_shard(name, loaded_weight, params_dict)
             if packed_shard is not None:
                 target_name, shard_id = packed_shard
-                loaded_param_names.add(target_name)
-                loaded_shards.setdefault(target_name, set()).add(shard_id)
+                if target_name in full_packed:
+                    raise ValueError(f"Mixed full and split QKV weights: {target_name}")
+                else:
+                    pass
+                loaded.setdefault(target_name, set()).add(shard_id)
                 continue
             else:
                 pass
@@ -487,24 +496,28 @@ class MingOmniTalker(nn.Module):
                 continue
             else:
                 pass
-            default_weight_loader(params_dict[name], loaded_weight)
-            loaded_param_names.add(name)
             if ".to_qkv." in name:
-                loaded_shards[name] = required_shards.copy()
+                if name in loaded:
+                    raise ValueError(f"Mixed full and split QKV weights: {name}")
+                else:
+                    pass
+                full_packed.add(name)
+                loaded[name] = required_shards.copy()
             else:
-                pass
+                loaded[name] = set()
+            default_weight_loader(params_dict[name], loaded_weight)
 
         packed_params = {name for name in params_dict if ".to_qkv." in name}
         missing_shards = {
-            name: sorted(required_shards - loaded_shards.get(name, set()))
+            name: sorted(required_shards - loaded.get(name, set()))
             for name in packed_params
-            if loaded_shards.get(name, set()) != required_shards
+            if loaded.get(name, set()) != required_shards
         }
         if missing_shards:
             raise ValueError(f"Missing packed QKV shards: {missing_shards}")
         else:
             pass
-        missing = params_dict.keys() - loaded_param_names
+        missing = params_dict.keys() - loaded.keys()
         if missing:
             logger.warning(
                 "Missing weights (%d): %s", len(missing), sorted(missing)[:20]

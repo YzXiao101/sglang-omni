@@ -78,17 +78,20 @@ class MingTalkerExecutor:
             self.device,
         )
 
+        # 1-3. Load config, create the model, and stream weights before moving it
         t0 = time.time()
         self.talker = MingOmniTalker.from_pretrained(
             self.talker_model_path, device=self.device
         )
         logger.info("[TALKER] MingOmniTalker loaded in %.1fs", time.time() - t0)
 
+        # 4. Load tokenizer externally
         tokenizer = AutoTokenizer.from_pretrained(
             str(Path(self.talker_model_path) / "llm")
         )
         self.talker.set_tokenizer(tokenizer)
 
+        # 5. Load voice presets
         voice_json_path = os.path.join(
             self.talker_model_path, "data", "voice_name.json"
         )
@@ -109,6 +112,7 @@ class MingTalkerExecutor:
                 "[TALKER] no voice_name.json at %s; presets disabled", voice_json_path
             )
 
+        # 6. Load speaker embedding extractor (optional)
         campplus_path = os.path.join(self.talker_model_path, "campplus.onnx")
         try:
             extractor = SpkembExtractor(campplus_path)
