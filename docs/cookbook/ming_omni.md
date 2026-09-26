@@ -490,12 +490,12 @@ At c=1 streaming delivers first audio ~2.2× sooner at a ~38% throughput cost. T
 
 ### SeedTTS English Speech Results
 
-Results for the full 1,088-sample English SeedTTS split on 3× H200 (Thinker TP=2 and a dedicated Talker GPU), at concurrency 4 with voice `DB30` and temperature 0.7. WER is corpus WER from Qwen3-ASR-1.7B.
+Results for the full 1,088-sample English SeedTTS split on 3× H200 (Thinker TP=2 and a dedicated Talker GPU), at concurrency 4 with voice `DB30`, temperature 0.7, seed 42, and `max_new_tokens=256`. AudioVAE uses FlashAttention-2. WER is corpus WER from Qwen3-ASR-1.7B. Each mode was measured once after four warmup requests.
 
 | Mode | Throughput (req/s) | Mean latency (s) | First audio (s) | Audio throughput (audio-s/s) | EN WER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Non-streaming | 4.039 | 0.988 | — | 26.128 | 1.474% |
-| Streaming | 0.960 | 4.159 | 3.243 | 6.253 | 1.716% |
+| Non-streaming | 4.606 | 0.867 | — | 29.988 | 1.666% |
+| Streaming | 1.503 | 2.658 | 2.059 | 9.712 | 1.591% |
 
 ### Audio Equivalence
 
