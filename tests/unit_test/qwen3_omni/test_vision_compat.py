@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
+"""CPU contracts for Qwen3-Omni vision encoding."""
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
-from sglang_omni.models.qwen3_omni.components import vision_compat
+from sglang_omni.models.qwen3_omni.components import image_encoder, vision_compat
 
 
 def make_encoder() -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
@@ -126,30 +131,120 @@ def test_interpolation_is_bit_exact_to_transformers_5_6(grid_thw) -> None:
     assert torch.equal(actual, expected)
 
 
-def test_compat_encoder_preserves_transformers_5_12_output_contract() -> None:
+def apply_cpu_joint_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+) -> None:
+    assert is_neox
+    assert cos_sin_cache.dtype == torch.float32
+    cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
+    rotated_query, rotated_key = hf_modeling.apply_rotary_pos_emb_vision(
+        query, key, torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+    )
+    query.copy_(rotated_query)
+    key.copy_(rotated_key)
+
+
+@pytest.fixture
+def vision_encoder() -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
+    # note (yzxiao): Keep the serving head dimension (72) in the small CPU model.
     config = hf_modeling.Qwen3OmniMoeVisionEncoderConfig(
-        depth=1,
-        hidden_size=16,
+        depth=2,
+        hidden_size=144,
         intermediate_size=32,
-        num_heads=4,
+        num_heads=2,
         in_channels=3,
         patch_size=2,
         spatial_merge_size=2,
         temporal_patch_size=2,
         out_hidden_size=16,
         num_position_embeddings=64,
-        deepstack_visual_indexes=(0,),
+        deepstack_visual_indexes=(0, 1),
     )
-    encoder = vision_compat.Qwen3OmniMoeVisionEncoderCompat(config)
-    encoder.eval().to(torch.bfloat16)
-    grid = torch.tensor([[1, 4, 4]], dtype=torch.long)
-    hidden_states = torch.randn(16, 24, dtype=torch.bfloat16)
+    with torch.device("cpu"), torch.random.fork_rng(devices=[]):
+        torch.manual_seed(734)
+        encoder = vision_compat.Qwen3OmniMoeVisionEncoderCompat(config)
+    return encoder.eval().to(torch.bfloat16)
 
-    with torch.inference_mode():
-        output = encoder(hidden_states, grid_thw=grid)
 
-    assert isinstance(output, hf_modeling.BaseModelOutputWithDeepstackFeatures)
-    assert output.last_hidden_state.shape == (16, 16)
-    assert output.pooler_output.shape == (4, 16)
-    assert len(output.deepstack_features) == 1
-    assert output.deepstack_features[0].shape == (4, 16)
+@pytest.mark.parametrize(
+    ("platform_device", "has_provider", "should_use_joint_kernel"),
+    [("cpu", True, True), ("cpu", False, False), ("cuda", True, False)],
+    ids=["joint-provider", "native-rope", "model-platform-mismatch"],
+)
+def test_image_encoder_preserves_outputs_with_platform_rotary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    vision_encoder: vision_compat.Qwen3OmniMoeVisionEncoderCompat,
+    platform_device: Literal["cpu", "cuda"],
+    has_provider: bool,
+    should_use_joint_kernel: bool,
+) -> None:
+    save_file(
+        {
+            f"thinker.visual.{name}": tensor
+            for name, tensor in vision_encoder.state_dict().items()
+        },
+        tmp_path / "model.safetensors",
+    )
+    kernel = Mock(side_effect=apply_cpu_joint_rope)
+    provider = Mock(return_value=kernel if has_provider else None)
+    monkeypatch.setattr(
+        image_encoder,
+        "current_platform",
+        SimpleNamespace(
+            device_type=platform_device, get_joint_rope_inplace_kernel=provider
+        ),
+    )
+    monkeypatch.setattr(
+        image_encoder,
+        "load_thinker_config",
+        Mock(return_value=SimpleNamespace(vision_config=vision_encoder.config)),
+    )
+    model = image_encoder.Qwen3OmniImageEncoder(
+        str(tmp_path), device="cpu", dtype="bf16"
+    )
+    image_encoder.optimize_patch_embed(vision_encoder)
+    image_grid = torch.tensor([[1, 4, 4], [1, 4, 6]], dtype=torch.long, device="cpu")
+    video_grid = torch.tensor([[2, 6, 4]], dtype=torch.long, device="cpu")
+    image_pixels = torch.randn(40, 24, dtype=torch.bfloat16, device="cpu")
+    video_pixels = torch.randn(48, 24, dtype=torch.bfloat16, device="cpu")
+
+    with torch.no_grad():
+        actual = model(
+            pixel_values=image_pixels,
+            image_grid_thw=image_grid,
+            pixel_values_videos=video_pixels,
+            video_grid_thw=video_grid,
+        )
+        expected_image = vision_encoder(
+            image_pixels, grid_thw=image_grid, return_dict=True
+        )
+        expected_video = vision_encoder(
+            video_pixels, grid_thw=video_grid, return_dict=True
+        )
+
+    torch.testing.assert_close(
+        actual,
+        {
+            "image_embeds": expected_image.pooler_output,
+            "image_grid_thw": image_grid,
+            "image_token_counts": torch.tensor([4, 6], device="cpu"),
+            "deepstack_visual_embeds_image": expected_image.deepstack_features,
+            "video_embeds": expected_video.pooler_output,
+            "video_grid_thw": video_grid,
+            "video_token_counts": torch.tensor([12], device="cpu"),
+            "deepstack_visual_embeds_video": expected_video.deepstack_features,
+        },
+        rtol=0,
+        atol=0,
+    )
+    expected_kernel_calls = (
+        2 * vision_encoder.config.depth if should_use_joint_kernel else 0
+    )
+    assert kernel.call_count == expected_kernel_calls
+    assert provider.call_count == (1 if platform_device == "cpu" else 0)

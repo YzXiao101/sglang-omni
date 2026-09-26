@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 from transformers.processing_utils import Unpack
@@ -10,8 +12,21 @@ from transformers.utils.generic import TransformersKwargs, merge_with_config_def
 from transformers.utils.output_capturing import capture_outputs
 
 
+@dataclass(frozen=True, kw_only=True)
+class VisionRotaryInputs:
+    cos_sin_cache: torch.Tensor
+    positions: torch.Tensor
+
+
 class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
     """HF vision encoder with the Transformers 5.6 interpolation arithmetic."""
+
+    def prepare_position_embeddings(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | VisionRotaryInputs:
+        return cos, sin
 
     def legacy_pos_embed_interpolate(
         self,
@@ -120,7 +135,8 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        cos, sin = emb.cos(), emb.sin()
+        position_embeddings = self.prepare_position_embeddings(cos, sin)
 
         deepstack_feature_lists = []
         for layer_num, block in enumerate(self.blocks):
