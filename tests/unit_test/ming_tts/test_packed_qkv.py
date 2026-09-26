@@ -44,7 +44,7 @@ def test_ming_tts_loads_split_qkv_shards_into_bf16_projection() -> None:
 
     torch.testing.assert_close(projection.weight, torch.cat(expected_weights))
     torch.testing.assert_close(projection.bias, torch.cat(expected_biases))
-    assert owner._weight_load_report.loaded_shards == {
+    assert owner.weight_load_report.loaded_shards == {
         f"{QKV_PREFIX}.weight": list(PACKED_QKV_SHARD_IDS),
         f"{QKV_PREFIX}.bias": list(PACKED_QKV_SHARD_IDS),
     }
@@ -78,7 +78,7 @@ def test_ming_tts_accepts_full_packed_qkv_checkpoint() -> None:
 
     torch.testing.assert_close(projection.weight, weight)
     torch.testing.assert_close(projection.bias, bias)
-    assert owner._weight_load_report.loaded_shards == {
+    assert owner.weight_load_report.loaded_shards == {
         f"{QKV_PREFIX}.weight": list(PACKED_QKV_SHARD_IDS),
         f"{QKV_PREFIX}.bias": list(PACKED_QKV_SHARD_IDS),
     }
