@@ -14,10 +14,14 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
+from sglang_omni.models.qwen3_omni.components.vision_attention import (
+    Qwen3OmniVisionAttention,
+)
 from sglang_omni.models.qwen3_omni.components.vision_compat import (
     Qwen3OmniMoeVisionEncoderCompat,
 )
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils import instantiate_module
 
 logger = logging.getLogger(__name__)
@@ -111,6 +115,25 @@ class ImageEncoderOutput(TypedDict, total=False):
     deepstack_visual_embeds_video: list[torch.Tensor] | None
 
 
+def optimize_vision_attention(visual: Qwen3OmniMoeVisionEncoderCompat) -> None:
+    if visual.device.type != current_platform.device_type:
+        return
+    else:
+        pass
+    joint_rope_kernel = current_platform.get_joint_rope_inplace_kernel()
+    if joint_rope_kernel is None:
+        return
+    else:
+        pass
+
+    # note (yzxiao): Replacing attention exposes its internal RoPE to the joint kernel.
+    for block in visual.blocks:
+        block.attn = Qwen3OmniVisionAttention(
+            block.attn, joint_rope_kernel=joint_rope_kernel
+        )
+    visual.has_joint_rope = True
+
+
 def unpack_visual_output(visual_out):
     """Unpack visual forward output regardless of return type.
 
@@ -143,6 +166,7 @@ def build_visual(
         strict=True,
     )
     optimize_patch_embed(visual)
+    optimize_vision_attention(visual)
     return visual
 
 
