@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .execution import NormLayerFactory
+from .execution import NormLayerFactory, QKVProjectionConstructor
 from .rotary import RotaryInputs, apply_rotary_embedding
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
@@ -96,7 +96,7 @@ class Attention(nn.Module):
         ) = None,  # number of attention head to apply rope, None for all
         attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
-        qkv_layer: type[nn.Module] | None = None,
+        qkv_layer: QKVProjectionConstructor | None = None,
     ):
         super().__init__()
 
@@ -180,7 +180,6 @@ class Attention(nn.Module):
         else:
             pass
 
-        # apply rotary position embedding
         query, key = apply_rotary_embedding(
             query, key, rope, pe_attn_head=self.pe_attn_head
         )
@@ -279,7 +278,7 @@ class DiTBlock(nn.Module):
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
         norm_layer: NormLayerFactory = RMSNorm,
-        qkv_layer: type[nn.Module] | None = None,
+        qkv_layer: QKVProjectionConstructor | None = None,
         **kwargs,
     ):
         super().__init__()

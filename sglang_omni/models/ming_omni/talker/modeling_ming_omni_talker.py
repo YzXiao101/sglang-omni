@@ -26,6 +26,10 @@ import torch.nn as nn
 import torchaudio
 from transformers import Qwen2Config, Qwen2Model, StaticCache
 
+from sglang_omni.models.weight_loader import (
+    default_weight_loader,
+    load_weights_by_prefix,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils.audio_features import cached_fbank
 
@@ -47,7 +51,7 @@ from .talker_module.packed_qkv import (
 logger = logging.getLogger(__name__)
 
 _TOKEN_DONE = object()
-_MAX_CACHE_LEN = 512
+AR_CACHE_MAX_TOKENS = 512
 
 # ---------- Optional: onnxruntime for speaker embedding ----------
 try:
@@ -225,7 +229,7 @@ class CFMGraphExecutor:
                 runtime = TalkerDeviceRuntime(input_tensor.device)
                 runtime.synchronize()
                 with runtime.create_stream_context(runtime.create_stream()):
-                    # Note(yzxiao): The full eager tail initializes JIT kernels
+                    # note (yzxiao): The full eager tail initializes JIT kernels
                     # before capture, using the same static inputs and precision.
                     for _ in range(2):
                         self.compute_tail()
@@ -248,7 +252,7 @@ class CFMGraphExecutor:
 
         self.initialized = True
 
-    def compute_tail(self):
+    def compute_tail(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         gen_lat = self.cfm.sample(
             self.last_hidden_state_placeholder,
             self.his_lat_placeholder,
@@ -398,8 +402,6 @@ class MingOmniTalker(nn.Module):
     def from_pretrained(
         cls, model_path: str, *, device: str | torch.device
     ) -> MingOmniTalker:
-        from sglang_omni.models.weight_loader import load_weights_by_prefix
-
         device = torch.device(device)
         # 1. Load config from checkpoint
         config = MingOmniTalkerConfig.from_pretrained_dir(model_path)
@@ -425,7 +427,7 @@ class MingOmniTalker(nn.Module):
                 pass
             norm_layer = partial(RMSNorm, cast_x_before_out_mul=True)
             qkv_layer = PackedQKVLinear
-            # Note(yzxiao): CFG doubles DiT batch; reference aggregation is
+            # note (yzxiao): CFG doubles DiT batch; reference aggregation is
             # capped by the 512-token AR cache's upper bound.
             dit_execution_config = TalkerExecutionConfig(
                 rope_kernel=rope_kernel,
@@ -437,7 +439,7 @@ class MingOmniTalker(nn.Module):
             aggregator_execution_config = TalkerExecutionConfig(
                 rope_kernel=rope_kernel,
                 rope_seq_len=1 + config.patch_size,
-                rope_max_batch_size=_MAX_CACHE_LEN,
+                rope_max_batch_size=AR_CACHE_MAX_TOKENS,
                 norm_layer=norm_layer,
                 qkv_layer=qkv_layer,
             )
@@ -472,8 +474,6 @@ class MingOmniTalker(nn.Module):
     # ---- Weight loading ----
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        from sglang_omni.models.weight_loader import default_weight_loader
-
         params_dict = dict(self.named_parameters())
         loaded: dict[str, set[str]] = {}
         full_packed: set[str] = set()
@@ -655,7 +655,7 @@ class MingOmniTalker(nn.Module):
                 past_key_values = StaticCache(
                     config=self.model.config,
                     max_batch_size=1,
-                    max_cache_len=_MAX_CACHE_LEN,
+                    max_cache_len=AR_CACHE_MAX_TOKENS,
                     device=self.model.device,
                     dtype=target_dtype,
                 )
@@ -677,7 +677,9 @@ class MingOmniTalker(nn.Module):
                 (attention_mask == 0), 1
             )
 
-            cache_max_decode_steps = (_MAX_CACHE_LEN - prefill_len) // self.patch_size
+            cache_max_decode_steps = (
+                AR_CACHE_MAX_TOKENS - prefill_len
+            ) // self.patch_size
             if max_decode_steps is None:
                 effective_max_decode_steps = cache_max_decode_steps
             else:

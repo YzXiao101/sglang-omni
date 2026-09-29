@@ -11,7 +11,6 @@ import pytest
 import torch
 from torch import nn
 
-from sglang_omni.models import weight_loader
 from sglang_omni.models.ming_omni.talker import (
     modeling_ming_omni_talker as talker_model,
 )
@@ -42,7 +41,7 @@ def test_talker_loader_selects_execution_config_only_for_cuda(
         classmethod(lambda cls, model_path: config),
     )
     monkeypatch.setattr(
-        weight_loader, "load_weights_by_prefix", lambda *args, **kwargs: {}
+        talker_model, "load_weights_by_prefix", lambda model_path, prefix: {}
     )
     layers = ModuleType("sglang_omni.vendor.sglang.layers")
     layers.RMSNorm = nn.RMSNorm

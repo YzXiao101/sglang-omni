@@ -79,7 +79,7 @@ class CachedRotaryEmbedding(RotaryEmbedding):
 
     def _apply(self, fn, recurse: bool = True):  # noqa: leading-underscore
         result = super()._apply(fn, recurse)
-        # Note(yzxiao): The CUDA kernel requires the cache produced from the
+        # note (yzxiao): The CUDA kernel requires the cache produced from the
         # canonical FP32 frequencies even when the surrounding model is BF16.
         self.cos_sin_cache = self.master_cos_sin_cache.to(self.positions.device)
         return result
@@ -152,7 +152,7 @@ def apply_rotary_inplace(
     query: torch.Tensor, key: torch.Tensor, rope: RotaryInputs
 ) -> None:
     batch_size, heads, seq_len, head_dim = query.shape
-    # Note(yzxiao): Preserve the packed Q/K views so RoPE writes to their source.
+    # note (yzxiao): Preserve the packed Q/K views so RoPE writes to their source.
     query_tokens = query.transpose(1, 2).view(batch_size * seq_len, heads, head_dim)
     key_tokens = key.transpose(1, 2).view(batch_size * seq_len, heads, head_dim)
     rope.kernel(

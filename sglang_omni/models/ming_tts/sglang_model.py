@@ -887,10 +887,10 @@ class MingTTSSGLangModel(nn.Module):
         self.tail_attn_backend = tail_attn_backend
         aggregator_config = dict(self.config.aggregator_config)
         ditar_config = dict(self.config.ditar_config)
-        # Note(yzxiao): Preserve Ming's cast-before-weight-multiply RMSNorm semantics.
+        # note (yzxiao): Preserve Ming's cast-before-weight-multiply RMSNorm semantics.
         norm_layer = partial(RMSNorm, cast_x_before_out_mul=True)
         qkv_layer = PackedQKVLinear
-        # Note(yzxiao): Runtime policy overrides checkpoint execution settings.
+        # note (yzxiao): Runtime policy overrides checkpoint execution settings.
         aggregator_config["execution_config"] = TalkerExecutionConfig(
             attn_backend=tail_attn_backend,
             rope_kernel=rope_kernel,
