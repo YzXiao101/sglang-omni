@@ -11,6 +11,7 @@ tests/
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
+│   ├── test_tts_latency_ci.py
 │   ├── test_asr_ci_multi_speaker.py
 │   └── test_asr_ci_seedtts.py
 └── unit_test/
@@ -152,6 +153,17 @@ tests/
     │   ├── test_paged_rollback.py
     │   ├── test_request_builders.py
     │   └── test_streaming_codec.py
+    ├── personaplex/
+    │   ├── test_code2wav_stream.py
+    │   ├── test_depformer.py
+    │   ├── test_engine_builder.py
+    │   ├── test_mimi_streaming.py
+    │   ├── test_model_runner.py
+    │   ├── test_prompts.py
+    │   ├── test_request_builders.py
+    │   ├── test_sglang_model.py
+    │   ├── test_stages.py
+    │   └── test_timeline.py
     ├── qwen3_asr/
     │   ├── test_encoder_cuda_graph.py
     │   ├── test_pipeline.py
@@ -412,6 +424,12 @@ python3 -m pytest tests/test_model/test_ming_tp_parity_ci.py -q -s
   speaker-similarity checks. Non-streaming and streaming WER pass the selected
   TTS generation concurrency into the result config while keeping Qwen3-ASR
   transcription concurrency at 4.
+- `test_tts_latency_ci.py`: streaming first-audio latency for the Qwen3-TTS
+  presets. One worker behind the router takes open-loop Poisson arrivals at
+  1 rps (60 samples) and 20 rps (the full EN set), and the median first
+  playable latency is gated against the calibrated references in
+  `tts_ci_config.py`; tail percentiles and continuity rates are printed.
+  It runs in its own pytest invocation so its worker is alone on the GPU.
 - `test_tts_consistency_artifacts.py`: CPU-only stage-3 check that compares
   TTS non-stream and streaming `speed_results.json` under
   `${OMNI_CI_HOME}/tts-stage-results/{nonstream,stream}/`.
@@ -896,6 +914,19 @@ that happened to contain an older version of the test.
   stream waits and decode resumption using simulated decode preparation.
   Tests run on CPU without model weights; request and rollback tests require
   SGLang, but do not start an engine.
+
+- `unit_test/personaplex/`: PersonaPlex delayed-timeline contract (stream
+  delays, prompt phases, packaged-voice rows and the first generative
+  position), chunked Mimi equivalence with whole-sequence encode/decode on
+  random weights and the ring cache's oldest-entry drop, depformer per-step weight slicing and teacher forcing, the
+  Llama-shaped backbone config and checkpoint shim, checkpoint weight routing
+  and embedding columns, model-runner prefill/decode rows and frame handoff,
+  per-request streaming code2wav and abort cleanup, preprocessing (caller
+  channel, `audios` input, role prompt, voice resolution, `stage_params`),
+  voice-archive unpacking (read-only fallback, no partial folder), and
+  request lowering (decode budget, reference sampling defaults over client
+  filler values, seeds, stream chunks, context limit, input validation). CPU
+  only, no weights; runner and request tests need SGLang but start no engine.
 
 - `unit_test/llada2_uni/`: LLaDA2-Uni request lowering to the upstream
   diffusion-language-model token-array contract.
