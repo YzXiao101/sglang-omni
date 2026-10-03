@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-Omni vision encoder with joint RoPE."""
+"""Qwen3-Omni vision encoder with shared rotary and attention inputs."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from sglang_omni.models.qwen3_omni.components.vision_attention import (
 from sglang_omni.models.qwen3_omni.components.vision_compat import (
     Qwen3OmniMoeVisionEncoderCompat,
     VisionRotaryInputs,
+    VisionSequenceMetadata,
 )
 from sglang_omni.platforms.interface import JointRopeInplaceKernel
 
@@ -55,3 +56,20 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
                     cos.shape[0], device=cos.device, dtype=torch.int64
                 ),
             )
+
+    def prepare_attention_metadata(
+        self,
+        cumulative_sequence_lengths: torch.Tensor,
+    ) -> dict[str, VisionSequenceMetadata]:
+        # note (yzxiao): Reuse host lengths to avoid per-layer device synchronization.
+        sequence_patch_counts = tuple(
+            (
+                cumulative_sequence_lengths[1:] - cumulative_sequence_lengths[:-1]
+            ).tolist()
+        )
+        return {
+            "sequence_metadata": VisionSequenceMetadata(
+                sequence_patch_counts=sequence_patch_counts,
+                max_sequence_patch_count=max(sequence_patch_counts),
+            )
+        }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-Omni vision attention with joint RoPE."""
+"""Qwen3-Omni vision attention with platform rotary and shared patch counts."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs
 
-from sglang_omni.models.qwen3_omni.components.vision_compat import VisionRotaryInputs
+from sglang_omni.models.qwen3_omni.components.vision_compat import (
+    VisionRotaryInputs,
+    VisionSequenceMetadata,
+)
 from sglang_omni.platforms.interface import JointRopeInplaceKernel
 
 
@@ -40,6 +43,8 @@ class Qwen3OmniVisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | VisionRotaryInputs,
+        *,
+        sequence_metadata: VisionSequenceMetadata,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         sequence_patch_count = hidden_states.shape[0]
@@ -69,7 +74,6 @@ class Qwen3OmniVisionAttention(nn.Module):
             hf_modeling.eager_attention_forward,
         )
         if hf_modeling.is_flash_attention_requested(self.config):
-            max_sequence_patch_count = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attention_output, _ = attention_interface(
                 self,
                 query,
@@ -80,15 +84,14 @@ class Qwen3OmniVisionAttention(nn.Module):
                 dropout=0.0 if not self.training else self.attention_dropout,
                 cu_seq_lens_q=cu_seqlens,
                 cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_sequence_patch_count,
-                max_length_k=max_sequence_patch_count,
+                max_length_q=sequence_metadata.max_sequence_patch_count,
+                max_length_k=sequence_metadata.max_sequence_patch_count,
                 is_causal=False,
                 **kwargs,
             )
         else:
-            sequence_patch_counts = cu_seqlens[1:] - cu_seqlens[:-1]
             query_segments, key_segments, value_segments = (
-                torch.split(tensor, sequence_patch_counts.tolist(), dim=2)
+                torch.split(tensor, sequence_metadata.sequence_patch_counts, dim=2)
                 for tensor in (query, key, value)
             )
             attention_outputs = [

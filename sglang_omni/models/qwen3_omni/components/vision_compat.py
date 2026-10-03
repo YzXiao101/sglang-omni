@@ -18,6 +18,12 @@ class VisionRotaryInputs:
     positions: torch.Tensor
 
 
+@dataclass(frozen=True, kw_only=True)
+class VisionSequenceMetadata:
+    sequence_patch_counts: tuple[int, ...]
+    max_sequence_patch_count: int
+
+
 class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
     """HF vision encoder with the Transformers 5.6 interpolation arithmetic."""
 
@@ -27,6 +33,12 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | VisionRotaryInputs:
         return cos, sin
+
+    def prepare_attention_metadata(
+        self,
+        cumulative_sequence_lengths: torch.Tensor,
+    ) -> dict[str, VisionSequenceMetadata]:
+        return {}
 
     def legacy_pos_embed_interpolate(
         self,
@@ -126,6 +138,8 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         )
         cu_seqlens = hf_modeling.get_vision_cu_seqlens(grid_thw, kwargs=kwargs)
 
+        attention_metadata_arguments = self.prepare_attention_metadata(cu_seqlens)
+
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.legacy_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
@@ -144,6 +158,7 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                **attention_metadata_arguments,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:

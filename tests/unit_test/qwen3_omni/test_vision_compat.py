@@ -12,6 +12,9 @@ from safetensors.torch import save_file
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
 from sglang_omni.models.qwen3_omni.components import image_encoder, vision_compat
+from sglang_omni.models.qwen3_omni.components.vision_encoder import (
+    Qwen3OmniVisionEncoder,
+)
 
 
 def make_encoder() -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
@@ -248,3 +251,50 @@ def test_image_encoder_preserves_outputs_with_platform_rotary(
     )
     assert kernel.call_count == expected_kernel_calls
     assert provider.call_count == (1 if platform_device == "cpu" else 0)
+
+
+@pytest.mark.parametrize(
+    "has_joint_kernel", [False, True], ids=["native-rope", "joint-rope"]
+)
+def test_flash_backend_receives_host_max_sequence_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+    vision_encoder: vision_compat.Qwen3OmniMoeVisionEncoderCompat,
+    has_joint_kernel: bool,
+) -> None:
+    kernel = Mock(side_effect=apply_cpu_joint_rope)
+    encoder = (
+        Qwen3OmniVisionEncoder(
+            vision_encoder.config,
+            joint_rope_kernel=kernel if has_joint_kernel else None,
+        )
+        .eval()
+        .to(torch.bfloat16)
+    )
+    encoder.load_state_dict(vision_encoder.state_dict(), strict=True)
+    grid = torch.tensor([[1, 4, 4], [2, 4, 6]], dtype=torch.long, device="cpu")
+    pixels = torch.randn(64, 24, dtype=torch.bfloat16, device="cpu")
+    attention_output = pixels.new_zeros(
+        1,
+        pixels.shape[0],
+        encoder.config.num_heads,
+        encoder.config.hidden_size // encoder.config.num_heads,
+    )
+    flash_backend = Mock(return_value=(attention_output, None))
+    monkeypatch.setattr(
+        hf_modeling, "is_flash_attention_requested", Mock(return_value=True)
+    )
+    monkeypatch.setattr(
+        hf_modeling.ALL_ATTENTION_FUNCTIONS,
+        "get_interface",
+        Mock(return_value=flash_backend),
+    )
+
+    with torch.no_grad():
+        encoder(pixels, grid_thw=grid)
+
+    assert flash_backend.call_count == vision_encoder.config.depth
+    for backend_call in flash_backend.call_args_list:
+        assert isinstance(backend_call.kwargs["max_length_q"], int)
+        assert isinstance(backend_call.kwargs["max_length_k"], int)
+        assert backend_call.kwargs["max_length_q"] == 24
+        assert backend_call.kwargs["max_length_k"] == 24
