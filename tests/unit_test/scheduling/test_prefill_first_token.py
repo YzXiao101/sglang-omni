@@ -39,6 +39,15 @@ from tests.unit_test.model_runner.test_speculative_target_worker import (
 )
 from tests.unit_test.pipeline.helpers import make_stage
 
+Publication = tuple[
+    OmniScheduler,
+    ScheduleBatch,
+    GenerationBatchResult,
+    torch.Tensor,
+    Mock,
+    list[str],
+]
+
 
 @pytest.fixture(params=[1])
 def publication(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
@@ -390,12 +399,7 @@ def test_mixed_row_roles_are_frozen_before_native_changes_batch(publication):
         assert scheduler.outbox.get_nowait().request_id == request.rid
 
 
-@pytest.mark.parametrize("publication", [1, 3], indirect=True)
-def test_real_abort_during_copy_wait_retains_current_batch_storage(publication):
-    scheduler, batch, result, _, event, events = publication
-    request = batch.reqs[0]
-    request_data = request.omni_data
-    original_requests = tuple(batch.reqs)
+def prepare_running_abort(scheduler: OmniScheduler, batch: ScheduleBatch) -> None:
     scheduler.scheduler_thread_id = threading.get_ident()
     scheduler.tp_size = 1
     scheduler.running_batch = None
@@ -416,6 +420,15 @@ def test_real_abort_during_copy_wait_retains_current_batch_storage(publication):
     scheduler.drain_inbox_for_request = Mock()
     scheduler.run_abort_callback = Mock()
     scheduler.release_request_kv_cache = Mock()
+
+
+@pytest.mark.parametrize("publication", [1, 3], indirect=True)
+def test_real_abort_during_copy_wait_retains_current_batch_storage(publication):
+    scheduler, batch, result, _, event, events = publication
+    request = batch.reqs[0]
+    request_data = request.omni_data
+    original_requests = tuple(batch.reqs)
+    prepare_running_abort(scheduler, batch)
 
     def cancel_while_waiting():
         # A listener thread must enter abort while the publishing thread waits.
@@ -448,6 +461,32 @@ def test_real_abort_during_copy_wait_retains_current_batch_storage(publication):
     assert request_data.speculative_emitted_tokens == 0
     assert request_data.speculative_first_token_id is None
     assert not request.output_ids
+    scheduler.release_request_kv_cache.assert_not_called()
+    scheduler.run_abort_callback.assert_not_called()
+
+
+def test_abort_after_early_enqueue_suppresses_late_committed_suffix(
+    publication: Publication,
+) -> None:
+    scheduler, batch, result, _, _, _ = publication
+    request = batch.reqs[0]
+    request_data = request.omni_data
+    prepare_running_abort(scheduler, batch)
+    publish_and_resolve(scheduler, batch, result)
+    assert scheduler.outbox.qsize() == 1
+    scheduler.abort(request.rid)
+    request.output_ids.extend([7, 8])
+    scheduler.emit_speculative_tokens(request)
+    scheduler.emit_speculative_tokens(request)
+    assert isinstance(request.to_finish, FINISH_ABORT)
+    assert request.omni_data is request_data
+    assert request.kv.req_pool_idx == 3
+    assert scheduler.cur_batch.reqs == [request]
+    assert request_data.speculative_emitted_tokens == 1
+    early_output = scheduler.outbox.get_nowait()
+    assert early_output.request_id == request.rid
+    assert early_output.data.tolist() == [7]
+    assert scheduler.outbox.empty()
     scheduler.release_request_kv_cache.assert_not_called()
     scheduler.run_abort_callback.assert_not_called()
 
@@ -787,6 +826,139 @@ def test_producer_claim_does_not_wait_for_prior_network_send(publication):
             stage.running = False
             await asyncio.wait_for(drain, 2)
         assert sent_request_ids == ["earlier", *(request.rid for request in batch.reqs)]
+
+    asyncio.run(run())
+
+
+def test_slow_consumer_preserves_early_token_then_committed_suffix(
+    publication: Publication,
+) -> None:
+    async def run() -> None:
+        scheduler, batch, result, _, event, _ = publication
+        request = batch.reqs[0]
+        stage = make_stage(
+            scheduler=scheduler, endpoints={"decode": "inproc://token-order"}
+        )
+        stage.running = True
+        stage.active_requests.update({"earlier", request.rid})
+        send_entered = asyncio.Event()
+        send_release = asyncio.Event()
+        producer_completed = threading.Event()
+        failures: list[BaseException] = []
+        delivered_tokens: list[tuple[str, list[int]]] = []
+
+        async def send_stream(
+            request_id: str,
+            token_ids: torch.Tensor,
+            target: str,
+            metadata: dict[str, object] | None = None,
+        ) -> None:
+            if request_id == "earlier":
+                send_entered.set()
+                await send_release.wait()
+            else:
+                pass
+            delivered_tokens.append((request_id, token_ids.tolist()))
+
+        stage.send_stream_to_target = send_stream
+        scheduler.outbox.put(
+            OutgoingMessage(
+                request_id="earlier",
+                type="stream",
+                target="decode",
+                data=torch.tensor([1]),
+            )
+        )
+
+        def producer() -> None:
+            try:
+                scheduler.publish_prefill_first_token(batch, result)
+                scheduler.wait_prefill_publication()
+                request.output_ids.extend([7, 8])
+                scheduler.emit_speculative_tokens(request)
+                scheduler.emit_speculative_tokens(request)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                producer_completed.set()
+
+        drain = asyncio.create_task(stage.drain_outbox_external())
+        thread = threading.Thread(target=producer)
+        try:
+            await asyncio.wait_for(send_entered.wait(), 2)
+            thread.start()
+            assert await asyncio.to_thread(producer_completed.wait, 2)
+            assert not failures
+            assert not delivered_tokens
+            assert request.omni_data.speculative_emitted_tokens == 2
+            assert scheduler.pending_prefill_publication is None
+        finally:
+            send_release.set()
+            if thread.ident is not None:
+                await asyncio.to_thread(thread.join, 2)
+            else:
+                pass
+            stage.running = False
+            await asyncio.wait_for(drain, 2)
+        assert not thread.is_alive() and not failures
+        assert event.synchronize.call_count == 1
+        assert delivered_tokens == [
+            ("earlier", [1]),
+            (request.rid, [7]),
+            (request.rid, [8]),
+        ]
+
+    asyncio.run(run())
+
+
+def test_repeated_consumer_cancel_waits_for_claimed_copy_completion(
+    publication: Publication,
+) -> None:
+    async def run() -> None:
+        scheduler, batch, result, _, event, _ = publication
+        scheduler.scheduler_thread_id = threading.get_ident()
+        scheduler.shutdown_resources = Mock()
+        stage = make_stage(scheduler=scheduler)
+        stage.running = True
+        stage.active_requests.add(batch.reqs[0].rid)
+        copy_entered = threading.Event()
+        copy_release = threading.Event()
+
+        def wait_copy() -> None:
+            copy_entered.set()
+            assert copy_release.wait(2)
+
+        event.synchronize.side_effect = wait_copy
+        scheduler.publish_prefill_first_token(batch, result)
+        pending = scheduler.pending_prefill_publication
+        drain = asyncio.create_task(stage.drain_outbox_external())
+        try:
+            assert await asyncio.to_thread(copy_entered.wait, 2)
+            assert drain.cancel()
+            await asyncio.sleep(0)
+            assert not drain.done()
+            assert drain.cancel()
+            await asyncio.sleep(0)
+            assert not drain.done()
+            assert scheduler.pending_prefill_publication is pending
+            assert not pending.completion.done()
+            assert scheduler.stop() is True
+            assert not pending.completion.done()
+            scheduler.shutdown_resources.assert_not_called()
+        finally:
+            stage.running = False
+            copy_release.set()
+            try:
+                await asyncio.wait_for(drain, 2)
+            except asyncio.CancelledError:
+                pass
+        assert drain.cancelled()
+        scheduler.wait_prefill_publication()
+        assert event.synchronize.call_count == 1
+        assert scheduler.pending_prefill_publication is None
+        assert scheduler.outbox.empty()
+        assert batch.reqs[0].omni_data.speculative_emitted_tokens == 0
+        scheduler.shutdown_resources.assert_not_called()
 
     asyncio.run(run())
 

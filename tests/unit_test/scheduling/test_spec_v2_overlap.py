@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -16,7 +17,7 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.schema import FactoryArgs
 from sglang_omni.models.qwen3_omni.config import Qwen3OmniPipelineConfig
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from tests.unit_test.scheduling.spec_v2_helpers import make_owner
+from tests.unit_test.scheduling.spec_v2_helpers import Device, make_owner
 from tests.unit_test.scheduling.test_speculative_output import (
     make_request,
     resolve_tokens,
@@ -182,6 +183,115 @@ def test_actual_admin_entry_drains_even_without_queue_snapshot(owner):
     scheduler.run_admin_action("pause_generation", {})
     assert scheduler.pending_spec_v2 is None
     scheduler.admin_pause_generation.assert_called_once()
+
+
+def test_pause_retract_waits_for_writer_and_copy_before_mutation(
+    owner: tuple[OmniScheduler, ScheduleBatch, Device],
+) -> None:
+    scheduler, batch, _ = owner
+    pending = scheduler.launch_spec_v2(batch)
+    scheduler.pending_spec_v2 = pending
+    scheduler.admin_lock = threading.RLock()
+    scheduler.resolve_pending_async = Mock()
+    scheduler.retract_running_requests = Mock(return_value=len(batch.reqs))
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+    copy_entered = threading.Event()
+    copy_release = threading.Event()
+
+    def wait_writer() -> None:
+        writer_entered.set()
+        assert writer_release.wait(2)
+
+    def wait_copy() -> None:
+        copy_entered.set()
+        assert copy_release.wait(2)
+
+    pending.writer_done.synchronize = wait_writer
+    pending.result.copy_done.synchronize = wait_copy
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        response = executor.submit(
+            scheduler.run_admin_action, "pause_generation", {"mode": "retract"}
+        )
+        try:
+            assert writer_entered.wait(2)
+            assert not response.done()
+            assert scheduler.pending_spec_v2 is pending
+            scheduler.resolve_pending_async.assert_not_called()
+            scheduler.retract_running_requests.assert_not_called()
+            writer_release.set()
+            assert copy_entered.wait(2)
+            assert not response.done()
+            assert scheduler.pending_spec_v2 is pending
+            scheduler.resolve_pending_async.assert_not_called()
+            scheduler.retract_running_requests.assert_not_called()
+        finally:
+            writer_release.set()
+            copy_release.set()
+        reply = response.result(timeout=2)
+    assert reply["success"] is True
+    assert reply["data"]["num_paused_requests"] == len(batch.reqs)
+    assert scheduler.pending_spec_v2 is None
+    assert scheduler.stored_results == [(pending.batch, pending.result)]
+    scheduler.resolve_pending_async.assert_called_once_with()
+    scheduler.retract_running_requests.assert_called_once_with()
+
+
+def test_immediate_abort_retires_worker_if_copy_completion_fails(
+    owner: tuple[OmniScheduler, ScheduleBatch, Device],
+) -> None:
+    scheduler, batch, device = owner
+    pending = scheduler.launch_spec_v2(batch)
+    scheduler.pending_spec_v2 = pending
+    scheduler.session_bridge = None
+    scheduler.scheduler_thread_id = threading.get_ident()
+    scheduler.mark_request_finished_immediately = Mock()
+    scheduler.run_abort_callback = Mock()
+    scheduler.release_request_kv_cache = Mock()
+    scheduler.terminate_prefill_worker = Mock(side_effect=SystemExit("retire"))
+    pending.result.copy_done.fail = True
+    with pytest.raises(SystemExit, match="retire"):
+        scheduler.abort(batch.reqs[0].rid, defer_running_cleanup=False)
+    assert ("wait", pending.writer_done.name) in device.log
+    scheduler.terminate_prefill_worker.assert_called_once()
+    assert scheduler.pending_spec_v2 is pending
+    assert not scheduler.stored_results
+    scheduler.mark_request_finished_immediately.assert_not_called()
+    scheduler.run_abort_callback.assert_not_called()
+    scheduler.release_request_kv_cache.assert_not_called()
+    scheduler.handle_batch_failure.assert_not_called()
+
+
+def test_generation_reused_during_copy_wait_cannot_receive_old_result(
+    owner: tuple[OmniScheduler, ScheduleBatch, Device],
+) -> None:
+    scheduler, batch, _ = owner
+    pending = scheduler.launch_spec_v2(batch)
+    original_request = batch.reqs[1]
+    replacement_request = make_request("replacement", 2, 20)
+    copy_entered = threading.Event()
+    copy_release = threading.Event()
+
+    def wait_copy() -> None:
+        copy_entered.set()
+        assert copy_release.wait(2)
+
+    pending.result.copy_done.synchronize = wait_copy
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        resolution = executor.submit(scheduler.resolve_spec_v2, pending)
+        try:
+            assert copy_entered.wait(2)
+            assert not resolution.done() and not scheduler.stored_results
+            scheduler.req_to_token_pool.req_generation[2] += 1
+            batch.reqs[1] = replacement_request
+        finally:
+            copy_release.set()
+        with pytest.raises(RuntimeError, match="slot generation"):
+            resolution.result(timeout=2)
+    assert pending.batch.reqs[1] is original_request
+    assert not scheduler.stored_results
+    assert not replacement_request.output_ids
+    assert replacement_request.kv.req_pool_idx == 2
 
 
 def test_stopped_external_admin_cannot_run_during_retained_shutdown(owner):
