@@ -657,6 +657,16 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
 
+    def on_speculative_tokens(
+        self, scheduler_request: SchedulerRequest, token_ids: list[int]
+    ) -> None:
+        """Hook for the tokens one speculative step committed for a request.
+
+        Speculative decoding bypasses execute, so a runner collecting outputs in
+        post_decode collects them here; they end at the stop, before the result.
+        """
+        return None
+
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         """Request ids whose ``generation_steps`` must NOT advance this step.
 

@@ -46,6 +46,7 @@ def test_create_sglang_infrastructure_runs_the_upstream_initialization_phases(
             events.append("init_cuda_graphs")
 
     class FakeWorker:
+        speculative_worker = None
         model_config = SimpleNamespace(is_multimodal=False)
         enable_prefill_input_embeds = False
 
@@ -112,6 +113,7 @@ def test_before_memory_pool_runs_after_the_weights_and_before_the_pool(
             events.append("init_cuda_graphs")
 
     class FakeWorker:
+        speculative_worker = None
         model_config = SimpleNamespace(is_multimodal=False)
         enable_prefill_input_embeds = False
 
@@ -222,6 +224,7 @@ def test_cuda_graph_init_scopes_prefill_embedding_capture_flag() -> None:
     model_config = SimpleNamespace(is_multimodal=False)
     capture_values: list[bool] = []
     model_worker = SimpleNamespace(
+        speculative_worker=None,
         model_config=model_config,
         enable_prefill_input_embeds=True,
         model_runner=SimpleNamespace(
@@ -326,6 +329,7 @@ def test_create_sglang_infrastructure_consumes_scoped_kv_budget(
             pass
 
     class FakeWorker:
+        speculative_worker = None
         model_config = SimpleNamespace(is_multimodal=False)
         enable_prefill_input_embeds = False
 

@@ -1778,6 +1778,150 @@ def test_omni_scheduler_flushes_stream_before_terminal_result(monkeypatch) -> No
     assert model_path_ends == [("req-finished", "success")]
 
 
+def test_speculative_stream_output_emits_each_committed_token_before_the_result(
+    monkeypatch,
+) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    init_terminal_output_state(scheduler)
+    scheduler.outbox = Queue()
+    scheduler.aborted_request_ids = set()
+    scheduler.first_emit_done = set()
+    scheduler.prefill_start_done = {"req-spec"}
+    scheduler.prefill_end_done = set()
+    scheduler.draft_worker = SimpleNamespace()
+    monkeypatch.setattr(
+        omni_scheduler_module, "_emit_model_path_end", lambda rid, *, status: None
+    )
+    calls: list[tuple[str, object]] = []
+
+    class Runner:
+        def on_speculative_tokens(self, scheduler_request, token_ids):
+            calls.append(("runner", list(token_ids)))
+
+        def on_request_finished(self, rid, data):
+            calls.append(("finished", rid))
+
+    scheduler.model_runner = Runner()
+    request_data = SimpleNamespace(
+        prefill_input_embeds=None,
+        decode_input_embeds=None,
+        emitted_token_count=1,
+        generation_steps=1,
+    )
+    finished = False
+    req = SimpleNamespace(
+        rid="req-spec",
+        omni_data=request_data,
+        output_ids=[5, 6, 7],
+        output_ids_through_stop=[5, 6, 7],
+        finished=lambda: finished,
+        finished_reason=None,
+        _omni_terminal_claimed=False,
+    )
+    request_data.req = req
+
+    def stream_output_builder(rid, data, output):
+        calls.append(("stream", output.data))
+        return [SimpleNamespace(request_id=rid, type="stream", data=output.data)]
+
+    scheduler.stream_output_builder = stream_output_builder
+    scheduler.result_adapter = lambda data: (
+        calls.append(("result", list(data.output_ids))) or {"done": True}
+    )
+
+    scheduler.stream_output([req])
+    # The next verify accepts drafts past the stop token 9, which finishing trims.
+    finished = True
+    req.output_ids = [5, 6, 7, 9, 8, 8]
+    req.output_ids_through_stop = [5, 6, 7, 9]
+    scheduler.stream_output([req])
+
+    assert calls == [
+        ("runner", [6, 7]),
+        ("stream", 6),
+        ("stream", 7),
+        ("runner", [9]),
+        ("stream", 9),
+        ("finished", "req-spec"),
+        ("result", [5, 6, 7, 9]),
+    ]
+    assert request_data.generation_steps == 4
+    outputs = [scheduler.outbox.get_nowait() for _ in range(4)]
+    assert [output.type for output in outputs] == [
+        "stream",
+        "stream",
+        "stream",
+        "result",
+    ]
+
+
+def test_speculative_emission_failure_fails_only_its_request() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    init_terminal_output_state(scheduler)
+    scheduler.outbox = Queue()
+    scheduler.aborted_request_ids = set()
+    scheduler.is_entry_rank = True
+    scheduler.draft_worker = SimpleNamespace()
+    scheduler.stream_output_builder = None
+    emitted: list[tuple[str, list[int]]] = []
+    hook_error = RuntimeError("vocoder chunker failed")
+
+    class Runner:
+        def on_speculative_tokens(self, scheduler_request, token_ids):
+            if scheduler_request.request_id == "req-bad":
+                raise hook_error
+            else:
+                emitted.append((scheduler_request.request_id, list(token_ids)))
+
+    scheduler.model_runner = Runner()
+
+    def running_request(request_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            rid=request_id,
+            omni_data=SimpleNamespace(emitted_token_count=1, generation_steps=1),
+            output_ids_through_stop=[5, 6],
+            finished=lambda: False,
+            finished_reason=None,
+            to_finish=None,
+            _omni_terminal_claimed=False,
+        )
+
+    bad_request = running_request("req-bad")
+    good_request = running_request("req-good")
+
+    scheduler.stream_output([bad_request, good_request])
+
+    assert emitted == [("req-good", [6])]
+    assert isinstance(bad_request.to_finish, omni_scheduler_module.FINISH_ABORT)
+    error = scheduler.outbox.get_nowait()
+    assert (error.request_id, error.type, error.data) == (
+        "req-bad",
+        "error",
+        hook_error,
+    )
+    assert good_request.to_finish is None
+
+
+def test_speculative_reserve_rejection_names_the_reserve(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.draft_worker = SimpleNamespace()
+    scheduler.max_req_len = 100
+    monkeypatch.setattr(
+        omni_scheduler_module, "get_alloc_reserve_per_decode", lambda: 16
+    )
+
+    def request(max_new_tokens: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            origin_input_ids=[0] * 50,
+            sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+        )
+
+    assert scheduler.request_kv_capacity_error(request(34)) is None
+    message = scheduler.request_kv_capacity_error(request(40))
+    assert "16-token speculative decoding reserve" in message
+    assert "Lower max_tokens" in message
+
+
 def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> None:
     """A Fish abort landing mid-step defers per-request cleanup to the
     upstream FINISH_ABORT path, leaves the buffered codes unconsumed, and
@@ -2955,6 +3099,7 @@ def construct_omni_scheduler(
         ),
         random_seed=0,
         device=torch.device("cpu"),
+        speculative_worker=None,
     )
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.new_token_ratio_tracker.get_schedule",
@@ -3188,6 +3333,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         ),
         random_seed=0,
         device=torch.device("cpu"),
+        speculative_worker=None,
     )
     server_args = SimpleNamespace(
         tp_size=1,
@@ -3275,6 +3421,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         ),
         random_seed=0,
         device=torch.device("cpu"),
+        speculative_worker=None,
     )
     server_args = SimpleNamespace(
         tp_size=1,
