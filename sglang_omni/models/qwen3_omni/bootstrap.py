@@ -95,6 +95,7 @@ def create_thinker_scheduler(
         tokenizer=tokenizer,
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
+        is_speculative=model_worker.speculative_worker is not None,
     )
     stream_output_builder = make_thinker_stream_output_builder(
         speech_enabled=speech_enabled

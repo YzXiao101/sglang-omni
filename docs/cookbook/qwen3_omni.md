@@ -120,3 +120,43 @@ must check for an `error` event, including after partial output.
 - **`content` must be `""` when the query is entirely in `audios`, `videos`, or `images`.** Leaving a text query in `content` alongside audio causes the model to process both, which is usually not what you want.
 - **Colocated topology does not support `--thinker.tp_size 2`.** The server raises a `ValueError` at startup ("Qwen Phase 1 colocation does not support thinker TP"). Use disaggregated topology for TP=2.
 - **Requests that exceed the model's context length are rejected with an error.** The preprocessor raises a `ValueError` when the prompt token count alone meets or exceeds `max_seq_len`, or when `prompt tokens + max_new_tokens ≥ max_seq_len`. Reduce input length or lower `max_tokens` to stay within the limit. Without `--preprocessing.factory.max_seq_len` and `--thinker.factory.max_seq_len`, the limit is the thinker's context in the checkpoint config (65,536 tokens for the Instruct checkpoint). Setting both to a lower value caps it. The talker's context is likewise the checkpoint's unless `--talker_ar.factory.max_seq_len` sets it. When a long spoken prompt leaves less room than `talker_max_new_tokens`, the talker generates only the frames that fit, so the audio can end before the text.
+
+## Speculative Decoding
+
+The thinker can verify tokens proposed by SpeechSpec's DFlash draft [`yuekai/qwen3_omni_30b_a3b_instruct_dflash_block8`](https://huggingface.co/yuekai/qwen3_omni_30b_a3b_instruct_dflash_block8) or EAGLE3 draft [`yuekai/qwen3_omni_30b_a3b_instruct_eagle3_audio`](https://huggingface.co/yuekai/qwen3_omni_30b_a3b_instruct_eagle3_audio).
+
+```bash
+# DFlash: one 8-token block per step
+sgl-omni serve \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --thinker.engine.speculative_algorithm DFLASH \
+  --thinker.engine.speculative_draft_model_path yuekai/qwen3_omni_30b_a3b_instruct_dflash_block8 \
+  --thinker.engine.speculative_num_draft_tokens 8 \
+  --port 8000
+
+# EAGLE3: a 3-step chain
+sgl-omni serve \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --thinker.engine.speculative_algorithm EAGLE3 \
+  --thinker.engine.speculative_draft_model_path yuekai/qwen3_omni_30b_a3b_instruct_eagle3_audio \
+  --thinker.engine.speculative_num_steps 3 \
+  --thinker.engine.speculative_eagle_topk 1 \
+  --thinker.engine.speculative_num_draft_tokens 4 \
+  --port 8000
+```
+
+- **Context.** The thinker serves within the draft's context (8,192 tokens for both drafts), and a request whose prompt plus `max_tokens` exceeds it, less a few tokens each step reserves, is rejected with an error. Setting `--preprocessing.factory.max_seq_len 8192` rejects most of them before the thinker.
+- **Sampling.** Requests with `repetition_penalty`, `min_p` or logprobs are rejected, because the draft workers verify without them. Rollout `/generate` requests default to `return_logprob: true`, so they must send `false`.
+- **Scheduling.** Async decode is turned off, and setting `enable_mixed_chunk` is rejected. EAGLE3 also runs prefill without CUDA graphs, since its draft extends on the composed multimodal embeddings. Sessions and weight updates are refused while a draft is loaded.
+
+Text-only ASR on LibriSpeech test-clean (2,620 utterances, `--text-only`, thinker on one H100 80GB with FA3, greedy, `max_tokens 200`), in requests per second:
+
+| Concurrency | Baseline | DFlash | EAGLE3 |
+|---|---|---|---|
+| 1 | 7.09 | 11.49 (1.62x) | 8.55 (1.21x) |
+| 4 | 14.47 | 21.80 (1.51x) | 14.71 (1.02x) |
+| 8 | 20.65 | 33.56 (1.63x) | 21.60 (1.05x) |
+
+DFlash accepts 4.7 tokens per verify and EAGLE3 3.4. WER stays between 1.65% and 1.68%.
+
+With speech output (Seed-TTS-Eval English, 1,088 prompts, concurrency 16, streaming; thinker on one H100, talker and code2wav on a second), DFlash raises throughput from 23.7 to 26.9 req/s (1.13x) and cuts mean latency from 0.67 to 0.59 s and time to first audio from 0.25 to 0.23 s, with WER unchanged (1.88% → 1.87%). The gain is smaller because the talker and code2wav, which the draft does not speed up, produce the audio.
