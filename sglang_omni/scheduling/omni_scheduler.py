@@ -2447,7 +2447,12 @@ class OmniScheduler(Generic[RequestDataT]):
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         if self.enable_spec_v2_overlap:
             # note (Codex): Retraction can free rows even when the loop's earlier memory check passed.
+            initial_request_count = batch.batch_size()
             batch.filter_batch()
+            if batch.batch_size() < initial_request_count:
+                batch.batch_is_full = False
+            else:
+                pass
             if not batch.is_empty() and (
                 not batch.check_decode_mem()
                 or (
