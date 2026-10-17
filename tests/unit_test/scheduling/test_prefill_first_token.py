@@ -16,11 +16,7 @@ import torch
 from pydantic import ValidationError
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.config.manager import ConfigManager
@@ -31,12 +27,9 @@ from sglang_omni.models.qwen3_omni.request_builders import (
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling import omni_scheduler as scheduler_module
-from sglang_omni.scheduling.message import OutgoingMessage, PendingStreamOutput
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
-from tests.unit_test.model_runner.test_speculative_target_worker import (
-    make_speculative_target_probe,
-)
 from tests.unit_test.pipeline.helpers import make_stage
 
 Publication = tuple[
@@ -103,6 +96,12 @@ def publication(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest)
     scheduler.first_emit_done = set()
     scheduler.find_request_data = request_data_by_id.get
     events = []
+    scheduler.enable_spec_v2_overlap = False
+    scheduler.draft_worker = object()
+    scheduler.device = "cuda"
+    scheduler.device_module = SimpleNamespace(
+        synchronize=lambda device: events.append("drain")
+    )
     copied = torch.arange(7, 7 + request_count)
 
     class HostToken:
@@ -136,11 +135,7 @@ def publication(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest)
 
 def publish_and_resolve(scheduler, batch, result):
     scheduler.publish_prefill_first_token(batch, result)
-    if scheduler.pending_prefill_publication is not None:
-        pending_output = scheduler.outbox.get_nowait()
-        assert isinstance(pending_output, PendingStreamOutput)
-        pending_output.resolve()
-        scheduler.wait_prefill_publication()
+    scheduler.wait_prefill_publication()
 
 
 def test_publish_then_commit_emits_once(publication):
@@ -492,55 +487,35 @@ def test_abort_after_early_enqueue_suppresses_late_committed_suffix(
 
 
 @pytest.mark.parametrize("publication", [3], indirect=True)
-def test_partial_batch_publication_failure_drains_before_cleanup(
-    publication, monkeypatch: pytest.MonkeyPatch
-):
-    scheduler, batch, result, _, _, _ = publication
-    adapter, forward_batch, calls = make_speculative_target_probe()
-    adapter.thinker_runner.prepare_and_forward = Mock(
-        return_value=SimpleNamespace(
-            logits_output=SimpleNamespace(hidden_states=torch.ones(3, 20)),
-            next_token_ids=result.next_token_ids,
-        )
-    )
-    adapter.prefill_token_publisher = scheduler.publish_prefill_first_token
-    monkeypatch.setattr(ForwardBatch, "init_new", lambda *args, **kwargs: forward_batch)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda device: SimpleNamespace(synchronize=lambda: calls.append("drain")),
-    )
+def test_partial_batch_publication_failure_drains_before_cleanup(publication):
+    scheduler, batch, result, _, _, events = publication
     stream_builder = scheduler.stream_output_builder
     publication_error = ValueError("second row publication failed")
 
     def fail_second_row(request_id, request_data, output):
         if request_id == batch.reqs[1].rid:
-            calls.append("publication_failed")
+            events.append("publication_failed")
             raise publication_error
-        else:
-            return stream_builder(request_id, request_data, output)
+        return stream_builder(request_id, request_data, output)
 
     scheduler.stream_output_builder = fail_second_row
-    scheduler.running = True
 
-    def forward_then_resolve(*args):
-        adapter.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
-        )
-        calls.append("draft_submitted")
-        scheduler.outbox.get_nowait().resolve()
+    def forward_then_publish(*args):
+        scheduler.publish_prefill_first_token(batch, result)
+        assert scheduler.outbox.empty()
+        events.append("draft_submitted")
         scheduler.wait_prefill_publication()
 
     scheduler._run_batch = Mock(
-        side_effect=forward_then_resolve
+        side_effect=forward_then_publish
     )  # noqa: leading-underscore
-
     scheduler.handle_batch_failure = Mock(
-        side_effect=lambda *args: calls.append("cleanup")
+        side_effect=lambda *args: events.append("cleanup")
     )
     scheduler.run_batch(batch)
-    assert calls[-3:] == ["publication_failed", "drain", "cleanup"]
+    assert events[-3:] == ["publication_failed", "drain", "cleanup"]
     scheduler.handle_batch_failure.assert_called_once_with(batch, publication_error)
+    assert scheduler.pending_prefill_publication is None
     assert scheduler.outbox.qsize() == 1
     assert scheduler.outbox.get_nowait().request_id == batch.reqs[0].rid
     assert [request.omni_data.speculative_emitted_tokens for request in batch.reqs] == [
@@ -552,23 +527,23 @@ def test_partial_batch_publication_failure_drains_before_cleanup(
 
 
 @pytest.mark.parametrize("publication", [3], indirect=True)
-def test_callback_returns_before_copy_resolution(publication):
+def test_callback_only_stages_copy_until_native_cpu_returns(publication):
     scheduler, batch, result, _, event, events = publication
     scheduler.publish_prefill_first_token(batch, result)
     assert events == ["copy", "record"]
     event.synchronize.assert_not_called()
+    assert scheduler.pending_prefill_publication is not None
+    assert scheduler.outbox.empty()
     assert all(
         request.omni_data.speculative_emitted_tokens == 0 for request in batch.reqs
     )
-    envelope = scheduler.outbox.get_nowait()
-    envelope.resolve()
     scheduler.wait_prefill_publication()
     assert events == ["copy", "record", "ready"]
     assert scheduler.outbox.qsize() == 3
 
 
 @pytest.mark.parametrize("publication", [3], indirect=True)
-def test_native_return_waits_for_ack_before_cache_publication(publication, monkeypatch):
+def test_native_cpu_return_precedes_single_owner_publication(publication, monkeypatch):
     scheduler, batch, result, _, event, events = publication
     copy_entered = threading.Event()
     copy_release = threading.Event()
@@ -580,6 +555,8 @@ def test_native_return_waits_for_ack_before_cache_publication(publication, monke
 
     event.synchronize.side_effect = wait_copy
     original_requests = tuple(batch.reqs)
+    native_entered = threading.Event()
+    native_return_release = threading.Event()
     draft_submitted = threading.Event()
     worker_errors = []
     returned = threading.Event()
@@ -599,6 +576,10 @@ def test_native_return_waits_for_ack_before_cache_publication(publication, monke
     def forward(batch):
         scheduler.publish_prefill_first_token(batch, result)
         assert events == ["copy", "record"]
+        native_entered.set()
+        assert native_return_release.wait(2)
+        assert scheduler.outbox.empty()
+        event.synchronize.assert_not_called()
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.reqs = []
         events.append("draft-submitted")
@@ -626,12 +607,15 @@ def test_native_return_waits_for_ack_before_cache_publication(publication, monke
 
     worker = threading.Thread(target=run)
     worker.start()
+    assert native_entered.wait(2)
+    assert scheduler.outbox.empty()
+    event.synchronize.assert_not_called()
+    native_return_release.set()
     assert draft_submitted.wait(2)
     assert copy_entered.wait(2)
     scheduler.update_cache_from_scheduler.assert_not_called()
     assert not returned.is_set()
-    envelope = scheduler.outbox.get_nowait()
-    envelope.resolve()
+    assert scheduler.outbox.empty()
     copy_release.set()
     worker.join(timeout=2)
     assert not worker.is_alive() and not worker_errors
@@ -639,6 +623,58 @@ def test_native_return_waits_for_ack_before_cache_publication(publication, monke
     assert [scheduler.outbox.get_nowait().request_id for _ in range(3)] == [
         request.rid for request in original_requests
     ]
+
+
+def test_token_publication_does_not_wait_for_full_writer_result_event(
+    publication, monkeypatch
+):
+    scheduler, batch, result, _, token_event, events = publication
+    full_writer_event = Mock()
+    native_result = SimpleNamespace(
+        next_draft_input=None,
+        new_seq_lens=None,
+        has_sampled_token_ids=True,
+        copy_to_cpu=Mock(),
+    )
+    scheduler.emit_prefill_start_for_batch = Mock()
+    scheduler.stamp_batch_launch = Mock()
+    scheduler.emit_prefill_end_for_batch = Mock()
+    scheduler.future_map = None
+    scheduler.device_module = SimpleNamespace(
+        Event=Mock(return_value=full_writer_event)
+    )
+    scheduler._forward_isolation = (
+        lambda *args, **kwargs: nullcontext()
+    )  # noqa: leading-underscore
+    monkeypatch.setattr(scheduler_module, "resolve_forward_inputs", lambda *args: None)
+
+    def forward(batch):
+        scheduler.publish_prefill_first_token(batch, result)
+        events.append("draft-submitted")
+        return native_result
+
+    def enqueue_normal_result(**kwargs):
+        assert scheduler.outbox.qsize() == 1
+        assert batch.reqs[0].omni_data.speculative_emitted_tokens == 1
+        full_writer_event.synchronize.assert_not_called()
+        events.append("normal-result-copy-enqueued")
+
+    native_result.copy_to_cpu.side_effect = enqueue_normal_result
+    scheduler.draft_worker = SimpleNamespace(forward_batch_generation=forward)
+    scheduler.update_cache_from_scheduler = Mock()
+    assert scheduler.run_batch(batch) is native_result
+    token_event.synchronize.assert_called_once()
+    assert native_result.copy_done is full_writer_event
+    full_writer_event.synchronize.assert_not_called()
+    assert scheduler.outbox.get_nowait().data.tolist() == [7]
+    assert events == [
+        "copy",
+        "record",
+        "draft-submitted",
+        "ready",
+        "normal-result-copy-enqueued",
+    ]
+    assert not batch.reqs[0].output_ids
 
 
 def test_stop_before_callback_retains_resources_and_rejects_new_pending(publication):
@@ -654,45 +690,68 @@ def test_stop_before_callback_retains_resources_and_rejects_new_pending(publicat
     assert scheduler.pending_prefill_publication is None
 
 
-def test_stop_during_pending_copy_suppresses_early_output(publication):
+def test_stop_during_pending_copy_suppresses_output_and_retains_buffers(publication):
     scheduler, batch, result, _, _, events = publication
     scheduler.scheduler_thread_id = threading.get_ident()
     scheduler.shutdown_resources = Mock()
     scheduler.publish_prefill_first_token(batch, result)
+    pending = scheduler.pending_prefill_publication
     assert scheduler.stop() is True
-    scheduler.outbox.get_nowait().resolve()
-    with pytest.raises(RuntimeError, match="consumer stopped"):
-        scheduler.wait_prefill_publication()
-    scheduler.close_prefill_publication(RuntimeError("consumer stopped"))
-    assert events == ["copy", "record", "drain"]
+    assert scheduler.pending_prefill_publication is pending
+    scheduler.wait_prefill_publication()
+    assert events == ["copy", "record", "ready"]
+    assert scheduler.pending_prefill_publication is None
     assert scheduler.outbox.empty()
     scheduler.shutdown_resources.assert_not_called()
 
 
-def test_worker_failure_before_resolution_drains_and_closes_envelope(publication):
-    scheduler, batch, result, _, _, events = publication
+@pytest.mark.parametrize("failure_site", ["native", "token_copy_event"])
+def test_failure_discards_pending_only_after_full_writer_drain(
+    publication, failure_site
+):
+    scheduler, batch, result, _, event, events = publication
     scheduler.publish_prefill_first_token(batch, result)
-    envelope = scheduler.outbox.get_nowait()
-    scheduler.close_prefill_publication(ValueError("draft submission failed"))
-    envelope.resolve()
-    assert events == ["copy", "record", "drain"]
+    pending = scheduler.pending_prefill_publication
+    failure = ValueError("draft submission failed")
+    if failure_site == "native":
+        scheduler._run_batch = Mock(side_effect=failure)  # noqa: leading-underscore
+    else:
+        event.synchronize.side_effect = failure
+        scheduler._run_batch = Mock(  # noqa: leading-underscore
+            side_effect=lambda *args: scheduler.wait_prefill_publication()
+        )
+
+    def drain(device):
+        assert scheduler.pending_prefill_publication is pending
+        events.append("drain")
+
+    scheduler.device_module.synchronize = drain
+    scheduler.handle_batch_failure = Mock(
+        side_effect=lambda *args: events.append("cleanup")
+    )
+    scheduler.run_batch(batch)
+    assert events == ["copy", "record", "drain", "cleanup"]
+    scheduler.handle_batch_failure.assert_called_once_with(batch, failure)
+    assert event.synchronize.call_count == int(failure_site == "token_copy_event")
     assert scheduler.pending_prefill_publication is None
     assert scheduler.outbox.empty()
 
 
 def test_failed_gpu_drain_never_enters_recoverable_cleanup(publication, monkeypatch):
     scheduler, batch, result, _, _, events = publication
-    producer = SimpleNamespace(
-        synchronize=Mock(side_effect=RuntimeError("device lost"))
-    )
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: producer)
+    scheduler.device_module.synchronize = Mock(side_effect=RuntimeError("device lost"))
     monkeypatch.setattr(scheduler_module.os, "write", Mock())
     monkeypatch.setattr(scheduler_module.os, "_exit", Mock(side_effect=SystemExit(1)))
     scheduler.publish_prefill_first_token(batch, result)
+    pending = scheduler.pending_prefill_publication
+    scheduler._run_batch = Mock(
+        side_effect=ValueError("draft submission failed")
+    )  # noqa: leading-underscore
+    scheduler.handle_batch_failure = Mock()
     with pytest.raises(SystemExit, match="1"):
-        scheduler.close_prefill_publication(ValueError("draft submission failed"))
-    assert scheduler.pending_prefill_publication is not None
-    assert not scheduler.pending_prefill_publication.completion.done()
+        scheduler.run_batch(batch)
+    assert scheduler.pending_prefill_publication is pending
+    scheduler.handle_batch_failure.assert_not_called()
     assert events == ["copy", "record"]
 
 
@@ -755,15 +814,15 @@ def test_consumer_failure_before_pending_cannot_deadlock_stop(publication):
         await asyncio.wait_for(stopping, 2)
         assert stage.scheduler_thread is None
         assert scheduler.pending_prefill_publication is None
-        assert events == ["copy", "record", "drain", "cleanup", "resource-close"]
-        scheduler.handle_batch_failure.assert_called_once()
+        assert events == ["copy", "record", "ready", "resource-close"]
+        scheduler.handle_batch_failure.assert_not_called()
         assert batch.reqs[0].omni_data.speculative_emitted_tokens == 0
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("publication", [3], indirect=True)
-def test_producer_claim_does_not_wait_for_prior_network_send(publication):
+def test_single_owner_publication_does_not_wait_for_prior_network_send(publication):
     async def run():
         scheduler, batch, result, _, event, _ = publication
         stage = make_stage(
@@ -911,122 +970,7 @@ def test_slow_consumer_preserves_early_token_then_committed_suffix(
     asyncio.run(run())
 
 
-def test_repeated_consumer_cancel_waits_for_claimed_copy_completion(
-    publication: Publication,
-) -> None:
-    async def run() -> None:
-        scheduler, batch, result, _, event, _ = publication
-        scheduler.scheduler_thread_id = threading.get_ident()
-        scheduler.shutdown_resources = Mock()
-        stage = make_stage(scheduler=scheduler)
-        stage.running = True
-        stage.active_requests.add(batch.reqs[0].rid)
-        copy_entered = threading.Event()
-        copy_release = threading.Event()
-
-        def wait_copy() -> None:
-            copy_entered.set()
-            assert copy_release.wait(2)
-
-        event.synchronize.side_effect = wait_copy
-        scheduler.publish_prefill_first_token(batch, result)
-        pending = scheduler.pending_prefill_publication
-        drain = asyncio.create_task(stage.drain_outbox_external())
-        try:
-            assert await asyncio.to_thread(copy_entered.wait, 2)
-            assert drain.cancel()
-            await asyncio.sleep(0)
-            assert not drain.done()
-            assert drain.cancel()
-            await asyncio.sleep(0)
-            assert not drain.done()
-            assert scheduler.pending_prefill_publication is pending
-            assert not pending.completion.done()
-            assert scheduler.stop() is True
-            assert not pending.completion.done()
-            scheduler.shutdown_resources.assert_not_called()
-        finally:
-            stage.running = False
-            copy_release.set()
-            try:
-                await asyncio.wait_for(drain, 2)
-            except asyncio.CancelledError:
-                pass
-        assert drain.cancelled()
-        scheduler.wait_prefill_publication()
-        assert event.synchronize.call_count == 1
-        assert scheduler.pending_prefill_publication is None
-        assert scheduler.outbox.empty()
-        assert batch.reqs[0].omni_data.speculative_emitted_tokens == 0
-        scheduler.shutdown_resources.assert_not_called()
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("first_owner", ["consumer", "producer"])
-def test_competing_resolvers_claim_once(publication, first_owner):
-    scheduler, batch, result, _, event, _ = publication
-    copy_entered = threading.Event()
-    copy_release = threading.Event()
-    consumer_completed = threading.Event()
-    producer_completed = threading.Event()
-    failures = []
-
-    def wait_copy():
-        copy_entered.set()
-        assert copy_release.wait(2)
-
-    event.synchronize.side_effect = wait_copy
-    scheduler.publish_prefill_first_token(batch, result)
-    envelope = scheduler.outbox.get_nowait()
-
-    def consumer():
-        try:
-            envelope.resolve()
-        except BaseException as error:
-            failures.append(error)
-        finally:
-            consumer_completed.set()
-
-    def producer():
-        try:
-            scheduler.wait_prefill_publication()
-        except BaseException as error:
-            failures.append(error)
-        finally:
-            producer_completed.set()
-
-    consumer_thread = threading.Thread(target=consumer)
-    producer_thread = threading.Thread(target=producer)
-    first, second = (
-        (consumer_thread, producer_thread)
-        if first_owner == "consumer"
-        else (producer_thread, consumer_thread)
-    )
-    first.start()
-    assert copy_entered.wait(2)
-    second.start()
-    try:
-        assert not producer_completed.is_set()
-        if first_owner == "producer":
-            assert consumer_completed.wait(1)
-        else:
-            pass
-        assert not batch.reqs[0].output_ids
-    finally:
-        copy_release.set()
-        first.join(2)
-        second.join(2)
-    assert not first.is_alive() and not second.is_alive() and not failures
-    assert event.synchronize.call_count == 1
-    assert scheduler.outbox.qsize() == 1
-    assert batch.reqs[0].omni_data.speculative_emitted_tokens == 1
-    assert scheduler.pending_prefill_publication is None
-    envelope.resolve()
-    assert event.synchronize.call_count == 1 and scheduler.outbox.qsize() == 1
-
-
-def test_queued_weak_envelope_releases_retired_payloads(publication):
+def test_single_owner_releases_retired_copy_payloads(publication):
     scheduler, batch, result, _, event, _ = publication
     scheduler.publish_prefill_first_token(batch, result)
     pending = scheduler.pending_prefill_publication
@@ -1046,18 +990,12 @@ def test_queued_weak_envelope_releases_retired_payloads(publication):
     assert all(reference() is not None for reference in references)
     scheduler.wait_prefill_publication()
     assert event.synchronize.call_count == 1
-    assert scheduler.outbox.qsize() == 2
+    assert scheduler.outbox.qsize() == 1
     scheduler.find_request_data = lambda request_id: None
     batch.reqs.clear()
     gc.collect()
     assert all(reference() is None for reference in references)
-    envelope = scheduler.outbox.get_nowait()
-    replacement = SimpleNamespace(completion=Mock())
-    scheduler.pending_prefill_publication = replacement
-    envelope.resolve()
-    assert scheduler.pending_prefill_publication is replacement
-    replacement.completion.assert_not_called()
-    scheduler.pending_prefill_publication = None
+    scheduler.wait_prefill_publication()
     assert event.synchronize.call_count == 1
 
 
@@ -1072,22 +1010,22 @@ def test_error_drain_retains_strong_payload_before_retirement(publication):
     drain_release = threading.Event()
     failures = []
 
-    def drain_writer():
+    def drain_writer(device):
         drain_entered.set()
         assert pending_reference() is not None and source_reference() is not None
         assert drain_release.wait(2)
         events.append("drain")
 
-    pending.producer_stream.synchronize = drain_writer
+    scheduler.device_module.synchronize = drain_writer
     pending = None
 
-    def close_publication():
+    def drain_publication():
         try:
-            scheduler.close_prefill_publication(RuntimeError("native submit failed"))
+            scheduler.drain_dflash_failure()
         except BaseException as error:
             failures.append(error)
 
-    thread = threading.Thread(target=close_publication)
+    thread = threading.Thread(target=drain_publication)
     thread.start()
     assert drain_entered.wait(2)
     gc.collect()
@@ -1098,14 +1036,13 @@ def test_error_drain_retains_strong_payload_before_retirement(publication):
     assert scheduler.pending_prefill_publication is None
     gc.collect()
     assert pending_reference() is None and source_reference() is None
-    scheduler.outbox.get_nowait().resolve()
+    assert scheduler.outbox.empty()
     assert not batch.reqs[0].output_ids
     assert batch.reqs[0].omni_data.speculative_emitted_tokens == 0
 
 
-@pytest.mark.parametrize("first_owner", ["consumer", "producer"])
-def test_stop_after_claim_suppresses_publication_and_retains_resources(
-    publication, first_owner
+def test_stop_while_scheduler_waits_suppresses_output_and_retains_resources(
+    publication,
 ):
     scheduler, batch, result, _, event, _ = publication
     scheduler.scheduler_thread_id = threading.get_ident()
@@ -1120,15 +1057,11 @@ def test_stop_after_claim_suppresses_publication_and_retains_resources(
 
     event.synchronize.side_effect = wait_copy
     scheduler.publish_prefill_first_token(batch, result)
-    envelope = scheduler.outbox.get_nowait()
     pending_reference = weakref.ref(scheduler.pending_prefill_publication)
 
     def run_owner():
         try:
-            if first_owner == "consumer":
-                envelope.resolve()
-            else:
-                scheduler.wait_prefill_publication()
+            scheduler.wait_prefill_publication()
         except BaseException as error:
             errors.append(error)
 
@@ -1137,7 +1070,7 @@ def test_stop_after_claim_suppresses_publication_and_retains_resources(
     assert copy_entered.wait(2)
     try:
         assert scheduler.stop() is True
-        assert pending_reference() is not None and pending_reference().closed
+        assert pending_reference() is not None
         scheduler.shutdown_resources.assert_not_called()
         assert not batch.reqs[0].output_ids
     finally:
@@ -1145,7 +1078,6 @@ def test_stop_after_claim_suppresses_publication_and_retains_resources(
         thread.join(2)
     assert not thread.is_alive() and not errors
     scheduler.wait_prefill_publication()
-    envelope.resolve()
     assert event.synchronize.call_count == 1
     assert scheduler.outbox.empty()
     assert batch.reqs[0].omni_data.speculative_emitted_tokens == 0

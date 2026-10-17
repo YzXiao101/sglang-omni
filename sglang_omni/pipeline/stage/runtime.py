@@ -63,7 +63,6 @@ from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
-    PendingStreamOutput,
     StageScheduler,
 )
 
@@ -1343,13 +1342,7 @@ class Stage:
                         stream_run = []
                     else:
                         pass
-                    if isinstance(out, PendingStreamOutput):
-                        resolution = loop.run_in_executor(None, out.resolve)
-                        if await self.wait_for_output_completion(resolution):
-                            raise asyncio.CancelledError
-                        else:
-                            pass
-                    elif out.type == "admitted":
+                    if out.type == "admitted":
                         if out.request_id not in self.aborted:
                             self.record_replica_bindings(
                                 out.request_id,
@@ -1462,13 +1455,7 @@ class Stage:
             except _queue_mod.Empty:
                 continue
 
-            if isinstance(out, PendingStreamOutput):
-                resolution = loop.run_in_executor(None, out.resolve)
-                if await self.wait_for_output_completion(resolution):
-                    raise asyncio.CancelledError
-                else:
-                    pass
-            elif out.type == "result":
+            if out.type == "result":
                 self.clear_request_state(out.request_id)
             elif out.type == "stream":
                 continue

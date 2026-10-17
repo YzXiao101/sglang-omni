@@ -24,11 +24,10 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING, Callable, Generic, NoReturn
-from weakref import ref
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
@@ -112,7 +111,6 @@ from sglang_omni.proto.session import find_session_operation
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
-    PendingStreamOutput,
     put_messages,
 )
 from sglang_omni.scheduling.sglang_backend.ar_session import (
@@ -184,17 +182,12 @@ class PrefillTokenPublication:
 
 @dataclass(kw_only=True)
 class PendingPrefillPublication:
-    """Retain one immutable row selection until copy and FIFO publication finish."""
+    """Retain sampled rows until scheduler-owned token publication completes."""
 
-    forward_mode: ForwardMode
     rows: tuple[PrefillTokenPublication, ...]
     source_token_ids: torch.Tensor
     host_token_ids: torch.Tensor
     copy_done: torch.cuda.Event
-    producer_stream: torch.cuda.Stream
-    completion: Future[None] = field(default_factory=Future)
-    resolving: bool = False
-    closed: bool = False
 
 
 @dataclass(kw_only=True)
@@ -444,9 +437,7 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage | PendingStreamOutput] = (
-            _queue_mod.Queue()
-        )
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
         self.pending_prefill_publication: PendingPrefillPublication | None = None
         self.requires_tp_work_fanout: bool = False
 
@@ -2223,7 +2214,6 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 raise
         except Exception as exc:
-            self.close_prefill_publication(exc)
             if self.enable_spec_v2_overlap:
                 self.fail_spec_v2(batch, exc)
             else:
@@ -2599,6 +2589,8 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.device_module.synchronize(self.device)
         except Exception as drain_error:
             self.terminate_prefill_worker(drain_error)
+        else:
+            self.pending_prefill_publication = None
 
     def fail_spec_v2(self, batch: ScheduleBatch, error: Exception) -> None:
         """A partially submitted forward owns its rows until every stream drains."""
@@ -3009,7 +3001,7 @@ class OmniScheduler(Generic[RequestDataT]):
     def publish_prefill_first_token(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ) -> None:
-        """Queue a copy for the existing consumer before native draft submission."""
+        """Submit the token copy before draft work, without publishing mutable rows."""
         publications: list[PrefillTokenPublication] = []
         with self.request_admission_lock:
             if not self.running:
@@ -3054,117 +3046,63 @@ class OmniScheduler(Generic[RequestDataT]):
             host_token_ids.copy_(token_ids, non_blocking=True)
             token_copy_done = torch.cuda.Event()
             token_copy_done.record(producer_stream)
-            pending = PendingPrefillPublication(
-                forward_mode=batch.forward_mode,
+            self.pending_prefill_publication = PendingPrefillPublication(
                 rows=tuple(publications),
                 source_token_ids=token_ids,
                 host_token_ids=host_token_ids,
                 copy_done=token_copy_done,
-                producer_stream=producer_stream,
             )
-            self.pending_prefill_publication = pending
-            pending_reference = ref(pending)
-
-            def resolve_pending() -> None:
-                publication = pending_reference()
-                if publication is None:
-                    return
-                else:
-                    self.resolve_prefill_publication(publication)
-
-            self.outbox.put(PendingStreamOutput(resolve=resolve_pending))
-
-    def resolve_prefill_publication(self, pending: PendingPrefillPublication) -> None:
-        """Claim a copy from either owner and acknowledge FIFO insertion once."""
-        with self.request_admission_lock:
-            if pending.resolving or pending.completion.done():
-                return
-            else:
-                pending.resolving = True
-        try:
-            pending.copy_done.synchronize()
-            with self.request_admission_lock:
-                if not pending.closed:
-                    for publication in pending.rows:
-                        request = publication.request
-                        request_id = publication.request_id
-                        request_data = publication.request_data
-                        if (
-                            not self.can_publish_prefill_request(request)
-                            or request.rid != request_id
-                            or request.omni_data is not request_data
-                            or self.find_request_data(request_id) is not request_data
-                            or request.kv.req_pool_idx != publication.request_pool_index
-                            or request.cache_request_handle
-                            is not publication.cache_request_handle
-                        ):
-                            continue
-                        else:
-                            pass
-                        token_id = int(
-                            pending.host_token_ids[publication.request_index]
-                        )
-                        if request.eos_token_ids and token_id in request.eos_token_ids:
-                            continue
-                        elif request.tokenizer is not None and (
-                            token_id == request.tokenizer.eos_token_id
-                            or (
-                                request.tokenizer.additional_stop_token_ids
-                                and token_id
-                                in request.tokenizer.additional_stop_token_ids
-                            )
-                        ):
-                            continue
-                        else:
-                            output = RequestOutput(request_id=request_id, data=token_id)
-                            messages = self.stream_output_builder(
-                                request_id, request_data, output
-                            )
-                            self.put_stream_messages(request_id, messages)
-                            request_data.speculative_emitted_tokens = 1
-                            request_data.speculative_first_token_id = token_id
-                else:
-                    pass
-        except BaseException as error:
-            pending.completion.set_exception(error)
-        else:
-            pending.completion.set_result(None)
 
     def wait_prefill_publication(self) -> None:
-        """Wait after native submission, before cache publication or request release."""
+        """Publish copied tokens after native CPU submission, before normal results."""
         pending = self.pending_prefill_publication
         if pending is None:
             return
         else:
-            self.resolve_prefill_publication(pending)
-            pending.completion.result()
-            with self.request_admission_lock:
-                self.pending_prefill_publication = None
-
-    def close_prefill_publication(self, error: Exception) -> None:
-        """Suppress late publication and drain writers before recoverable cleanup."""
-        pending = self.pending_prefill_publication
-        if pending is None:
-            return
-        else:
-            with self.request_admission_lock:
-                pending.closed = True
-        try:
-            pending.producer_stream.synchronize()
-        except Exception as drain_error:
-            self.terminate_prefill_worker(drain_error)
+            pass
+        pending.copy_done.synchronize()
         with self.request_admission_lock:
-            if not pending.resolving and not pending.completion.done():
-                pending.completion.set_exception(error)
+            if not self.running:
+                self.pending_prefill_publication = None
+                return
             else:
                 pass
-        try:
-            pending.completion.result()
-        except BaseException:
-            pass
-        finally:
-            with self.request_admission_lock:
-                self.pending_prefill_publication = None
+            for publication in pending.rows:
+                request = publication.request
+                request_id = publication.request_id
+                request_data = publication.request_data
+                if (
+                    not self.can_publish_prefill_request(request)
+                    or request.rid != request_id
+                    or request.omni_data is not request_data
+                    or self.find_request_data(request_id) is not request_data
+                    or request.kv.req_pool_idx != publication.request_pool_index
+                    or request.cache_request_handle
+                    is not publication.cache_request_handle
+                ):
+                    continue
+                else:
+                    pass
+                token_id = int(pending.host_token_ids[publication.request_index])
+                if request.eos_token_ids and token_id in request.eos_token_ids:
+                    continue
+                elif request.tokenizer is not None and (
+                    token_id == request.tokenizer.eos_token_id
+                    or (
+                        request.tokenizer.additional_stop_token_ids
+                        and token_id in request.tokenizer.additional_stop_token_ids
+                    )
+                ):
+                    continue
+                else:
+                    output = RequestOutput(request_id=request_id, data=token_id)
+                    messages = self.stream_output_builder(
+                        request_id, request_data, output
+                    )
+                    self.put_stream_messages(request_id, messages)
+                    request_data.speculative_emitted_tokens = 1
+                    request_data.speculative_first_token_id = token_id
+            self.pending_prefill_publication = None
 
     @staticmethod
     def terminate_prefill_worker(error: BaseException) -> NoReturn:
@@ -3276,11 +3214,10 @@ class OmniScheduler(Generic[RequestDataT]):
                     self.drain_spec_v2()
                 else:
                     pass
-                self.close_prefill_publication(
-                    RuntimeError(
-                        "Scheduler stopped before prefill publication completed"
-                    )
-                )
+                if self.pending_prefill_publication is not None:
+                    self.drain_dflash_failure()
+                else:
+                    pass
                 if self.session_bridge is not None:
                     self.resolve_pending_async()
                     self.session_bridge.close_open_sessions()
@@ -3302,17 +3239,6 @@ class OmniScheduler(Generic[RequestDataT]):
         with self.request_admission_lock:
             self.running = False
             self.prefill_publication_stopped = self.wait_for_prefill_publication_on_stop
-            pending = self.pending_prefill_publication
-            if pending is not None:
-                pending.closed = True
-                if not pending.resolving and not pending.completion.done():
-                    pending.completion.set_exception(
-                        RuntimeError("Prefill publication consumer stopped")
-                    )
-                else:
-                    pass
-            else:
-                pass
         retains_scheduler_thread = self.scheduler_thread_id is not None and (
             self.session_bridge is not None or self.wait_for_prefill_publication_on_stop
         )

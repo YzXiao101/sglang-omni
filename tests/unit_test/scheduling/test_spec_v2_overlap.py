@@ -424,7 +424,6 @@ def test_sync_prefill_submission_failure_drains_before_normal_error_cleanup(owne
     scheduler.draft_worker.forward_batch_generation = Mock(
         side_effect=RuntimeError("partial prefill")
     )
-    scheduler.close_prefill_publication = Mock()
     scheduler.handle_batch_failure.side_effect = lambda batch, error: device.log.append(
         ("cleanup",)
     )
@@ -549,7 +548,6 @@ def test_start_finally_drains_last_pending_before_shutdown(owner):
     scheduler.pending_spec_v2 = scheduler.launch_spec_v2(batch)
     scheduler.request_admission_lock = threading.RLock()
     scheduler.event_loop_spec_v2 = Mock()
-    scheduler.close_prefill_publication = Mock()
     scheduler.emit_remaining_model_path_ends = Mock()
     scheduler.shutdown_request_build_executor = Mock()
     scheduler.discard_pending_request_admissions = Mock()

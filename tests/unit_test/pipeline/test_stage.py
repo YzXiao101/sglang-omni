@@ -21,7 +21,7 @@ from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, construct_stage
 from sglang_omni.proto import DataReadyMessage, ShutdownMessage, SubmitMessage
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
-from sglang_omni.scheduling.message import PendingStreamOutput
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.session import SessionHooks, SessionScheduler
 from tests.unit_test.fixtures.pipeline_fakes import (
@@ -1695,39 +1695,6 @@ def test_small_cuda_payload_survives_the_relay_route_bitwise() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("follower", [False, True])
-def test_pending_output_waits_for_real_executor_despite_repeated_cancel(follower):
-    async def run():
-        scheduler = FakeScheduler()
-        stage = make_stage(scheduler=scheduler)
-        stage.running = True
-        entered = threading.Event()
-        release = threading.Event()
-        completed = threading.Event()
-
-        def resolve():
-            entered.set()
-            assert release.wait(2)
-            completed.set()
-
-        scheduler.outbox.put(PendingStreamOutput(resolve=resolve))
-        drain = stage.drain_outbox_follower if follower else stage.drain_outbox_external
-        task = asyncio.create_task(drain())
-        assert await asyncio.to_thread(entered.wait, 1)
-        for _ in range(3):
-            task.cancel()
-            await asyncio.sleep(0)
-            assert not task.done()
-            assert not completed.is_set()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 2)
-        assert completed.is_set()
-        await stage.stop()
-
-    asyncio.run(run())
-
-
 def test_outbox_waits_for_retained_producer_after_stage_stops():
     async def run():
         scheduler = FakeScheduler()
@@ -1735,15 +1702,19 @@ def test_outbox_waits_for_retained_producer_after_stage_stops():
         stage = make_stage(scheduler=scheduler)
         assert stage.request_scheduler_stop()
         producer_release = threading.Event()
-        resolved = threading.Event()
         stage.scheduler_thread = threading.Thread(target=producer_release.wait)
         stage.scheduler_thread.start()
         task = asyncio.create_task(stage.drain_outbox_external())
         try:
             await asyncio.sleep(0.15)
             assert not task.done()
-            scheduler.outbox.put(PendingStreamOutput(resolve=resolved.set))
-            assert await asyncio.to_thread(resolved.wait, 1)
+            scheduler.outbox.put(OutgoingMessage(request_id="late", type="admitted"))
+
+            async def wait_for_admission():
+                while "late" not in stage.active_requests:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_admission(), 1)
         finally:
             producer_release.set()
             await asyncio.to_thread(stage.scheduler_thread.join, 1)
@@ -1869,12 +1840,11 @@ def test_run_cleanup_shield_only_for_explicit_retention(retained, monkeypatch):
 
 
 @pytest.mark.parametrize("follower", [False, True])
-def test_background_failure_retains_empty_outbox_before_late_envelope(follower):
+def test_background_failure_retains_empty_outbox_before_late_output(follower):
     async def run():
         scheduler = FakeScheduler()
         stopped = threading.Event()
         release = threading.Event()
-        resolved = threading.Event()
         stop_calls = []
 
         def stop_scheduler():
@@ -1903,8 +1873,13 @@ def test_background_failure_retains_empty_outbox_before_late_envelope(follower):
         try:
             await asyncio.sleep(0)
             assert not task.done()
-            scheduler.outbox.put(PendingStreamOutput(resolve=resolved.set))
-            assert await asyncio.to_thread(resolved.wait, 1)
+            scheduler.outbox.put(OutgoingMessage(request_id="late", type="admitted"))
+
+            async def wait_for_admission():
+                while "late" not in stage.active_requests:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_admission(), 1)
         finally:
             release.set()
             await asyncio.to_thread(stage.scheduler_thread.join, 1)
