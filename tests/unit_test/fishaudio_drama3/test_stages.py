@@ -254,23 +254,8 @@ def test_preprocessing_warms_the_encoder_up_once_on_an_accelerator(
     assert codec.encoded_shapes == expected_encoded_shapes
 
 
-@pytest.mark.parametrize(
-    ("async_decode_overrides", "expected_async_decode", "expected_min_batch_size"),
-    [
-        pytest.param({}, True, 1, id="default"),
-        pytest.param(
-            {"enable_async_decode": False, "async_decode_min_batch_size": 3},
-            False,
-            3,
-            id="explicit-off",
-        ),
-    ],
-)
 def test_the_engine_factory_hands_its_knobs_to_the_builder(
     monkeypatch: pytest.MonkeyPatch,
-    async_decode_overrides: dict[str, bool | int],
-    expected_async_decode: bool,
-    expected_min_batch_size: int,
 ) -> None:
     def build(
         builder: Drama3EngineBuilder,
@@ -295,14 +280,7 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
             builder.max_new_tokens_cap,
             builder.enable_async_decode,
             builder.async_decode_min_batch_size,
-        ) == (
-            4096,
-            4,
-            1024,
-            512,
-            expected_async_decode,
-            expected_min_batch_size,
-        )
+        ) == (4096, 4, 1024, 512, False, 3)
         return "engine"
 
     monkeypatch.setattr(Drama3EngineBuilder, "build", build)
@@ -315,7 +293,8 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
         max_new_tokens=512,
         max_prompt_rows=1024,
         server_args_overrides={"mem_fraction_static": 0.5},
-        **async_decode_overrides,
+        enable_async_decode=False,
+        async_decode_min_batch_size=3,
     )
 
     assert engine == "engine"

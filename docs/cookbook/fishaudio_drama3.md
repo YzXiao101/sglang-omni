@@ -244,7 +244,7 @@ All numbers below were measured on NVIDIA H200 GPUs with streaming requests on S
 
 *Table 1. Drama 3 streaming performance on one H200 with the high-concurrency configuration above and default model parameters. Each cell is the mean of four runs of all 1,088 English samples.*
 
-A single stream gets its first audio in under 100 ms. At concurrency 16, audio is still generated about 2.8× faster than it plays back, and at concurrency 64 mean RTF stays at 0.77. In SGLang-Omni, how the pipeline stages are grouped into processes and placed on GPUs is deployment-time configuration rather than per-model code. Table 2 shows two vocoder placements at higher concurrency, with the vocoder's default GPU share, 1,088 requests per concurrency level, and the average of six server starts. The single-GPU measurements use default model parameters; the second-GPU measurements use synchronous decode (`enable_async_decode=false`). Its throughput also counts the end-of-speech frame that ends each stream.
+A single stream gets its first audio in under 100 ms. At concurrency 16, audio is still generated about 2.8× faster than it plays back, and at concurrency 64 mean RTF stays at 0.77. In SGLang-Omni, how the pipeline stages are grouped into processes and placed on GPUs is deployment-time configuration rather than per-model code. Table 2 shows two vocoder placements at higher concurrency, with the vocoder's default GPU share, 1,088 requests per concurrency level, and the average of six server starts. Its throughput also counts the end-of-speech frame that ends each stream.
 
 | Vocoder placement | Concurrency | Throughput (frames/s) | TTFA p50 | TTFA p95 |
 |---|---:|---:|---:|---:|
@@ -253,9 +253,7 @@ A single stream gets its first audio in under 100 ms. At concurrency 16, audio i
 | Second GPU | 128 | 3,692 | 401 ms | 995 ms |
 | Second GPU | 256 | 4,160 | 2,146 ms | 2,469 ms |
 
-*Table 2. Drama 3 streaming performance by vocoder placement. Each cell is the mean of six server starts.*
-
-The single-GPU runs completed 13,054 of 13,056 requests; two returned an empty-audio error. Latency statistics cover successful requests; throughput uses their generated frames over the full measured duration.
+*Table 2. Drama 3 streaming performance by vocoder placement. Each cell is the mean of six server starts. Single-GPU measurements use default model parameters, with 13,054/13,056 requests completed. Second-GPU measurements use synchronous decode (`enable_async_decode=false`).*
 
 Moving the vocoder to a second GPU, as described under [Deployment](https://sgl-project.github.io/sglang-omni/cookbook/fishaudio_drama3.html#deployment), lets it run independently of the engine. Use this layout when you need many concurrent streams and a short time to first audio together.
 

@@ -1640,10 +1640,15 @@ def test_next_token_ids_from_post_decode_outlive_later_steps() -> None:
 
 
 @pytest.mark.parametrize(
-    "has_active_requests", [True, False], ids=["mixed", "all-inactive"]
+    ("inactive_row_indices", "expected_streamed_message_counts"),
+    [
+        pytest.param((1, 2), [1, 0, 0, 0], id="mixed"),
+        pytest.param((0, 1, 2, 3), [0, 0, 0, 0], id="all-inactive"),
+    ],
 )
 def test_a_lookahead_resolve_skips_rows_finished_or_retracted_since_launch(
-    has_active_requests: bool,
+    inactive_row_indices: tuple[int, ...],
+    expected_streamed_message_counts: list[int],
 ) -> None:
     decode = decode_runner(row_count=4)
     requests = decoding_scheduler_requests(decode, [3, 4, 2, 3])
@@ -1679,47 +1684,27 @@ def test_a_lookahead_resolve_skips_rows_finished_or_retracted_since_launch(
         eos_frame,
     ]
     pending_step = launched_step(decode.runner, requests)
-    finished_request = batch_request_data[1].req
-    retracted_request = batch_request_data[2].req
-    assert finished_request is not None and retracted_request is not None
-    finished_request.finished_reason = FINISH_MATCHED_TOKEN(matched=EOS_TOKEN_ID)
-    retracted_request.is_retracted = True
-    if has_active_requests:
-        pass
-    else:
-        first_request = batch_request_data[0].req
-        eos_request = batch_request_data[3].req
-        assert first_request is not None and eos_request is not None
-        first_request.finished_reason = FINISH_MATCHED_TOKEN(matched=EOS_TOKEN_ID)
-        eos_request.is_retracted = True
+    for row_index in inactive_row_indices:
+        inactive_request = batch_request_data[row_index].req
+        assert inactive_request is not None
+        if row_index in (0, 1):
+            inactive_request.finished_reason = FINISH_MATCHED_TOKEN(
+                matched=EOS_TOKEN_ID
+            )
+        else:
+            inactive_request.is_retracted = True
     output = decode.runner.execute_resolve(pending_step)
 
     assert output is not None and output.next_token_ids is not None
     assert output.next_token_ids.tolist() == [90, 91, 92, EOS_TOKEN_ID]
-    if has_active_requests:
-        assert [request_data.frame_rows for request_data in batch_request_data] == [
-            histories[0] + [[90, 1, 1, 1, 1]],
-            histories[1],
-            histories[2],
-            histories[3] + [eos_frame],
-        ]
-        assert [
-            request_data.generation_steps for request_data in batch_request_data
-        ] == [
-            generation_steps[0] + 1,
-            generation_steps[1],
-            generation_steps[2],
-            generation_steps[3] + 1,
-        ]
-        assert streamed_message_counts() == [1, 0, 0, 0]
-    else:
-        assert [request_data.frame_rows for request_data in batch_request_data] == (
-            histories
+    for row_index, request_data in enumerate(batch_request_data):
+        is_active = row_index not in inactive_row_indices
+        expected_frames = [decode.forward.next_frames[row_index]] if is_active else []
+        assert request_data.frame_rows == histories[row_index] + expected_frames
+        assert request_data.generation_steps == generation_steps[row_index] + int(
+            is_active
         )
-        assert [
-            request_data.generation_steps for request_data in batch_request_data
-        ] == generation_steps
-        assert streamed_message_counts() == [0, 0, 0, 0]
+    assert streamed_message_counts() == expected_streamed_message_counts
 
 
 def test_row_indices_upload_only_when_the_batch_order_or_slots_change() -> None:
