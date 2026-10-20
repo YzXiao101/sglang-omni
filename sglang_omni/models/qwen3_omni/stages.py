@@ -58,7 +58,6 @@ from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memor
 from sglang_omni.utils.misc import avail_gpu_mem
 
 if TYPE_CHECKING:
-
     from sglang_omni.models.qwen3_omni.talker_scheduler import QwenTalkerScheduler
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 else:
@@ -1205,6 +1204,7 @@ def create_sglang_thinker_executor_from_config(
     speech_enabled: bool = False,
     total_gpu_memory_fraction: float | None = None,
     enable_async_decode: bool = True,
+    enable_overlap: bool = False,
     async_decode_min_batch_size: int = 1,
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,
@@ -1250,9 +1250,12 @@ def create_sglang_thinker_executor_from_config(
     speculative_algorithm = SpeculativeAlgorithm.from_string(
         overrides.get("speculative_algorithm")
     )
+    if enable_overlap and draft_model_path is None:
+        raise ValueError("enable_overlap requires a speculative_draft_model_path")
+    else:
+        pass
     if draft_model_path is not None:
-        # note (wilsonzheng0327): the draft worker drives a synchronous loop that
-        # verifies whole blocks, so mixed prefill tails and the lookahead stay off.
+        overrides["disable_overlap_schedule"] = not enable_overlap
         if speculative_algorithm.is_none():
             raise ValueError(
                 "speculative_draft_model_path needs a speculative_algorithm"
@@ -1371,6 +1374,7 @@ def create_sglang_thinker_executor_from_config(
         nccl_port=nccl_port,
         total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
         enable_async_decode=enable_async_decode,
+        enable_overlap=enable_overlap,
         async_decode_min_batch_size=async_decode_min_batch_size,
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
