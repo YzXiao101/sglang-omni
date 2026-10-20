@@ -10,6 +10,7 @@ this worker feeds every verify row's history to dspark_sampling.exact_accept.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from threading import Lock
 
 import torch
@@ -68,52 +69,70 @@ class StepSamplingState:
 
 
 class RequestHistories:
-    """Which tokens each request slot has committed, kept on the device.
-
-    A step uploads only the tokens committed since that slot's last step; a slot is
-    cleared when a different request takes it over.
-    """
+    """Committed output history, advanced on the device after each verified block."""
 
     def __init__(self, *, slot_count: int, device: torch.device) -> None:
-        self.presence_by_slot: torch.Tensor = torch.zeros(
+        self.presence_by_slot = torch.zeros(
             (slot_count, TOTAL_VOCAB_SIZE), dtype=torch.bool, device=device
         )
-        self.slot_owners: list[str | None] = [None] * slot_count
-        self.slot_lengths: list[int] = [0] * slot_count
+        self.recent_by_slot = torch.full(
+            (slot_count, COSYVOICE3_RAS_WINDOW_SIZE),
+            EMPTY_HISTORY_TOKEN,
+            dtype=torch.long,
+            device=device,
+        )
+        self.lengths_by_slot = torch.zeros(slot_count, dtype=torch.long, device=device)
+        self.slot_owners: list[int | None] = [None] * slot_count
 
     def presence_mask(self, batch: ScheduleBatch) -> torch.Tensor:
-        cleared_slots: list[int] = []
-        update_slots: list[int] = []
-        update_tokens: list[int] = []
         for request in batch.reqs:
             slot = request.kv.req_pool_idx
-            output_ids = request.output_ids
-            # Every step grows a request's outputs, so a length that did not grow
-            # means a new request reused the id.
-            if self.slot_owners[slot] != request.rid or self.slot_lengths[slot] >= len(
-                output_ids
-            ):
-                cleared_slots.append(slot)
-                self.slot_owners[slot] = request.rid
-                synced_length = 0
+            if self.slot_owners[slot] == id(request):
+                continue
             else:
-                synced_length = self.slot_lengths[slot]
-            update_tokens.extend(output_ids[synced_length:])
-            update_slots.extend([slot] * (len(output_ids) - synced_length))
-            self.slot_lengths[slot] = len(output_ids)
-        device = self.presence_by_slot.device
-        if cleared_slots:
-            self.presence_by_slot[torch.tensor(cleared_slots, device=device)] = False
-        else:
-            pass
-        if update_tokens:
+                self.slot_owners[slot] = id(request)
+            output_ids = list(request.output_ids)
+            device = self.presence_by_slot.device
+            self.presence_by_slot[slot] = False
             self.presence_by_slot[
-                torch.tensor(update_slots, device=device),
-                torch.tensor(update_tokens, dtype=torch.long, device=device),
+                slot, torch.tensor(output_ids, dtype=torch.long, device=device)
             ] = True
-        else:
-            pass
+            recent = output_ids[-COSYVOICE3_RAS_WINDOW_SIZE:]
+            self.recent_by_slot[slot] = torch.tensor(
+                [EMPTY_HISTORY_TOKEN] * (COSYVOICE3_RAS_WINDOW_SIZE - len(recent))
+                + recent,
+                dtype=torch.long,
+                device=device,
+            )
+            self.lengths_by_slot[slot] = len(output_ids)
         return self.presence_by_slot[batch.req_pool_indices]
+
+    def commit(
+        self,
+        slots: torch.Tensor,
+        tokens: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> None:
+        """Append valid outputs, including the bonus; padding never enters history."""
+        lengths = lengths.to(torch.long)
+        valid = (
+            torch.arange(tokens.shape[1], device=tokens.device)[None, :]
+            < lengths[:, None]
+        )
+        safe_tokens = tokens.long().masked_fill(~valid, 0)
+        presence = self.presence_by_slot[slots]
+        # note (Codex): CUDA amax scatter requires a numeric dtype, even for 0/1 data.
+        presence.view(torch.uint8).scatter_reduce_(
+            1, safe_tokens, valid.view(torch.uint8), reduce="amax", include_self=True
+        )
+        self.presence_by_slot[slots] = presence
+        combined = torch.cat((self.recent_by_slot[slots], tokens), dim=1)
+        offsets = (
+            lengths[:, None]
+            + torch.arange(COSYVOICE3_RAS_WINDOW_SIZE, device=tokens.device)[None, :]
+        )
+        self.recent_by_slot[slots] = combined.gather(1, offsets)
+        self.lengths_by_slot[slots] += lengths
 
 
 def build_step_sampling_state(
@@ -123,30 +142,18 @@ def build_step_sampling_state(
 ) -> StepSamplingState:
     """Collect each running request's committed history and sampling parameters."""
     device = sampling_info.temperatures.device
-    recent_tokens = torch.tensor(
-        [
-            [EMPTY_HISTORY_TOKEN]
-            * (
-                COSYVOICE3_RAS_WINDOW_SIZE
-                - len(request.output_ids[-COSYVOICE3_RAS_WINDOW_SIZE:])
-            )
-            + list(request.output_ids[-COSYVOICE3_RAS_WINDOW_SIZE:])
-            for request in batch.reqs
-        ],
-        dtype=torch.long,
-    )
-    # One host-to-device copy carries the three per-request values.
+    presence = histories.presence_mask(batch)
     request_values = torch.tensor(
         [
             [
                 request.sampling_params.repetition_penalty,
-                len(request.output_ids),
                 request.sampling_params.min_new_tokens,
             ]
             for request in batch.reqs
         ],
         dtype=torch.float64,
-    ).to(device)
+        device=device,
+    )
     top_ks = sampling_info.top_ks.view(-1)
     top_ps = sampling_info.top_ps.view(-1).float()
     if not (sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling):
@@ -156,14 +163,14 @@ def build_step_sampling_state(
         pass
     return StepSamplingState(
         draft=DraftSamplingState(
-            presence_mask=histories.presence_mask(batch),
+            presence_mask=presence,
             repetition_penalties=request_values[:, 0].float(),
-            output_lengths=request_values[:, 1].long(),
-            min_new_tokens=request_values[:, 2].long(),
+            output_lengths=histories.lengths_by_slot[batch.req_pool_indices],
+            min_new_tokens=request_values[:, 1].long(),
             temperatures=sampling_info.temperatures.view(-1).float(),
             greedy=top_ks == 1,
         ),
-        recent_tokens=recent_tokens.to(device),
+        recent_tokens=histories.recent_by_slot[batch.req_pool_indices],
         top_ks=top_ks,
         top_ps=top_ps,
     )
@@ -443,7 +450,7 @@ class FunCosyVoice3DSparkWorker(DSparkWorkerV2):
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
-        on_publish: None = None,
+        on_publish: partial[None] | None = None,
         grammar_barrier: None = None,
         *,
         pp_proxy_tensors: PPProxyTensors | None = None,
@@ -472,10 +479,20 @@ class FunCosyVoice3DSparkWorker(DSparkWorkerV2):
             self.draft_model.markov_head.sampling_state = state.draft
             self.exact_verify_executor.step_state = state
         else:
-            pass
-        return super().forward_batch_generation(
+            for request in batch.reqs:
+                self.request_histories.slot_owners[request.kv.req_pool_idx] = None
+        result = super().forward_batch_generation(
             batch,
             on_publish,
             grammar_barrier,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if is_decode:
+            self.request_histories.commit(
+                batch.req_pool_indices,
+                result.next_token_ids.view(len(batch.reqs), -1),
+                result.accept_lens,
+            )
+        else:
+            pass
+        return result

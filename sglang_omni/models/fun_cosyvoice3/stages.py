@@ -1542,6 +1542,7 @@ def create_sglang_tts_engine_executor(
     server_args_overrides: Mapping[str, object] | None = None,
     onnx_intra_op_threads: int = 16,
     token_hop_len: int = TOKEN_HOP_LEN,
+    enable_overlap: bool = False,
 ) -> OmniScheduler[CosyVoice3SGLangRequestData]:
     from sglang_omni.models.fun_cosyvoice3.engine_builder import (
         FunCosyVoice3EngineBuilder,
@@ -1549,6 +1550,7 @@ def create_sglang_tts_engine_executor(
 
     return FunCosyVoice3EngineBuilder(
         token_hop_len=token_hop_len,
+        enable_overlap=enable_overlap,
         onnx_intra_op_threads=onnx_intra_op_threads,
     ).build(
         model_path,

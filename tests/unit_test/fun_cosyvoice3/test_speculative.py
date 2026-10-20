@@ -357,7 +357,8 @@ def test_request_histories_track_each_slot_through_reuse() -> None:
         rid="b", kv=SimpleNamespace(req_pool_idx=1), output_ids=array("q", [3])
     )
     assert presence(first, second) == [[7, 9], [3]]
-    first.output_ids.extend([9, 11])
+    histories.commit(torch.tensor([2]), torch.tensor([[9, 11, -1]]), torch.tensor([2]))
+    assert list(first.output_ids) == [7, 9]
     assert presence(first) == [[7, 9, 11]]
     # A new request on a freed slot starts from an empty history.
     reused = SimpleNamespace(
@@ -581,3 +582,100 @@ def test_fa3_lays_out_a_dspark_draft_batch_at_the_draft_width(
     FlashAttentionBackend.__init__(backend, model_runner)
 
     assert backend.speculative_num_draft_tokens == expected_rows_per_request
+
+
+@pytest.mark.parametrize("block_width", [1, 4, 17])
+def test_device_history_matches_committed_prefix_with_host_one_round_behind(
+    block_width: int,
+) -> None:
+    histories = RequestHistories(slot_count=4, device=torch.device("cpu"))
+    requests = [
+        SimpleNamespace(
+            rid=str(slot),
+            kv=SimpleNamespace(req_pool_idx=slot),
+            output_ids=array("q", [slot + 7]),
+        )
+        for slot in [2, 0, 3]
+    ]
+    expected = {
+        request.kv.req_pool_idx: list(request.output_ids) for request in requests
+    }
+    generator = torch.Generator().manual_seed(101)
+    for step in range(30):
+        requests = requests[1:] + requests[:1]
+        slots = torch.tensor([request.kv.req_pool_idx for request in requests])
+        batch = SimpleNamespace(reqs=requests, req_pool_indices=slots)
+        before = histories.presence_mask(batch)
+        for row, slot in enumerate(slots.tolist()):
+            assert before[row].nonzero().flatten().tolist() == sorted(
+                set(expected[slot])
+            )
+        tokens = torch.randint(0, 32, (3, block_width), generator=generator)
+        lengths = torch.tensor([(step + row) % block_width + 1 for row in range(3)])
+        tokens[torch.arange(block_width)[None, :] >= lengths[:, None]] = -1
+        histories.commit(slots, tokens, lengths)
+        for row, request in enumerate(requests):
+            slot = request.kv.req_pool_idx
+            request.output_ids = array("q", expected[slot])
+            expected[slot].extend(tokens[row, : lengths[row]].tolist())
+            assert histories.lengths_by_slot[slot].item() == len(expected[slot])
+            recent = expected[slot][-10:]
+            assert (
+                histories.recent_by_slot[slot].tolist()
+                == [-1] * (10 - len(recent)) + recent
+            )
+            assert histories.presence_by_slot[
+                slot
+            ].nonzero().flatten().tolist() == sorted(set(expected[slot]))
+
+
+def test_device_history_discards_overrun_after_reprefill_and_same_id_slot_reuse() -> (
+    None
+):
+    histories = RequestHistories(slot_count=1, device=torch.device("cpu"))
+    request = SimpleNamespace(
+        rid="same", kv=SimpleNamespace(req_pool_idx=0), output_ids=array("q", [8])
+    )
+    batch = SimpleNamespace(reqs=[request], req_pool_indices=torch.tensor([0]))
+    histories.presence_mask(batch)
+    histories.commit(
+        batch.req_pool_indices, torch.tensor([[9, 10, -1]]), torch.tensor([2])
+    )
+    # Re-prefill has retained only the externally committed prefix, then sampled again.
+    request.output_ids = array("q", [8, 9, 12])
+    histories.slot_owners[0] = None
+    assert histories.presence_mask(batch)[0].nonzero().flatten().tolist() == [8, 9, 12]
+    assert histories.lengths_by_slot.tolist() == [3]
+    replacement = SimpleNamespace(
+        rid="same", kv=SimpleNamespace(req_pool_idx=0), output_ids=array("q", [5])
+    )
+    batch.reqs = [replacement]
+    assert histories.presence_mask(batch)[0].nonzero().flatten().tolist() == [5]
+    assert histories.recent_by_slot[0].tolist() == [-1] * 9 + [5]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
+        ),
+    ],
+)
+def test_device_history_ignores_padding_that_aliases_a_real_token(device) -> None:
+    histories = RequestHistories(slot_count=1, device=device)
+    histories.commit(
+        torch.tensor([0], device=device),
+        torch.tensor([[0, -1, 0]], device=device),
+        torch.tensor([1], device=device),
+    )
+    assert histories.presence_by_slot[0, 0].item()
+    assert histories.presence_by_slot.sum().item() == 1
+    assert histories.recent_by_slot[0].tolist() == [-1] * 9 + [0]

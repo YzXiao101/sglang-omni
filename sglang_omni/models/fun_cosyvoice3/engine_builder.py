@@ -27,12 +27,15 @@ from sglang_omni.models.fun_cosyvoice3.utils import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.bootstrap import InfrastructureOptions
-from sglang_omni.scheduling.engine_factory import GenerationDefaults, TtsEngineBuilder
+from sglang_omni.scheduling.engine_factory import (
+    GenerationDefaults,
+    SchedulerExtras,
+    TtsEngineBuilder,
+)
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 if TYPE_CHECKING:
-
     from sglang_omni.models.fun_cosyvoice3.model_runner import FunCosyVoice3ModelRunner
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 else:
@@ -51,8 +54,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         *,
         token_hop_len: int = TOKEN_HOP_LEN,
         onnx_intra_op_threads: int = 16,
+        enable_overlap: bool = False,
     ) -> None:
         super().__init__()
+        self.enable_overlap = enable_overlap
         hop = int(token_hop_len)
         if hop <= 0:
             raise ValueError(f"token_hop_len must be positive, got {token_hop_len}")
@@ -91,7 +96,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             return {
                 "max_running_requests": 1,
                 "disable_cuda_graph": True,
-                "disable_overlap_schedule": True,
+                "disable_overlap_schedule": not self.enable_overlap,
                 "disable_radix_cache": True,
                 "enable_torch_compile": False,
                 "max_prefill_tokens": self.context_length,
@@ -109,7 +114,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             "torch_compile_max_bs": 32,
             "dtype": dtype,
             "disable_cuda_graph": False,
-            "disable_overlap_schedule": True,
+            "disable_overlap_schedule": not self.enable_overlap,
             "enable_torch_compile": False,
             "mem_fraction_static": 0.85,
             "max_prefill_tokens": 4096,
@@ -126,7 +131,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         )
         speculative_reserve_tokens = 0
         if draft_model_path is None:
-            if not speculative_algorithm.is_none():
+            if self.enable_overlap or not speculative_algorithm.is_none():
                 raise ValueError(
                     "Fun-CosyVoice3 speculative decoding needs "
                     "speculative_draft_model_path"
@@ -276,6 +281,9 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         )
 
         return {"speculative_worker_class": FunCosyVoice3DSparkWorker}
+
+    def extra_scheduler_kwargs(self) -> SchedulerExtras[CosyVoice3SGLangRequestData]:
+        return {"enable_overlap": self.enable_overlap}
 
     def make_abort_callback(self) -> Callable[[str], None]:
         return request_builders.cleanup_prepared_cosyvoice3_request
