@@ -98,7 +98,9 @@ def test_custom_omni_forward_publishes_sglang_forward_context():
         assert kwargs["input_deepstack_embeds"] is None
         return torch.ones(1, 2)
 
-    def logits_processor(input_ids, hidden_states, lm_head, forward_batch):
+    def logits_processor(
+        input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states=None
+    ):
         seen.append(get_forward_context().attn_backend)
         assert input_ids is forward_batch.input_ids
         assert lm_head == "lm_head"
