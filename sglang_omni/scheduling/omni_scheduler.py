@@ -24,6 +24,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
+from functools import partial
 from itertools import islice
 from typing import Callable, Generic
 
@@ -34,7 +35,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.overlap_utils import (
+    RelayPayload,
+    decide_needs_cpu_seq_lens,
+    resolve_forward_inputs,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -309,6 +314,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     session_bridge: ARSessionBridge | None = None
     scheduler_thread_id: int | None = None
+    overlap_device_drained: bool = True
     previous_pending_decode: PendingDecode | None = None
     async_decode_resolve_before_prefill: bool = False
     draft_worker: BaseSpecWorker | None = None
@@ -535,6 +541,10 @@ class OmniScheduler(Generic[RequestDataT]):
         # decode batch, or None. Tracked here (not just a loop local) so abort
         # can reach the in-flight step. See _event_loop_async_decode.
         self.async_pending: PendingDecode | None = None
+        self.overlap_results: deque[tuple[ScheduleBatch, GenerationBatchResult]] = (
+            deque()
+        )
+        self.overlap_device_drained = True
         self.previous_pending_decode = None
         self.forward_ct = 0
         self.return_health_check_ct = 0
@@ -615,6 +625,10 @@ class OmniScheduler(Generic[RequestDataT]):
 
         self.draft_worker = tp_worker.speculative_worker
         if self.draft_worker is None:
+            if self.enable_overlap:
+                raise ValueError("enable_overlap requires a native speculative worker")
+            else:
+                pass
             self.spec_algorithm = SpeculativeAlgorithm.NONE
         elif session_adapter is not None:
             raise ValueError("speculative decoding does not support sessions")
@@ -622,19 +636,37 @@ class OmniScheduler(Generic[RequestDataT]):
             raise ValueError(
                 "speculative decoding verifies whole blocks; disable enable_mixed_chunk"
             )
-        elif self.enable_overlap or self.enable_async_decode:
+        elif self.enable_async_decode:
             raise ValueError(
-                "speculative decoding runs the synchronous loop; disable "
-                "enable_overlap and enable_async_decode"
+                "speculative decoding requires enable_async_decode=False; "
+                "use enable_overlap for speculative lookahead"
             )
         else:
             self.spec_algorithm = SpeculativeAlgorithm.from_string(
                 get_spec().speculative_algorithm
             )
+        if self.enable_overlap:
+            if self.pp_size != 1:
+                raise ValueError(
+                    "speculative overlap requires pipeline_parallel_size=1"
+                )
+            elif server_args.disable_overlap_schedule:
+                raise ValueError(
+                    "enable_overlap requires disable_overlap_schedule=False"
+                )
+            else:
+                pass
+            needs_cpu_seq_lens = decide_needs_cpu_seq_lens(
+                self.draft_worker.spec_v2_attn_backends
+            )
+            self.batch_record_ct = 0
+            self.batch_record_buf = [None, None]
+        else:
+            needs_cpu_seq_lens = True
         self.future_map = self.spec_algorithm.create_future_map(
             torch.device(self.device),
             self.req_to_token_pool,
-            needs_cpu_seq_lens=True,
+            needs_cpu_seq_lens=needs_cpu_seq_lens,
         )
         self.dllm_config = None
         self.execution_bridge = None
@@ -864,10 +896,12 @@ class OmniScheduler(Generic[RequestDataT]):
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
@@ -888,8 +922,8 @@ class OmniScheduler(Generic[RequestDataT]):
         )
         self.output_streamer = types.SimpleNamespace(
             stream_output=self.stream_output,
-            _stream_output_generation=lambda reqs, return_logprob, **_kwargs: self.stream_output(
-                reqs, return_logprob
+            _stream_output_generation=lambda reqs, return_logprob, **_kwargs: (
+                self.stream_output(reqs, return_logprob)
             ),
         )
         self.init_beam_coordinator()
@@ -2094,8 +2128,11 @@ class OmniScheduler(Generic[RequestDataT]):
         try:
             return self._run_batch(batch, pp_proxy_tensors)
         except Exception as exc:
-            self.handle_batch_failure(batch, exc)
-            return _FAILED_BATCH_RESULT
+            if self.enable_overlap:
+                raise
+            else:
+                self.handle_batch_failure(batch, exc)
+                return _FAILED_BATCH_RESULT
 
     def process_batch_result(self, batch, result) -> None:
         _Upstream.process_batch_result(self, batch, result)
@@ -2162,24 +2199,47 @@ class OmniScheduler(Generic[RequestDataT]):
         return self.make_batch_result(mr_output)
 
     def run_speculative_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """Drive the draft worker synchronously, as the scheduler does without overlap.
-
-        Tokens are emitted later by stream_output, once finishing trims them at the stop.
-        """
+        """Run one verified block; result processing owns committed-token emission."""
         if batch.forward_mode.is_extend():
             # note (wilsonzheng0327): a re-prefilled request samples its next token
             # here, and speculative decode never cumulates penalty history.
             self.model_runner.restore_output_penalty_history(batch)
         else:
             pass
+        if self.enable_overlap:
+            self.overlap_device_drained = False
+            self.future_map.resolve_seq_lens_cpu(batch)
+        else:
+            pass
         resolve_forward_inputs(batch, self.future_map)
         with _Upstream._forward_isolation(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            self, batch, overlap=False
+            self, batch, overlap=self.enable_overlap
         ):
-            result = self.draft_worker.forward_batch_generation(batch)
+            if self.enable_overlap:
+                result = self.draft_worker.forward_batch_generation(
+                    batch,
+                    on_publish=partial(self.future_map.publish, batch.req_pool_indices),
+                )
+                self.future_map.stash(
+                    batch.req_pool_indices,
+                    RelayPayload.from_draft_input(result.next_draft_input),
+                )
+                if result.extra_keep_alive_refs:
+                    self.batch_record_buf[self.batch_record_ct].extend(
+                        result.extra_keep_alive_refs
+                    )
+                else:
+                    pass
+            else:
+                result = self.draft_worker.forward_batch_generation(batch)
         batch.spec_info = result.next_draft_input
         new_sequence_lengths = result.new_seq_lens
-        if (
+        if self.enable_overlap:
+            batch.spec_info.future_dsa_topk_indices_available = (
+                batch.spec_info.dsa_topk_indices is not None
+            )
+            batch.spec_info.future_indices = batch.req_pool_indices
+        elif (
             new_sequence_lengths is not None
             and new_sequence_lengths is not batch.seq_lens
         ):
@@ -2688,12 +2748,19 @@ class OmniScheduler(Generic[RequestDataT]):
             if self.enable_async_decode:
                 self.event_loop_async_decode()
             elif self.enable_overlap:
+                self.overlap_device_drained = False
                 self.event_loop_overlap()
             else:
                 self.event_loop_normal()
             model_path_status = "aborted"
         finally:
             try:
+                if self.enable_overlap:
+                    self.device_module.current_stream().synchronize()
+                    self.overlap_device_drained = True
+                    self.resolve_pending_overlap()
+                else:
+                    pass
                 if self.session_bridge is not None:
                     self.resolve_pending_async()
                     self.session_bridge.close_open_sessions()
@@ -2706,18 +2773,24 @@ class OmniScheduler(Generic[RequestDataT]):
                     self.shutdown_request_build_executor()
                 finally:
                     self.discard_pending_request_admissions()
-                    self.shutdown_resources()
+                    if not self.enable_overlap or self.overlap_device_drained:
+                        self.shutdown_resources()
+                    else:
+                        logger.error("GPU drain failed; restart the stage before reuse")
 
     def event_loop(self) -> None:
         self.start()
 
     def stop(self) -> None:
         self.running = False
-        retains_scheduler_thread = (
-            self.session_bridge is not None and self.scheduler_thread_id is not None
+        retains_scheduler_thread = self.scheduler_thread_id is not None and (
+            self.session_bridge is not None or self.enable_overlap
         )
         if retains_scheduler_thread:
             # note (Junnan Li): Cleanup runs on the scheduler thread after it drains GPU work.
+            return
+        elif not self.overlap_device_drained:
+            logger.error("GPU drain failed; restart the stage before reuse")
             return
         else:
             if self.session_bridge is not None:
@@ -2754,7 +2827,7 @@ class OmniScheduler(Generic[RequestDataT]):
         if (
             self.scheduler_thread_id is not None
             and self.scheduler_thread_id != threading.get_ident()
-            and (bridge is not None or self.tp_size > 1)
+            and (bridge is not None or self.tp_size > 1 or self.enable_overlap)
         ):
             # note (Richard Wang): every TP rank must drop a request in the same
             # pass, so the entry rank broadcast carries it and followers skip theirs.
@@ -3027,6 +3100,7 @@ class OmniScheduler(Generic[RequestDataT]):
             self._engine_paused = True  # noqa: leading-underscore
             self.last_pause_mode = mode
             self.resolve_pending_async()
+            self.resolve_pending_overlap()
             num_paused = 0
             if mode == "abort":
                 num_paused = len(self.abort_all_requests())
@@ -3306,12 +3380,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # note (Richard Wang): a request whose build waits for upstream chunks
         # is owned here too, so abort all and the active request check see it.
         request_ids.update(list(self.deferred_request_payloads))
-        for batch in (
-            self.running_batch,
-            self.cur_batch,
-            self.last_batch,
-            self.async_pending_batch(),
-        ):
+        for batch in self.request_batches():
             if batch is None:
                 continue
             else:
@@ -3391,15 +3460,19 @@ class OmniScheduler(Generic[RequestDataT]):
     def empty_torch_cache() -> None:
         current_platform.empty_cache()
 
-    def mark_running_request_aborted(self, request_id: str) -> bool:
-        marked = False
-        seen: set[int] = set()
-        for batch in (
+    def request_batches(self) -> tuple[ScheduleBatch | None, ...]:
+        return (
             self.running_batch,
             self.cur_batch,
             self.last_batch,
             self.async_pending_batch(),
-        ):
+            *(batch for batch, _ in self.overlap_results),
+        )
+
+    def mark_running_request_aborted(self, request_id: str) -> bool:
+        marked = False
+        seen: set[int] = set()
+        for batch in self.request_batches():
             if batch is None or id(batch) in seen:
                 continue
             else:
@@ -3435,12 +3508,7 @@ class OmniScheduler(Generic[RequestDataT]):
         """Make immediate cleanup visible without rewriting prepared batches."""
         matches = []
         seen: set[int] = set()
-        for batch in (
-            self.running_batch,
-            self.cur_batch,
-            self.last_batch,
-            self.async_pending_batch(),
-        ):
+        for batch in self.request_batches():
             if batch is None:
                 continue
             else:
@@ -3536,23 +3604,78 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 pass
 
+    @DynamicGradMode()
     def event_loop_overlap(self) -> None:
-        # Model runners read Req.inflight_middle_chunks at forward time under
-        # a same-iteration process_batch_result contract. On this loop the
-        # decrement lags one iteration, so a final prefill chunk still reads
-        # as a middle chunk at forward time and the TTS model runners emit
-        # wrong chunk boundaries — silently. No construction site enables
-        # overlap today; refuse to run rather than corrupt chunked prefill if
-        # one ever does.
-        # The pre-guard loop body lives in git history ("Refuse the
-        # OmniScheduler overlap event loop"); reviving it needs that drain,
-        # not just deleting this raise.
-        raise NotImplementedError(
-            "OmniScheduler's overlap event loop is unsupported: "
-            "Req.inflight_middle_chunks lags one iteration on this loop. "
-            "Drain the result queue before the forward, then remove this "
-            "guard."
-        )
+        """Submit the next verified block before processing the previous result.
+
+        All device work shares one stream, including cache updates and reclamation.
+        Prefill keeps same-iteration result processing for model hooks.
+        """
+        while self.running:
+            self.process_admin_requests()
+            recv_reqs = self.recv_requests()
+            recv_reqs.extend(self.take_deferred_request_payloads())
+            self.process_input_requests(recv_reqs)
+            if (
+                self._engine_paused
+            ):  # noqa: leading-underscore  # existing scheduler state
+                self.resolve_pending_overlap()
+                time.sleep(0.001)
+                continue
+            else:
+                pass
+
+            if self.is_prefill_expected() or any(
+                request.grammar is not None for request in self.running_batch.reqs
+            ):
+                self.resolve_pending_overlap()
+            else:
+                pass
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            if batch is None:
+                self.resolve_pending_overlap()
+                self._sched_idled = (
+                    True  # noqa: leading-underscore  # existing scheduler state
+                )
+                self.self_check_during_idle()
+                self.sleep_during_idle()
+            else:
+                # note (Codex): Grammar masks need the preceding committed CPU state.
+                synchronous = (
+                    batch.forward_mode.is_extend()
+                    or batch.is_extend_in_batch
+                    or any(request.grammar is not None for request in batch.reqs)
+                )
+                if synchronous:
+                    self.resolve_pending_overlap()
+                    batch = self.drop_stale_overrun(batch)
+                    self.cur_batch = batch
+                else:
+                    pass
+                if batch is not None:
+                    result = self.run_batch(batch)
+                    self.overlap_results.append((batch.copy(), result))
+                    if synchronous:
+                        self.resolve_pending_overlap()
+                    elif len(self.overlap_results) > 1:
+                        previous_batch, previous_result = self.overlap_results.popleft()
+                        self.process_batch_result(previous_batch, previous_result)
+                    else:
+                        pass
+                else:
+                    pass
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+            else:
+                pass
+
+    def resolve_pending_overlap(self) -> None:
+        """Commit pending results before prefill, pause, or shutdown."""
+        while self.overlap_results:
+            batch, result = self.overlap_results.popleft()
+            self.process_batch_result(batch, result)
 
     @staticmethod
     def batch_is_decode(batch: ScheduleBatch) -> bool:
@@ -4001,12 +4124,7 @@ class OmniScheduler(Generic[RequestDataT]):
         self, request_id: str
     ) -> RequestDataT | SGLangARRequestData | None:
         # Scan all batches a live req can sit in during prefill→decode handoff.
-        for batch in (
-            self.running_batch,
-            self.cur_batch,
-            self.last_batch,
-            self.async_pending_batch(),
-        ):
+        for batch in self.request_batches():
             if batch is None:
                 continue
             else:

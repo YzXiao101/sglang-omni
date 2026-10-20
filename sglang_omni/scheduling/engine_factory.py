@@ -82,6 +82,7 @@ class GenerationDefaults(GenerationBatchSizeCaps):
 class SchedulerExtras(TypedDict, Generic[RequestDataT], total=False):
     stream_output_builder: StreamOutputBuilder[RequestDataT] | None
     enable_async_decode: bool
+    enable_overlap: bool
     async_decode_min_batch_size: int
     async_decode_resolve_before_prefill: bool
     prefill_coalesce_requests: int

@@ -94,6 +94,9 @@ def init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler.backlogged_request_build_payloads = deque()
     scheduler.request_build_max_pending_observed = 0
     scheduler.async_pending = None
+    scheduler.overlap_results = deque()
+    scheduler.enable_overlap = False
+    scheduler.overlap_device_drained = True
     scheduler.enable_priority_scheduling = False
     scheduler.abort_on_priority_when_disabled = False
     scheduler.processed_tokens_counter = 0
@@ -1835,6 +1838,7 @@ def test_speculative_stream_output_emits_each_committed_token_before_the_result(
     req.output_ids = [5, 6, 7, 9, 8, 8]
     req.output_ids_through_stop = [5, 6, 7, 9]
     scheduler.stream_output([req])
+    scheduler.stream_output([req])
 
     assert calls == [
         ("runner", [6, 7]),
@@ -3250,7 +3254,7 @@ def test_request_build_backlog_honors_configured_queue_limit(monkeypatch) -> Non
     ("enable_overlap", "enable_async_decode", "bind_late"),
     [
         (False, True, False),
-        (True, False, False),
+        (False, False, False),
         (False, True, True),
     ],
 )
@@ -4050,3 +4054,157 @@ def test_prefill_end_emission_skips_when_no_request_is_pending(
     scheduler.emit_prefill_end_for_batch(batch)
     assert emitted == ["r2"]
     assert scheduler.prefill_end_done == {"r1", "r2"}
+
+
+def test_speculative_overlap_launches_next_before_committing_previous(
+    monkeypatch,
+) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.running = True
+    scheduler.overlap_results = deque()
+    scheduler.running_batch = SimpleNamespace(reqs=[])
+    scheduler._engine_paused = False  # noqa: leading-underscore  # scheduler fixture
+    scheduler.process_admin_requests = lambda: None
+    scheduler.recv_requests = lambda: []
+    scheduler.take_deferred_request_payloads = lambda: []
+    scheduler.process_input_requests = lambda requests: None
+    scheduler.is_prefill_expected = lambda: False
+    scheduler.self_check_during_idle = lambda: None
+    order = []
+    mode = SimpleNamespace(is_extend=lambda: False)
+    requests = [SimpleNamespace(grammar=None)]
+    batches = deque(
+        [
+            SimpleNamespace(
+                name="first", forward_mode=mode, is_extend_in_batch=False, reqs=requests
+            ),
+            SimpleNamespace(
+                name="second",
+                forward_mode=mode,
+                is_extend_in_batch=False,
+                reqs=requests,
+            ),
+            None,
+        ]
+    )
+    for batch in list(batches)[:2]:
+        batch.copy = lambda batch=batch: batch
+    scheduler.get_next_batch_to_run = batches.popleft
+    scheduler.run_batch = lambda batch: order.append("launch-" + batch.name)
+    scheduler.process_batch_result = lambda batch, result: order.append(
+        "commit-" + batch.name
+    )
+    scheduler.sleep_during_idle = lambda: setattr(scheduler, "running", False)
+    monkeypatch.setattr(
+        envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, "get", lambda: False
+    )
+    scheduler.event_loop_overlap()
+    assert order == ["launch-first", "launch-second", "commit-first", "commit-second"]
+    assert not scheduler.overlap_results
+
+
+def test_speculative_overlap_drains_before_prefill_selection(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.running = True
+    scheduler.running_batch = SimpleNamespace(reqs=[])
+    scheduler._engine_paused = False  # noqa: leading-underscore  # scheduler fixture
+    request = SimpleNamespace(grammar=None, inflight_middle_chunks=1)
+    mode = SimpleNamespace(is_extend=lambda: True)
+    batch = SimpleNamespace(reqs=[request], forward_mode=mode, is_extend_in_batch=True)
+    batch.copy = lambda: batch
+    scheduler.overlap_results = deque([(batch, None)])
+    scheduler.process_admin_requests = lambda: None
+    scheduler.recv_requests = lambda: []
+    scheduler.take_deferred_request_payloads = lambda: []
+    scheduler.process_input_requests = lambda requests: None
+    scheduler.is_prefill_expected = lambda: True
+    order = []
+
+    def commit(batch, result):
+        request.inflight_middle_chunks = 0
+        order.append("commit")
+
+    def select():
+        assert request.inflight_middle_chunks == 0
+        order.append("select")
+        return batch
+
+    def forward(batch):
+        assert request.inflight_middle_chunks == 0
+        order.append("forward")
+        scheduler.running = False
+
+    scheduler.process_batch_result = commit
+    scheduler.get_next_batch_to_run = select
+    scheduler.drop_stale_overrun = lambda batch: batch
+    scheduler.run_batch = forward
+    monkeypatch.setattr(
+        envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, "get", lambda: False
+    )
+    scheduler.event_loop_overlap()
+    assert order == ["commit", "select", "forward", "commit"]
+    assert not scheduler.overlap_results
+
+
+def test_speculative_overlap_stop_leaves_cleanup_to_scheduler_thread() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.running = True
+    scheduler.enable_overlap = True
+    scheduler.scheduler_thread_id = threading.get_ident()
+    scheduler.shutdown_resources = Mock()
+    scheduler.stop()
+    assert scheduler.running is False
+    scheduler.shutdown_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("drain_fails", [False, True])
+def test_speculative_overlap_failure_drains_before_resource_cleanup(
+    drain_fails,
+) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = True
+    scheduler.enable_async_decode = False
+    scheduler.overlap_device_drained = False
+    scheduler.overlap_results = deque()
+    order = []
+
+    def fail_forward():
+        raise RuntimeError("forward failed")
+
+    def drain():
+        order.append("drain")
+        if drain_fails:
+            raise RuntimeError("device failed")
+
+    scheduler.event_loop_overlap = fail_forward
+    scheduler.device_module = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(synchronize=drain)
+    )
+    scheduler.emit_remaining_model_path_ends = lambda **kwargs: order.append("terminal")
+    scheduler.shutdown_request_build_executor = lambda: None
+    scheduler.discard_pending_request_admissions = lambda: None
+    scheduler.shutdown_resources = lambda: order.append("release")
+    with pytest.raises(
+        RuntimeError, match="device failed" if drain_fails else "forward failed"
+    ):
+        scheduler.start()
+    assert order == (
+        ["drain", "terminal"] if drain_fails else ["drain", "terminal", "release"]
+    )
+    assert scheduler.scheduler_thread_id is None
+
+
+def test_speculative_overlap_pending_request_remains_visible_to_lifecycle() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    payload = SimpleNamespace(value="pending")
+    request = SimpleNamespace(rid="pending-request", omni_data=payload)
+    pending_batch = SimpleNamespace(reqs=[request])
+    scheduler.running_batch = SimpleNamespace(reqs=[])
+    scheduler.cur_batch = None
+    scheduler.last_batch = None
+    scheduler.async_pending = None
+    scheduler.overlap_results = deque([(pending_batch, None)])
+    scheduler.waiting_queue = []
+    assert scheduler.find_request_data("pending-request") is payload
+    scheduler.overlap_results.clear()
+    assert scheduler.find_request_data("pending-request") is None
