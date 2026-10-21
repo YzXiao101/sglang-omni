@@ -104,17 +104,9 @@ class OutgoingMessage:
 upstream scheduler. The goal is to reuse SGLang's
 batch selection, KV cache management, prefill/decode scheduling, and tree cache
 while keeping SGLang-Omni's transport, request objects, and streaming behavior
-outside the upstream scheduler.
-
-Stages with a native speculative worker can opt into decode overlap with
-`factory.enable_overlap: true`. The scheduler submits the next GPU round before
-processing the preceding CPU result; the worker still owns proposal, verification,
-acceptance and KV updates. Prefill drains pending results so model hooks see the
-current `Req.inflight_middle_chunks`. The main execution path uses one device stream
-for scheduling, forward and result copies. This experimental option defaults to
-false and excludes sessions, mixed prefill/decode and pipeline parallelism greater
-than one. Model-specific sampling state must advance with accepted GPU tokens,
-without waiting for CPU output processing.
+outside the upstream scheduler. (Overlap scheduling is explicitly unsupported:
+`OmniScheduler._event_loop_overlap` refuses to run because the
+`Req.inflight_middle_chunks` decrement would lag one iteration on that loop.)
 
 ### SimpleScheduler
 
