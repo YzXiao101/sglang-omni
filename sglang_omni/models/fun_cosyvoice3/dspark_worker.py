@@ -78,6 +78,10 @@ class SequenceTokenCountPublisher(Protocol):
     ) -> None: ...
 
 
+class GrammarStateAdvancer(Protocol):
+    def __call__(self) -> None: ...
+
+
 class RequestHistories:
     """Committed output history, advanced on the device after each verified block."""
 
@@ -96,7 +100,7 @@ class RequestHistories:
         )
         self.slot_owners: list[int | None] = [None] * slot_count
 
-    def presence_mask(self, batch: ScheduleBatch) -> torch.Tensor:
+    def ensure_initialized(self, batch: ScheduleBatch) -> None:
         for request in batch.reqs:
             request_pool_index = request.kv.req_pool_idx
             if self.slot_owners[request_pool_index] == id(request):
@@ -119,6 +123,9 @@ class RequestHistories:
                 device=device,
             )
             self.output_token_counts_by_slot[request_pool_index] = len(output_token_ids)
+
+    def presence_mask(self, batch: ScheduleBatch) -> torch.Tensor:
+        self.ensure_initialized(batch)
         return self.presence_by_slot[batch.req_pool_indices]
 
     def commit(
@@ -480,10 +487,11 @@ class FunCosyVoice3DSparkWorker(DSparkWorkerV2):
         self,
         batch: ScheduleBatch,
         on_publish: SequenceTokenCountPublisher | None = None,
-        grammar_barrier: None = None,
+        grammar_barrier: GrammarStateAdvancer | None = None,
         *,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> GenerationBatchResult:
+        prefill_token_counts: torch.Tensor | None = None
         is_decode = not (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -507,9 +515,20 @@ class FunCosyVoice3DSparkWorker(DSparkWorkerV2):
             )
             self.draft_model.markov_head.sampling_state = state.draft
             self.exact_verify_executor.step_state = state
-        else:
+        elif not batch.forward_mode.is_idle():
             for request in batch.reqs:
                 self.request_histories.slot_owners[request.kv.req_pool_idx] = None
+            self.request_histories.ensure_initialized(batch)
+            prefill_token_counts = torch.tensor(
+                [
+                    int(request is not batch.chunked_req and not batch.is_prefill_only)
+                    for request in batch.reqs
+                ],
+                dtype=torch.long,
+                device=batch.req_pool_indices.device,
+            )
+        else:
+            pass
         result = super().forward_batch_generation(
             batch,
             on_publish,
@@ -521,6 +540,13 @@ class FunCosyVoice3DSparkWorker(DSparkWorkerV2):
                 batch.req_pool_indices,
                 result.next_token_ids.view(len(batch.reqs), -1),
                 result.accept_lens,
+            )
+        elif prefill_token_counts is not None:
+            # note (Codex): The first decode can launch before CPU prefill commits.
+            self.request_histories.commit(
+                batch.req_pool_indices,
+                result.next_token_ids.view(len(batch.reqs), -1),
+                prefill_token_counts,
             )
         else:
             pass

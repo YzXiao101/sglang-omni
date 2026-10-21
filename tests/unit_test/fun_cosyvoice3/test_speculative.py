@@ -35,6 +35,7 @@ from sglang_omni.models.fun_cosyvoice3.dspark_sampling import (
 )
 from sglang_omni.models.fun_cosyvoice3.dspark_worker import (
     FunCosyVoice3DSparkWorker,
+    GrammarStateAdvancer,
     RequestHistories,
     SequenceTokenCountPublisher,
     build_step_sampling_state,
@@ -671,10 +672,14 @@ def test_device_history_matches_committed_prefix_with_host_one_round_behind(
             )
 
 
+@pytest.mark.parametrize("commit_prefill_on_cpu", [False, True])
+@pytest.mark.parametrize("chunked_prefill", [False, True])
 def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
     monkeypatch: pytest.MonkeyPatch,
+    commit_prefill_on_cpu: bool,
+    chunked_prefill: bool,
 ) -> None:
-    """Sampling must see committed tokens before host output and reset after re-prefill."""
+    """Sampling sees the final prefill token before CPU commit, including re-prefill."""
     worker = object.__new__(FunCosyVoice3DSparkWorker)
     worker.request_histories = RequestHistories(
         slot_count=1, device=torch.device("cpu")
@@ -684,13 +689,13 @@ def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
     request = SimpleNamespace(
         rid="same",
         kv=SimpleNamespace(req_pool_idx=0),
-        output_ids=array("q", [8]),
+        output_ids=array("q"),
         sampling_params=SimpleNamespace(repetition_penalty=1.1, min_new_tokens=0),
     )
     batch = ScheduleBatch(
         reqs=[request],
         req_pool_indices=torch.tensor([0]),
-        forward_mode=ForwardMode.DECODE,
+        forward_mode=ForwardMode.EXTEND,
         sampling_info=SamplingBatchInfo(
             temperatures=torch.tensor([[0.7]]),
             top_ks=torch.tensor([TOTAL_VOCAB_SIZE]),
@@ -705,7 +710,13 @@ def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
         ),
     )
     native_results = iter(
-        [
+        (
+            [GenerationBatchResult(next_token_ids=torch.tensor([7]))]
+            if chunked_prefill
+            else []
+        )
+        + [
+            GenerationBatchResult(next_token_ids=torch.tensor([8])),
             GenerationBatchResult(
                 next_token_ids=torch.tensor([[9, 10, -1]]),
                 accept_lens=torch.tensor([2]),
@@ -733,7 +744,7 @@ def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
         self: FunCosyVoice3DSparkWorker,
         batch: ScheduleBatch,
         on_publish: SequenceTokenCountPublisher | None = None,
-        grammar_barrier: None = None,
+        grammar_barrier: GrammarStateAdvancer | None = None,
         *,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> GenerationBatchResult:
@@ -754,14 +765,29 @@ def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
         return next(native_results)
 
     monkeypatch.setattr(DSparkWorkerV2, "forward_batch_generation", native_forward)
+    if chunked_prefill:
+        batch.chunked_req = request
+        worker.forward_batch_generation(batch)
+        batch.chunked_req = None
+    else:
+        pass
+    worker.forward_batch_generation(batch)
+    if commit_prefill_on_cpu:
+        request.output_ids = array("q", [8])
+    else:
+        pass
+    batch.forward_mode = ForwardMode.DECODE
     worker.forward_batch_generation(batch)
     worker.forward_batch_generation(batch)
-    assert list(request.output_ids) == [8]
+    assert list(request.output_ids) == ([8] if commit_prefill_on_cpu else [])
 
     request.output_ids = array("q", [8, 9])
     batch.forward_mode = ForwardMode.EXTEND
     worker.forward_batch_generation(batch)
-    request.output_ids = array("q", [8, 9, 12])
+    if commit_prefill_on_cpu:
+        request.output_ids = array("q", [8, 9, 12])
+    else:
+        pass
     batch.forward_mode = ForwardMode.DECODE
     worker.forward_batch_generation(batch)
 

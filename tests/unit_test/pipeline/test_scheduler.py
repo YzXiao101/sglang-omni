@@ -22,7 +22,11 @@ import pytest
 import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -30,6 +34,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -95,7 +100,7 @@ def init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler.backlogged_request_build_payloads = deque()
     scheduler.request_build_max_pending_observed = 0
     scheduler.async_pending = None
-    scheduler.overlap_results = deque()
+    scheduler.result_queue = deque()
     scheduler.enable_overlap = False
     scheduler.overlap_device_drained = True
     scheduler.enable_priority_scheduling = False
@@ -1386,7 +1391,7 @@ def test_immediate_finish_keeps_async_snapshot_aligned_until_resolve() -> None:
     scheduler.async_pending = PendingDecode(
         batch=snapshot, scheduler_output=object(), device_step=object()
     )
-    scheduler.overlap_results = deque()
+    scheduler.result_queue = deque()
     captured = {}
 
     def resolve(batch, sched_output, _pending_step, *, skip_rids):
@@ -2732,7 +2737,7 @@ def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
     scheduler.cur_batch = None
     scheduler.last_batch = None
     scheduler.async_pending = None
-    scheduler.overlap_results = deque()
+    scheduler.result_queue = deque()
     scheduler.waiting_queue = []
     scheduler.completed_request_ids = {}
     scheduler.pending_stream_ingress = {}
@@ -4059,96 +4064,328 @@ def test_prefill_end_emission_skips_when_no_request_is_pending(
     assert scheduler.prefill_end_done == {"r1", "r2"}
 
 
-def test_speculative_overlap_launches_next_before_committing_previous(
+@pytest.mark.parametrize(
+    "first_mode,second_mode,disable_prefill_overlap,algorithm,has_grammar,drain_first",
+    [
+        (
+            ForwardMode.DECODE,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.DFLASH,
+            False,
+            False,
+        ),
+        (
+            ForwardMode.DECODE,
+            ForwardMode.EXTEND,
+            False,
+            SpeculativeAlgorithm.DFLASH,
+            False,
+            False,
+        ),
+        (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.DFLASH,
+            False,
+            False,
+        ),
+        (
+            ForwardMode.EXTEND,
+            ForwardMode.EXTEND,
+            False,
+            SpeculativeAlgorithm.DFLASH,
+            False,
+            False,
+        ),
+        (
+            ForwardMode.EXTEND,
+            ForwardMode.EXTEND,
+            True,
+            SpeculativeAlgorithm.DFLASH,
+            False,
+            True,
+        ),
+        (
+            ForwardMode.DECODE,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.DFLASH,
+            True,
+            False,
+        ),
+        (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.EAGLE,
+            True,
+            False,
+        ),
+        (
+            ForwardMode.DECODE,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.NGRAM,
+            True,
+            True,
+        ),
+        (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.NGRAM,
+            True,
+            True,
+        ),
+        (
+            ForwardMode.DECODE,
+            ForwardMode.DECODE,
+            False,
+            SpeculativeAlgorithm.NGRAM,
+            False,
+            False,
+        ),
+    ],
+)
+def test_speculative_overlap_uses_native_batch_dependencies(
     monkeypatch: pytest.MonkeyPatch,
+    first_mode: ForwardMode,
+    second_mode: ForwardMode,
+    disable_prefill_overlap: bool,
+    algorithm: SpeculativeAlgorithm,
+    has_grammar: bool,
+    drain_first: bool,
 ) -> None:
+    """Independent prefills and supported grammars must not force a full drain."""
     scheduler = object.__new__(OmniScheduler)
     scheduler.running = True
-    scheduler.overlap_results = deque()
-    scheduler.running_batch = SimpleNamespace(reqs=[])
+    scheduler.result_queue = deque()
+    scheduler.last_batch = None
+    scheduler.require_mlp_sync = False
     scheduler._engine_paused = False  # noqa: leading-underscore  # scheduler fixture
     scheduler.process_admin_requests = lambda: None
     scheduler.recv_requests = lambda: []
     scheduler.take_deferred_request_payloads = lambda: []
     scheduler.process_input_requests = lambda requests: None
-    scheduler.is_prefill_expected = lambda: False
     scheduler.self_check_during_idle = lambda: None
     order: list[str] = []
-    mode = SimpleNamespace(is_extend=lambda: False)
-    requests = [SimpleNamespace(grammar=None)]
     batches = deque(
         [
-            SimpleNamespace(
-                name="first", forward_mode=mode, is_extend_in_batch=False, reqs=requests
-            ),
-            SimpleNamespace(
-                name="second",
+            ScheduleBatch(
+                reqs=[SimpleNamespace(rid=name)],
                 forward_mode=mode,
-                is_extend_in_batch=False,
-                reqs=requests,
-            ),
-            None,
+                spec_algorithm=algorithm,
+                has_grammar=has_grammar,
+            )
+            for name, mode in (("first", first_mode), ("second", second_mode))
         ]
+        + [None]
     )
-    for batch in list(batches)[:2]:
-        batch.copy = lambda batch=batch: batch
     scheduler.get_next_batch_to_run = batches.popleft
-    scheduler.run_batch = lambda batch: order.append("launch-" + batch.name)
+    scheduler.run_batch = lambda batch: order.append("launch-" + batch.reqs[0].rid)
     scheduler.process_batch_result = lambda batch, result: order.append(
-        "commit-" + batch.name
+        "commit-" + batch.reqs[0].rid
     )
     scheduler.sleep_during_idle = lambda: setattr(scheduler, "running", False)
     monkeypatch.setattr(
         envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, "get", lambda: False
     )
-    scheduler.event_loop_overlap()
-    assert order == ["launch-first", "launch-second", "commit-first", "commit-second"]
-    assert not scheduler.overlap_results
-
-
-def test_speculative_overlap_drains_before_prefill_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scheduler = object.__new__(OmniScheduler)
-    scheduler.running = True
-    scheduler.running_batch = SimpleNamespace(reqs=[])
-    scheduler._engine_paused = False  # noqa: leading-underscore  # scheduler fixture
-    request = SimpleNamespace(grammar=None, inflight_middle_chunks=1)
-    mode = SimpleNamespace(is_extend=lambda: True)
-    batch = SimpleNamespace(reqs=[request], forward_mode=mode, is_extend_in_batch=True)
-    batch.copy = lambda: batch
-    scheduler.overlap_results = deque([(batch, None)])
-    scheduler.process_admin_requests = lambda: None
-    scheduler.recv_requests = lambda: []
-    scheduler.take_deferred_request_payloads = lambda: []
-    scheduler.process_input_requests = lambda requests: None
-    scheduler.is_prefill_expected = lambda: True
-    order: list[str] = []
-
-    def commit(batch: SimpleNamespace, result: None) -> None:
-        request.inflight_middle_chunks = 0
-        order.append("commit")
-
-    def select() -> SimpleNamespace:
-        assert request.inflight_middle_chunks == 0
-        order.append("select")
-        return batch
-
-    def forward(batch: SimpleNamespace) -> None:
-        assert request.inflight_middle_chunks == 0
-        order.append("forward")
-        scheduler.running = False
-
-    scheduler.process_batch_result = commit
-    scheduler.get_next_batch_to_run = select
-    scheduler.drop_stale_overrun = lambda batch: batch
-    scheduler.run_batch = forward
     monkeypatch.setattr(
-        envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, "get", lambda: False
+        envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP,
+        "get",
+        lambda: disable_prefill_overlap,
     )
     scheduler.event_loop_overlap()
-    assert order == ["commit", "select", "forward", "commit"]
-    assert not scheduler.overlap_results
+    if drain_first:
+        assert order == [
+            "launch-first",
+            "commit-first",
+            "launch-second",
+            "commit-second",
+        ]
+    else:
+        assert order == [
+            "launch-first",
+            "launch-second",
+            "commit-first",
+            "commit-second",
+        ]
+    assert not scheduler.result_queue
+
+
+@pytest.mark.parametrize(
+    "algorithm", [SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.NGRAM]
+)
+def test_speculative_forward_passes_only_supported_grammar_barriers(
+    monkeypatch: pytest.MonkeyPatch, algorithm: SpeculativeAlgorithm
+) -> None:
+    """The worker must receive the scheduler barrier for grammar-capable algorithms."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = True
+    scheduler.device = "cpu"
+    scheduler.batch_record_ct = 0
+    scheduler.batch_record_buf = [[], []]
+    scheduler.result_queue = deque()
+    scheduler.future_map = SimpleNamespace(
+        spec_algo=algorithm,
+        resolve_seq_lens_cpu=Mock(),
+        _resolve_spec_extras=Mock(),
+        publish=Mock(),
+        stash=Mock(),
+    )
+    scheduler.update_cache_from_scheduler = Mock()
+    draft_input = SimpleNamespace(
+        bonus_tokens=torch.tensor([11]),
+        topk_p=None,
+        topk_index=None,
+        hidden_states=None,
+        dsa_topk_indices=None,
+    )
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([11]),
+        next_draft_input=draft_input,
+        new_seq_lens=torch.tensor([6]),
+    )
+    scheduler.draft_worker = SimpleNamespace(
+        forward_batch_generation=Mock(return_value=result)
+    )
+    batch = ScheduleBatch(
+        reqs=[],
+        enable_overlap=True,
+        forward_mode=ForwardMode.DECODE,
+        spec_algorithm=algorithm,
+        input_ids=torch.tensor([10]),
+        req_pool_indices=torch.tensor([0]),
+    )
+    copy_done = Mock()
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(Event=lambda: copy_done),
+    )
+
+    assert scheduler.run_speculative_batch(batch) is result
+
+    worker_keywords = scheduler.draft_worker.forward_batch_generation.call_args.kwargs
+    if algorithm.supports_grammar_overlap():
+        assert (
+            worker_keywords["grammar_barrier"] == scheduler._advance_pending_grammar
+        )  # noqa: leading-underscore  # native scheduler callback
+    else:
+        assert "grammar_barrier" not in worker_keywords
+    worker_keywords["on_publish"](result.new_seq_lens)
+    scheduler.future_map.publish.assert_called_once_with(
+        batch.req_pool_indices, result.new_seq_lens
+    )
+    assert batch.spec_info is draft_input
+    assert batch.spec_info.future_indices is batch.req_pool_indices
+    copy_done.record.assert_called_once()
+
+
+class OverlapGrammarRecorder:
+    def __init__(self, terminal_token: int | None = None) -> None:
+        self.accepted_tokens: list[int] = []
+        self.terminal_token = terminal_token
+        self.finished = False
+
+    def accept_token(self, token: int) -> None:
+        self.accepted_tokens.append(token)
+
+    def is_terminated(self) -> bool:
+        return (
+            bool(self.accepted_tokens)
+            and self.accepted_tokens[-1] == self.terminal_token
+        )
+
+
+def test_speculative_grammar_barrier_commits_legal_tokens_once() -> None:
+    """Early FSM advancement must preserve its truncated run for result processing."""
+    grammars = [OverlapGrammarRecorder(terminal_token=12) for _ in range(3)]
+    requests = [
+        SimpleNamespace(
+            rid=f"request-{index}",
+            grammar=grammar,
+            is_retracted=index == 1,
+            finished=lambda index=index: index == 2,
+            kv=SimpleNamespace(kv_committed_len=5),
+            spec_verify_ct=0,
+            spec_num_correct_drafts=0,
+            update_spec_correct_drafts_histogram=lambda count: None,
+        )
+        for index, grammar in enumerate(grammars)
+    ]
+    batch = ScheduleBatch(
+        reqs=requests,
+        forward_mode=ForwardMode.DECODE,
+        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+        has_grammar=True,
+    )
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([11, 12, 13] * 3),
+        accept_lens=torch.tensor([3, 3, 3]),
+        speculative_output_stride=3,
+        copy_done=Mock(),
+    )
+    processor = object.__new__(SchedulerBatchResultProcessor)
+    object.__setattr__(
+        processor, "model_worker", SimpleNamespace(on_verify_complete_cpu=Mock())
+    )
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.batch_result_processor = processor
+    scheduler.result_queue = deque([(batch.copy(), result)])
+
+    scheduler._advance_pending_grammar()  # noqa: leading-underscore  # native scheduler callback
+    scheduler._advance_pending_grammar()  # noqa: leading-underscore  # callback must be idempotent
+    tokens = processor._resolve_spec_v2_tokens(
+        result, batch
+    )  # noqa: leading-underscore  # native result settlement
+
+    assert [grammar.accepted_tokens for grammar in grammars] == [[11, 12], [], []]
+    assert tokens[0] == [11, 12]
+    assert [request.kv.kv_committed_len for request in requests] == [7, 5, 5]
+    assert [request.spec_verify_ct for request in requests] == [1, 0, 0]
+    assert result.grammar_advanced
+    assert len(scheduler.result_queue) == 1
+    result.copy_done.synchronize.assert_called_once()
+
+
+@pytest.mark.parametrize("middle_chunk", [False, True])
+def test_speculative_grammar_barrier_respects_prefill_completion(
+    middle_chunk: bool,
+) -> None:
+    """A following verify consumes a final-prefill token once, never a middle chunk."""
+    grammar = OverlapGrammarRecorder()
+    request = SimpleNamespace(
+        grammar=grammar,
+        is_retracted=False,
+        finished=lambda: False,
+        inflight_middle_chunks=int(middle_chunk),
+    )
+    batch = ScheduleBatch(
+        reqs=[request],
+        forward_mode=ForwardMode.EXTEND,
+        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+        has_grammar=True,
+    )
+    result = GenerationBatchResult(next_token_ids=torch.tensor([11]), copy_done=Mock())
+    processor = object.__new__(SchedulerBatchResultProcessor)
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.batch_result_processor = processor
+    scheduler.result_queue = deque([(batch.copy(), result)])
+
+    scheduler._advance_pending_grammar()  # noqa: leading-underscore  # native scheduler callback
+    if middle_chunk:
+        assert grammar.accepted_tokens == []
+    else:
+        processor._apply_prefill_grammar(  # noqa: leading-underscore  # native prefill settlement
+            req=request, next_token_id=11, already_advanced=result.grammar_advanced
+        )
+        assert grammar.accepted_tokens == [11]
+    assert result.grammar_advanced
+    assert len(scheduler.result_queue) == 1
+    result.copy_done.synchronize.assert_called_once()
 
 
 def test_speculative_overlap_stop_leaves_cleanup_to_scheduler_thread() -> None:
@@ -4170,7 +4407,7 @@ def test_speculative_overlap_shutdown_drains_pending_results_before_resource_cle
     scheduler.enable_overlap = True
     scheduler.enable_async_decode = False
     scheduler.overlap_device_drained = False
-    scheduler.overlap_results = deque(
+    scheduler.result_queue = deque(
         [(SimpleNamespace(name="first"), None), (SimpleNamespace(name="second"), None)]
     )
     scheduler.request_admission_lock = threading.RLock()
@@ -4200,7 +4437,7 @@ def test_speculative_overlap_shutdown_drains_pending_results_before_resource_cle
         order.append(f"terminal-{status}")
 
     def release_resources() -> None:
-        assert not scheduler.overlap_results
+        assert not scheduler.result_queue
         assert scheduler.scheduler_thread_id is None
         order.append("release")
 
@@ -4223,7 +4460,7 @@ def test_speculative_overlap_shutdown_drains_pending_results_before_resource_cle
     terminal_status = "aborted" if failure_stage == "none" else "error"
     if failure_stage == "drain":
         assert order == ["drain", f"terminal-{terminal_status}"]
-        assert len(scheduler.overlap_results) == 2
+        assert len(scheduler.result_queue) == 2
         assert scheduler.shutdown_callback is release_resources
     else:
         assert order == [
@@ -4233,7 +4470,7 @@ def test_speculative_overlap_shutdown_drains_pending_results_before_resource_cle
             f"terminal-{terminal_status}",
             "release",
         ]
-        assert not scheduler.overlap_results
+        assert not scheduler.result_queue
         assert scheduler.shutdown_callback is None
     assert scheduler.scheduler_thread_id is None
     shutdown_order = list(order)
@@ -4267,8 +4504,8 @@ def test_speculative_overlap_pending_request_remains_visible_to_lifecycle() -> N
     scheduler.cur_batch = None
     scheduler.last_batch = None
     scheduler.async_pending = None
-    scheduler.overlap_results = deque([(pending_batch, None)])
+    scheduler.result_queue = deque([(pending_batch, None)])
     scheduler.waiting_queue = []
     assert scheduler.find_request_data("pending-request") is payload
-    scheduler.overlap_results.clear()
+    scheduler.result_queue.clear()
     assert scheduler.find_request_data("pending-request") is None

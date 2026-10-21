@@ -382,7 +382,8 @@ class ThinkerModelRunner(ModelRunner):
             else:
                 pass
 
-            if req.inflight_middle_chunks == 0:
+            # note (Codex): prior chunks can still await CPU settlement during overlap.
+            if req is not schedule_batch.chunked_req:
                 req.omni_model_inputs = None
                 req._omni_consumed = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
                 req._omni_mm_positions = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken

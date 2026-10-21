@@ -91,8 +91,15 @@ def make_batch(
         positions=torch.arange(len(flat_ids), dtype=torch.long),
         mrope_positions=torch.arange(len(flat_ids), dtype=torch.long).repeat(3, 1),
     )
+    chunked_requests = [
+        request
+        for request, chunk, prefix in zip(requests, chunks, prefix_lens)
+        if prefix + len(chunk) < len(request.origin_input_ids)
+    ]
+    assert len(chunked_requests) <= 1
     schedule_batch = SimpleNamespace(
         reqs=list(requests),
+        chunked_req=chunked_requests[0] if chunked_requests else None,
         forward_mode=SimpleNamespace(is_extend=lambda: True),
         is_prefill_only=True,
     )
@@ -273,7 +280,10 @@ def test_mixed_text_and_audio_batch_uses_one_live_sidecar():
     assert forward_batch.input_embeds is None
 
 
-def test_chunked_audio_prefill_attaches_live_text_and_audio_chunks():
+@pytest.mark.parametrize("pending_middle_chunks", [0, 1])
+def test_chunked_audio_prefill_attaches_live_text_and_audio_chunks(
+    pending_middle_chunks: int,
+):
     runner = make_runner()
     audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
     audio_inputs = {"audio_embeds": audio_embeds}
@@ -311,7 +321,7 @@ def test_chunked_audio_prefill_attaches_live_text_and_audio_chunks():
     assert request.multimodal_inputs is official_request_mm_inputs
     assert request.multimodal_inputs.mrope_position_delta is official_mrope_delta
 
-    request.inflight_middle_chunks = 0
+    request.inflight_middle_chunks = pending_middle_chunks
     second_batch, second_schedule = make_batch(
         [request], chunks=[[AUDIO_ID]], prefix_lens=[2]
     )
@@ -328,6 +338,7 @@ def test_chunked_audio_prefill_attaches_live_text_and_audio_chunks():
     )  # noqa: leading-underscore  # production name
     assert request.multimodal_inputs is official_request_mm_inputs
     assert request.multimodal_inputs.mrope_position_delta is official_mrope_delta
+    assert request.inflight_middle_chunks == pending_middle_chunks
 
 
 def test_fresh_cached_prefix_with_only_live_audio_is_sidecar_eligible():
@@ -554,7 +565,7 @@ def test_cached_audio_eager_cursor_preserves_existing_cursor():
     runner = make_runner()
     audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
     audio_request = make_request(
-        [AUDIO_ID, 7, AUDIO_ID, 8],
+        [AUDIO_ID, 7, AUDIO_ID, 8, 9],
         {"audio_embeds": audio_embeds},
         positions=make_positions(audio=(0, 2)),
         inflight_middle_chunks=1,

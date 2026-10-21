@@ -541,9 +541,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # decode batch, or None. Tracked here (not just a loop local) so abort
         # can reach the in-flight step. See _event_loop_async_decode.
         self.async_pending: PendingDecode | None = None
-        self.overlap_results: deque[tuple[ScheduleBatch, GenerationBatchResult]] = (
-            deque()
-        )
+        self.result_queue: deque[tuple[ScheduleBatch, GenerationBatchResult]] = deque()
         self.overlap_device_drained = True
         self.previous_pending_decode = None
         self.forward_ct = 0
@@ -2215,9 +2213,19 @@ class OmniScheduler(Generic[RequestDataT]):
             self, batch, overlap=self.enable_overlap
         ):
             if self.enable_overlap:
+                forward_kwargs = {
+                    "on_publish": partial(
+                        self.future_map.publish, batch.req_pool_indices
+                    )
+                }
+                if batch.spec_algorithm.supports_grammar_overlap():
+                    forward_kwargs["grammar_barrier"] = (
+                        self._advance_pending_grammar  # noqa: leading-underscore  # native scheduler callback
+                    )
+                else:
+                    pass
                 result = self.draft_worker.forward_batch_generation(
-                    batch,
-                    on_publish=partial(self.future_map.publish, batch.req_pool_indices),
+                    batch, **forward_kwargs
                 )
                 self.future_map.stash(
                     batch.req_pool_indices,
@@ -3465,7 +3473,7 @@ class OmniScheduler(Generic[RequestDataT]):
             self.cur_batch,
             self.last_batch,
             self.async_pending_batch(),
-            *(batch for batch, _ in self.overlap_results),
+            *(batch for batch, _ in self.result_queue),
         )
 
     def mark_running_request_aborted(self, request_id: str) -> bool:
@@ -3605,7 +3613,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     @DynamicGradMode()
     def event_loop_overlap(self) -> None:
-        """Overlap decode with CPU results; keep prefill hooks in the same iteration."""
+        """Overlap batch execution with the preceding batch's CPU results."""
         while self.running:
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
@@ -3620,12 +3628,6 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 pass
 
-            if self.is_prefill_expected() or any(
-                request.grammar is not None for request in self.running_batch.reqs
-            ):
-                self.resolve_pending_overlap()
-            else:
-                pass
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch is None:
@@ -3636,28 +3638,15 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.self_check_during_idle()
                 self.sleep_during_idle()
             else:
-                # note (Codex): Grammar masks need the preceding committed CPU state.
-                synchronous = (
-                    batch.forward_mode.is_extend()
-                    or batch.is_extend_in_batch
-                    or any(request.grammar is not None for request in batch.reqs)
-                )
-                if synchronous:
+                if self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch):
                     self.resolve_pending_overlap()
-                    batch = self.drop_stale_overrun(batch)
-                    self.cur_batch = batch
                 else:
                     pass
-                if batch is not None:
-                    result = self.run_batch(batch)
-                    self.overlap_results.append((batch.copy(), result))
-                    if synchronous:
-                        self.resolve_pending_overlap()
-                    elif len(self.overlap_results) > 1:
-                        previous_batch, previous_result = self.overlap_results.popleft()
-                        self.process_batch_result(previous_batch, previous_result)
-                    else:
-                        pass
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+                if len(self.result_queue) > 1:
+                    previous_batch, previous_result = self.result_queue.popleft()
+                    self.process_batch_result(previous_batch, previous_result)
                 else:
                     pass
             self.last_batch = batch
@@ -3667,9 +3656,9 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
 
     def resolve_pending_overlap(self) -> None:
-        """Commit pending results before prefill, pause, or shutdown."""
-        while self.overlap_results:
-            batch, result = self.overlap_results.popleft()
+        """Commit pending results at a synchronization or lifecycle boundary."""
+        while self.result_queue:
+            batch, result = self.result_queue.popleft()
             self.process_batch_result(batch, result)
 
     @staticmethod

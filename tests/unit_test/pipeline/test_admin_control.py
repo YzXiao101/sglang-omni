@@ -374,7 +374,7 @@ def test_omni_scheduler_abort_pause_ends_each_dropped_request() -> None:
     scheduler.admin_lock = threading.Lock()
     scheduler._engine_paused = False  # noqa: leading-underscore  # production name
     scheduler.resolve_pending_async = lambda: None
-    scheduler.overlap_results = deque()
+    scheduler.result_queue = deque()
     scheduler.active_request_ids = lambda: ["req-1", "req-2"]
     scheduler.abort = lambda request_id, **_kwargs: aborted.append(request_id)
     scheduler.running_batch = scheduler.cur_batch = scheduler.last_batch = None
