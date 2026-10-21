@@ -1199,9 +1199,11 @@ def test_qwen_encoder_mem_reserve_routes_as_scheduler_group_value() -> None:
 
 
 @pytest.mark.parametrize("speech_enabled", [False, True])
+@pytest.mark.parametrize("enable_overlap", [False, True])
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
     speech_enabled: bool,
+    enable_overlap: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -1316,9 +1318,10 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
 
     scheduler = bootstrap.create_thinker_scheduler(
-        server_args, speech_enabled=speech_enabled
+        server_args, speech_enabled=speech_enabled, enable_overlap=enable_overlap
     )
 
+    assert scheduler.enable_overlap is enable_overlap
     assert infrastructure_saw_graph_disabled == [False]
     assert "defer_cuda_graph_capture" not in infrastructure_kwargs[0]
     assert graph_init_workers == []
@@ -1428,7 +1431,9 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
 
-    scheduler = bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
+    scheduler = bootstrap.create_thinker_scheduler(
+        server_args, speech_enabled=True, enable_overlap=False
+    )
 
     assert captured["enable_prefill_input_embeds"] is True
     assert "defer_cuda_graph_capture" not in captured

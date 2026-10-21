@@ -12,6 +12,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 
 from sglang_omni.models.fun_cosyvoice3 import dspark_draft, dspark_worker
 from sglang_omni.models.fun_cosyvoice3.dspark_draft import (
@@ -31,6 +36,7 @@ from sglang_omni.models.fun_cosyvoice3.dspark_sampling import (
 from sglang_omni.models.fun_cosyvoice3.dspark_worker import (
     FunCosyVoice3DSparkWorker,
     RequestHistories,
+    SequenceTokenCountPublisher,
     build_step_sampling_state,
 )
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
@@ -477,9 +483,11 @@ def test_materialized_draft_refuses_another_vocabulary_or_block(
 
 
 def dspark_overrides(
+    *,
+    enable_overlap: bool,
     **server_args_overrides: object,
 ) -> tuple[FunCosyVoice3EngineBuilder, dict[str, object]]:
-    builder = FunCosyVoice3EngineBuilder()
+    builder = FunCosyVoice3EngineBuilder(enable_overlap=enable_overlap)
     builder.device = "cuda:0"
     overrides = build_generation_batch_overrides(
         server_args_overrides=server_args_overrides,
@@ -518,16 +526,21 @@ def test_engine_builder_refuses_what_the_dspark_draft_cannot_serve(
     server_args_overrides: dict[str, object], error: str
 ) -> None:
     with pytest.raises(ValueError, match=error):
-        dspark_overrides(**server_args_overrides)
+        dspark_overrides(enable_overlap=False, **server_args_overrides)
 
 
+@pytest.mark.parametrize("enable_overlap", [False, True])
 def test_dspark_draft_reserves_its_verify_windows_in_the_kv_pool_cap(
     materialized_draft: str,
+    enable_overlap: bool,
 ) -> None:
     builder, overrides = dspark_overrides(
-        speculative_draft_model_path="yuekai/cosyvoice3_llm_dspark"
+        enable_overlap=enable_overlap,
+        speculative_draft_model_path="yuekai/cosyvoice3_llm_dspark",
     )
 
+    assert builder.extra_scheduler_kwargs()["enable_overlap"] is enable_overlap
+    assert overrides["disable_overlap_schedule"] is not enable_overlap
     assert overrides["speculative_algorithm"] == "DSPARK"
     assert overrides["speculative_draft_model_path"] == materialized_draft
     assert overrides["speculative_dspark_block_size"] == DRAFT_TOKENS_PER_STEP
@@ -584,9 +597,9 @@ def test_fa3_lays_out_a_dspark_draft_batch_at_the_draft_width(
     assert backend.speculative_num_draft_tokens == expected_rows_per_request
 
 
-@pytest.mark.parametrize("block_width", [1, 4, 17])
+@pytest.mark.parametrize("block_token_count", [1, 4, 17])
 def test_device_history_matches_committed_prefix_with_host_one_round_behind(
-    block_width: int,
+    block_token_count: int,
 ) -> None:
     histories = RequestHistories(slot_count=4, device=torch.device("cpu"))
     requests = [
@@ -597,61 +610,176 @@ def test_device_history_matches_committed_prefix_with_host_one_round_behind(
         )
         for slot in [2, 0, 3]
     ]
-    expected = {
+    expected_token_ids_by_slot = {
         request.kv.req_pool_idx: list(request.output_ids) for request in requests
     }
     generator = torch.Generator().manual_seed(101)
-    for step in range(30):
+    for decode_round in range(30):
         requests = requests[1:] + requests[:1]
-        slots = torch.tensor([request.kv.req_pool_idx for request in requests])
-        batch = SimpleNamespace(reqs=requests, req_pool_indices=slots)
-        before = histories.presence_mask(batch)
-        for row, slot in enumerate(slots.tolist()):
-            assert before[row].nonzero().flatten().tolist() == sorted(
-                set(expected[slot])
+        request_pool_indices = torch.tensor(
+            [request.kv.req_pool_idx for request in requests]
+        )
+        batch = SimpleNamespace(reqs=requests, req_pool_indices=request_pool_indices)
+        token_presence_mask = histories.presence_mask(batch)
+        for row_index, request_pool_index in enumerate(request_pool_indices.tolist()):
+            assert token_presence_mask[
+                row_index
+            ].nonzero().flatten().tolist() == sorted(
+                set(expected_token_ids_by_slot[request_pool_index])
             )
-        tokens = torch.randint(0, 32, (3, block_width), generator=generator)
-        lengths = torch.tensor([(step + row) % block_width + 1 for row in range(3)])
-        tokens[torch.arange(block_width)[None, :] >= lengths[:, None]] = -1
-        histories.commit(slots, tokens, lengths)
-        for row, request in enumerate(requests):
-            slot = request.kv.req_pool_idx
-            request.output_ids = array("q", expected[slot])
-            expected[slot].extend(tokens[row, : lengths[row]].tolist())
-            assert histories.lengths_by_slot[slot].item() == len(expected[slot])
-            recent = expected[slot][-10:]
+        accepted_token_ids = torch.randint(
+            0, 32, (3, block_token_count), generator=generator
+        )
+        accepted_token_counts = torch.tensor(
+            [
+                (decode_round + row_index) % block_token_count + 1
+                for row_index in range(3)
+            ]
+        )
+        accepted_token_ids[
+            torch.arange(block_token_count)[None, :] >= accepted_token_counts[:, None]
+        ] = EMPTY_HISTORY_TOKEN
+        histories.commit(
+            request_pool_indices, accepted_token_ids, accepted_token_counts
+        )
+        for row_index, request in enumerate(requests):
+            request_pool_index = request.kv.req_pool_idx
+            request.output_ids = array(
+                "q", expected_token_ids_by_slot[request_pool_index]
+            )
+            expected_token_ids_by_slot[request_pool_index].extend(
+                accepted_token_ids[
+                    row_index, : accepted_token_counts[row_index]
+                ].tolist()
+            )
+            assert histories.output_token_counts_by_slot[
+                request_pool_index
+            ].item() == len(expected_token_ids_by_slot[request_pool_index])
+            recent_token_ids = expected_token_ids_by_slot[request_pool_index][
+                -COSYVOICE3_RAS_WINDOW_SIZE:
+            ]
             assert (
-                histories.recent_by_slot[slot].tolist()
-                == [-1] * (10 - len(recent)) + recent
+                histories.recent_token_ids_by_slot[request_pool_index].tolist()
+                == [EMPTY_HISTORY_TOKEN]
+                * (COSYVOICE3_RAS_WINDOW_SIZE - len(recent_token_ids))
+                + recent_token_ids
             )
             assert histories.presence_by_slot[
-                slot
-            ].nonzero().flatten().tolist() == sorted(set(expected[slot]))
+                request_pool_index
+            ].nonzero().flatten().tolist() == sorted(
+                set(expected_token_ids_by_slot[request_pool_index])
+            )
 
 
-def test_device_history_discards_overrun_after_reprefill_and_same_id_slot_reuse() -> (
-    None
-):
-    histories = RequestHistories(slot_count=1, device=torch.device("cpu"))
+def test_device_history_follows_worker_commits_reprefill_and_same_id_slot_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampling must see committed tokens before host output and reset after re-prefill."""
+    worker = object.__new__(FunCosyVoice3DSparkWorker)
+    worker.request_histories = RequestHistories(
+        slot_count=1, device=torch.device("cpu")
+    )
+    worker.draft_model = SimpleNamespace(markov_head=SimpleNamespace())
+    worker.exact_verify_executor = SimpleNamespace()
     request = SimpleNamespace(
-        rid="same", kv=SimpleNamespace(req_pool_idx=0), output_ids=array("q", [8])
+        rid="same",
+        kv=SimpleNamespace(req_pool_idx=0),
+        output_ids=array("q", [8]),
+        sampling_params=SimpleNamespace(repetition_penalty=1.1, min_new_tokens=0),
     )
-    batch = SimpleNamespace(reqs=[request], req_pool_indices=torch.tensor([0]))
-    histories.presence_mask(batch)
-    histories.commit(
-        batch.req_pool_indices, torch.tensor([[9, 10, -1]]), torch.tensor([2])
+    batch = ScheduleBatch(
+        reqs=[request],
+        req_pool_indices=torch.tensor([0]),
+        forward_mode=ForwardMode.DECODE,
+        sampling_info=SamplingBatchInfo(
+            temperatures=torch.tensor([[0.7]]),
+            top_ks=torch.tensor([TOTAL_VOCAB_SIZE]),
+            top_ps=torch.tensor([1.0]),
+            min_ps=torch.tensor([0.0]),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=TOTAL_VOCAB_SIZE,
+        ),
     )
-    # Re-prefill has retained only the externally committed prefix, then sampled again.
+    native_results = iter(
+        [
+            GenerationBatchResult(
+                next_token_ids=torch.tensor([[9, 10, -1]]),
+                accept_lens=torch.tensor([2]),
+            ),
+            GenerationBatchResult(
+                next_token_ids=torch.tensor([[11, -1, -1]]),
+                accept_lens=torch.tensor([1]),
+            ),
+            GenerationBatchResult(next_token_ids=torch.tensor([12])),
+            GenerationBatchResult(
+                next_token_ids=torch.tensor([[13, -1, -1]]),
+                accept_lens=torch.tensor([1]),
+            ),
+            GenerationBatchResult(
+                next_token_ids=torch.tensor([[6, -1, -1]]),
+                accept_lens=torch.tensor([1]),
+            ),
+        ]
+    )
+    observed_token_ids: list[list[int]] = []
+    observed_recent_token_ids: list[list[int]] = []
+    observed_token_counts: list[int] = []
+
+    def native_forward(
+        self: FunCosyVoice3DSparkWorker,
+        batch: ScheduleBatch,
+        on_publish: SequenceTokenCountPublisher | None = None,
+        grammar_barrier: None = None,
+        *,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+    ) -> GenerationBatchResult:
+        assert (
+            on_publish is None and grammar_barrier is None and pp_proxy_tensors is None
+        )
+        if batch.forward_mode.is_decode():
+            sampling_state = self.draft_model.markov_head.sampling_state
+            observed_token_ids.append(
+                sampling_state.presence_mask[0].nonzero().flatten().tolist()
+            )
+            observed_token_counts.append(sampling_state.output_lengths[0].item())
+            observed_recent_token_ids.append(
+                self.exact_verify_executor.step_state.recent_tokens[0].tolist()
+            )
+        else:
+            pass
+        return next(native_results)
+
+    monkeypatch.setattr(DSparkWorkerV2, "forward_batch_generation", native_forward)
+    worker.forward_batch_generation(batch)
+    worker.forward_batch_generation(batch)
+    assert list(request.output_ids) == [8]
+
+    request.output_ids = array("q", [8, 9])
+    batch.forward_mode = ForwardMode.EXTEND
+    worker.forward_batch_generation(batch)
     request.output_ids = array("q", [8, 9, 12])
-    histories.slot_owners[0] = None
-    assert histories.presence_mask(batch)[0].nonzero().flatten().tolist() == [8, 9, 12]
-    assert histories.lengths_by_slot.tolist() == [3]
+    batch.forward_mode = ForwardMode.DECODE
+    worker.forward_batch_generation(batch)
+
     replacement = SimpleNamespace(
-        rid="same", kv=SimpleNamespace(req_pool_idx=0), output_ids=array("q", [5])
+        rid="same",
+        kv=SimpleNamespace(req_pool_idx=0),
+        output_ids=array("q", [5]),
+        sampling_params=request.sampling_params,
     )
     batch.reqs = [replacement]
-    assert histories.presence_mask(batch)[0].nonzero().flatten().tolist() == [5]
-    assert histories.recent_by_slot[0].tolist() == [-1] * 9 + [5]
+    worker.forward_batch_generation(batch)
+    assert observed_token_ids == [[8], [8, 9, 10], [8, 9, 12], [5]]
+    assert observed_token_counts == [1, 3, 3, 1]
+    assert observed_recent_token_ids == [
+        [EMPTY_HISTORY_TOKEN] * (COSYVOICE3_RAS_WINDOW_SIZE - len(token_ids))
+        + token_ids
+        for token_ids in observed_token_ids
+    ]
 
 
 @pytest.mark.parametrize(
@@ -669,7 +797,9 @@ def test_device_history_discards_overrun_after_reprefill_and_same_id_slot_reuse(
         ),
     ],
 )
-def test_device_history_ignores_padding_that_aliases_a_real_token(device) -> None:
+def test_device_history_ignores_padding_that_aliases_a_real_token(
+    device: torch.device,
+) -> None:
     histories = RequestHistories(slot_count=1, device=device)
     histories.commit(
         torch.tensor([0], device=device),
@@ -678,4 +808,6 @@ def test_device_history_ignores_padding_that_aliases_a_real_token(device) -> Non
     )
     assert histories.presence_by_slot[0, 0].item()
     assert histories.presence_by_slot.sum().item() == 1
-    assert histories.recent_by_slot[0].tolist() == [-1] * 9 + [0]
+    assert histories.recent_token_ids_by_slot[0].tolist() == (
+        [EMPTY_HISTORY_TOKEN] * (COSYVOICE3_RAS_WINDOW_SIZE - 1) + [0]
+    )

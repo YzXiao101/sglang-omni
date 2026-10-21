@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import Mock
 
 import pytest
@@ -1385,6 +1386,7 @@ def test_immediate_finish_keeps_async_snapshot_aligned_until_resolve() -> None:
     scheduler.async_pending = PendingDecode(
         batch=snapshot, scheduler_output=object(), device_step=object()
     )
+    scheduler.overlap_results = deque()
     captured = {}
 
     def resolve(batch, sched_output, _pending_step, *, skip_rids):
@@ -2730,6 +2732,7 @@ def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
     scheduler.cur_batch = None
     scheduler.last_batch = None
     scheduler.async_pending = None
+    scheduler.overlap_results = deque()
     scheduler.waiting_queue = []
     scheduler.completed_request_ids = {}
     scheduler.pending_stream_ingress = {}
@@ -4057,7 +4060,7 @@ def test_prefill_end_emission_skips_when_no_request_is_pending(
 
 
 def test_speculative_overlap_launches_next_before_committing_previous(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.running = True
@@ -4070,7 +4073,7 @@ def test_speculative_overlap_launches_next_before_committing_previous(
     scheduler.process_input_requests = lambda requests: None
     scheduler.is_prefill_expected = lambda: False
     scheduler.self_check_during_idle = lambda: None
-    order = []
+    order: list[str] = []
     mode = SimpleNamespace(is_extend=lambda: False)
     requests = [SimpleNamespace(grammar=None)]
     batches = deque(
@@ -4103,7 +4106,9 @@ def test_speculative_overlap_launches_next_before_committing_previous(
     assert not scheduler.overlap_results
 
 
-def test_speculative_overlap_drains_before_prefill_selection(monkeypatch) -> None:
+def test_speculative_overlap_drains_before_prefill_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.running = True
     scheduler.running_batch = SimpleNamespace(reqs=[])
@@ -4118,18 +4123,18 @@ def test_speculative_overlap_drains_before_prefill_selection(monkeypatch) -> Non
     scheduler.take_deferred_request_payloads = lambda: []
     scheduler.process_input_requests = lambda requests: None
     scheduler.is_prefill_expected = lambda: True
-    order = []
+    order: list[str] = []
 
-    def commit(batch, result):
+    def commit(batch: SimpleNamespace, result: None) -> None:
         request.inflight_middle_chunks = 0
         order.append("commit")
 
-    def select():
+    def select() -> SimpleNamespace:
         assert request.inflight_middle_chunks == 0
         order.append("select")
         return batch
 
-    def forward(batch):
+    def forward(batch: SimpleNamespace) -> None:
         assert request.inflight_middle_chunks == 0
         order.append("forward")
         scheduler.running = False
@@ -4157,41 +4162,100 @@ def test_speculative_overlap_stop_leaves_cleanup_to_scheduler_thread() -> None:
     scheduler.shutdown_resources.assert_not_called()
 
 
-@pytest.mark.parametrize("drain_fails", [False, True])
-def test_speculative_overlap_failure_drains_before_resource_cleanup(
-    drain_fails,
+@pytest.mark.parametrize("failure_stage", ["none", "forward", "drain"])
+def test_speculative_overlap_shutdown_drains_pending_results_before_resource_cleanup(
+    failure_stage: Literal["none", "forward", "drain"],
 ) -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.enable_overlap = True
     scheduler.enable_async_decode = False
     scheduler.overlap_device_drained = False
-    scheduler.overlap_results = deque()
-    order = []
+    scheduler.overlap_results = deque(
+        [(SimpleNamespace(name="first"), None), (SimpleNamespace(name="second"), None)]
+    )
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler.pending_request_admissions = {}
+    scheduler.request_build_executor = None
+    scheduler.shutdown_lock = threading.Lock()
+    order: list[str] = []
 
-    def fail_forward():
-        raise RuntimeError("forward failed")
+    def run_until_shutdown() -> None:
+        if failure_stage == "none":
+            scheduler.stop()
+        else:
+            raise RuntimeError("forward failed")
 
-    def drain():
+    def synchronize_device() -> None:
         order.append("drain")
-        if drain_fails:
+        if failure_stage == "drain":
             raise RuntimeError("device failed")
+        else:
+            pass
 
-    scheduler.event_loop_overlap = fail_forward
+    def process_result(batch: SimpleNamespace, result: None) -> None:
+        assert scheduler.overlap_device_drained
+        order.append(f"commit-{batch.name}")
+
+    def emit_terminal_events(*, status: str) -> None:
+        order.append(f"terminal-{status}")
+
+    def release_resources() -> None:
+        assert not scheduler.overlap_results
+        assert scheduler.scheduler_thread_id is None
+        order.append("release")
+
+    scheduler.event_loop_overlap = run_until_shutdown
     scheduler.device_module = SimpleNamespace(
-        current_stream=lambda: SimpleNamespace(synchronize=drain)
+        current_stream=lambda: SimpleNamespace(synchronize=synchronize_device)
     )
-    scheduler.emit_remaining_model_path_ends = lambda **kwargs: order.append("terminal")
-    scheduler.shutdown_request_build_executor = lambda: None
-    scheduler.discard_pending_request_admissions = lambda: None
-    scheduler.shutdown_resources = lambda: order.append("release")
-    with pytest.raises(
-        RuntimeError, match="device failed" if drain_fails else "forward failed"
-    ):
+    scheduler.process_batch_result = process_result
+    scheduler.emit_remaining_model_path_ends = emit_terminal_events
+    scheduler.shutdown_callback = release_resources
+    if failure_stage == "none":
         scheduler.start()
-    assert order == (
-        ["drain", "terminal"] if drain_fails else ["drain", "terminal", "release"]
-    )
+    else:
+        with pytest.raises(
+            RuntimeError,
+            match="device failed" if failure_stage == "drain" else "forward failed",
+        ):
+            scheduler.start()
+
+    terminal_status = "aborted" if failure_stage == "none" else "error"
+    if failure_stage == "drain":
+        assert order == ["drain", f"terminal-{terminal_status}"]
+        assert len(scheduler.overlap_results) == 2
+        assert scheduler.shutdown_callback is release_resources
+    else:
+        assert order == [
+            "drain",
+            "commit-first",
+            "commit-second",
+            f"terminal-{terminal_status}",
+            "release",
+        ]
+        assert not scheduler.overlap_results
+        assert scheduler.shutdown_callback is None
     assert scheduler.scheduler_thread_id is None
+    shutdown_order = list(order)
+    scheduler.stop()
+    assert order == shutdown_order
+
+
+def test_speculative_overlap_external_abort_is_queued_for_scheduler_thread() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = True
+    scheduler.scheduler_thread_id = threading.get_ident()
+    scheduler.tp_size = 1
+    scheduler.is_entry_rank = True
+    scheduler.inbox = Queue()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(scheduler.abort, "in-flight-request").result()
+
+    message = scheduler.inbox.get_nowait()
+    assert message.type == "abort"
+    assert message.request_id == "in-flight-request"
+    assert scheduler.inbox.empty()
 
 
 def test_speculative_overlap_pending_request_remains_visible_to_lifecycle() -> None:

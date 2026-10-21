@@ -656,17 +656,17 @@ class OmniScheduler(Generic[RequestDataT]):
                 )
             else:
                 pass
-            needs_cpu_seq_lens = decide_needs_cpu_seq_lens(
+            needs_cpu_sequence_lengths = decide_needs_cpu_seq_lens(
                 self.draft_worker.spec_v2_attn_backends
             )
             self.batch_record_ct = 0
             self.batch_record_buf = [None, None]
         else:
-            needs_cpu_seq_lens = True
+            needs_cpu_sequence_lengths = True
         self.future_map = self.spec_algorithm.create_future_map(
             torch.device(self.device),
             self.req_to_token_pool,
-            needs_cpu_seq_lens=needs_cpu_seq_lens,
+            needs_cpu_seq_lens=needs_cpu_sequence_lengths,
         )
         self.dllm_config = None
         self.execution_bridge = None
@@ -2207,7 +2207,6 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         if self.enable_overlap:
-            self.overlap_device_drained = False
             self.future_map.resolve_seq_lens_cpu(batch)
         else:
             pass
@@ -3606,11 +3605,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     @DynamicGradMode()
     def event_loop_overlap(self) -> None:
-        """Submit the next verified block before processing the previous result.
-
-        All device work shares one stream, including cache updates and reclamation.
-        Prefill keeps same-iteration result processing for model hooks.
-        """
+        """Overlap decode with CPU results; keep prefill hooks in the same iteration."""
         while self.running:
             self.process_admin_requests()
             recv_reqs = self.recv_requests()

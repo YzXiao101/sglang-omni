@@ -1214,7 +1214,9 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
         request_builders, "set_cosyvoice3_preprocessing_context", lambda **kwargs: None
     )
 
-    builder = engine_builder.FunCosyVoice3EngineBuilder(onnx_intra_op_threads=6)
+    builder = engine_builder.FunCosyVoice3EngineBuilder(
+        onnx_intra_op_threads=6, enable_overlap=False
+    )
     builder.checkpoint_root = "/tmp"
     builder.before_memory_pool(
         model_worker=SimpleNamespace(

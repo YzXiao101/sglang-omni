@@ -54,10 +54,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         *,
         token_hop_len: int = TOKEN_HOP_LEN,
         onnx_intra_op_threads: int = 16,
-        enable_overlap: bool = False,
+        enable_overlap: bool,
     ) -> None:
         super().__init__()
-        self.enable_overlap = enable_overlap
+        self.enable_overlap: bool = enable_overlap
         hop = int(token_hop_len)
         if hop <= 0:
             raise ValueError(f"token_hop_len must be positive, got {token_hop_len}")
@@ -126,6 +126,18 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         draft_model_path = overrides.get("speculative_draft_model_path")
+        if draft_model_path is not None or self.enable_overlap:
+            if overrides.get("disable_overlap_schedule") not in (
+                None,
+                not self.enable_overlap,
+            ):
+                raise ValueError(
+                    "engine.disable_overlap_schedule conflicts with factory.enable_overlap"
+                )
+            else:
+                overrides["disable_overlap_schedule"] = not self.enable_overlap
+        else:
+            pass
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             overrides.get("speculative_algorithm")
         )

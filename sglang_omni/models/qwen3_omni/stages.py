@@ -1211,6 +1211,18 @@ def create_sglang_thinker_executor_from_config(
     prefill_coalesce_when_idle: bool = False,
 ) -> "OmniScheduler[SGLangARRequestData]":
     """Returns OmniScheduler for thinker."""
+    if (
+        enable_overlap
+        or (server_args_overrides or {}).get("speculative_draft_model_path") is not None
+    ) and (server_args_overrides or {}).get("disable_overlap_schedule") not in (
+        None,
+        not enable_overlap,
+    ):
+        raise ValueError(
+            "engine.disable_overlap_schedule conflicts with factory.enable_overlap"
+        )
+    else:
+        pass
     from sglang_omni.scheduling.sglang_backend import pin_resolved_device_type
     from sglang_omni.utils.device import resolve_concrete_device
 

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from sglang.srt.arg_groups.model_override_base import resolved_view
@@ -788,3 +789,75 @@ def test_talker_graph_stays_available_to_an_explicit_override(monkeypatch) -> No
     )
 
     assert overrides["disable_cuda_graph"] is False
+
+
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_thinker_overlap_conflict_fails_before_draft_loading(
+    monkeypatch: pytest.MonkeyPatch, enable_overlap: bool
+) -> None:
+    """A contradictory native flag must fail before draft metadata is loaded."""
+    load_draft = Mock(side_effect=AssertionError("draft loading must not start"))
+    monkeypatch.setattr(qwen_stages.AutoConfig, "from_pretrained", load_draft)
+
+    with pytest.raises(ValueError, match="conflicts with factory.enable_overlap"):
+        qwen_stages.create_sglang_thinker_executor_from_config(
+            "dummy",
+            enable_overlap=enable_overlap,
+            server_args_overrides={
+                "speculative_algorithm": "DFLASH",
+                "speculative_draft_model_path": "draft",
+                "disable_overlap_schedule": enable_overlap,
+            },
+        )
+
+    load_draft.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_overlap", [False, True])
+@pytest.mark.parametrize("explicit_native_flag", [False, True])
+def test_thinker_overlap_derives_native_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_overlap: bool,
+    explicit_native_flag: bool,
+) -> None:
+    """The public option selects the native worker mode after overrides merge."""
+    monkeypatch.setattr(
+        qwen_stages.AutoConfig,
+        "from_pretrained",
+        Mock(return_value=SimpleNamespace(max_position_embeddings=8192)),
+    )
+    engine_overrides: dict[str, object] = {
+        "speculative_algorithm": "DFLASH",
+        "speculative_draft_model_path": "draft",
+    }
+    if explicit_native_flag:
+        engine_overrides["disable_overlap_schedule"] = not enable_overlap
+    else:
+        pass
+    build_server_args = Mock(side_effect=RuntimeError("configuration forwarded"))
+    monkeypatch.setattr(qwen_stages, "build_sglang_server_args", build_server_args)
+
+    with pytest.raises(RuntimeError, match="configuration forwarded"):
+        qwen_stages.create_sglang_thinker_executor_from_config(
+            "dummy",
+            enable_overlap=enable_overlap,
+            server_args_overrides=engine_overrides,
+        )
+
+    assert (
+        build_server_args.call_args.kwargs["disable_overlap_schedule"]
+        is not enable_overlap
+    )
+
+
+def test_thinker_without_draft_preserves_native_scheduling_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The speculative option must not reject an existing non-draft configuration."""
+    overrides = thinker_overrides(
+        monkeypatch,
+        allows=True,
+        server_args_overrides={"disable_overlap_schedule": False},
+    )
+
+    assert overrides["disable_overlap_schedule"] is False

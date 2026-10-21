@@ -147,7 +147,12 @@ sgl-omni serve \
 
 - **Context.** The thinker serves within the draft's context (8,192 tokens for both drafts), and a request whose prompt plus `max_tokens` exceeds it, less a few tokens each step reserves, is rejected with an error. Setting `--preprocessing.factory.max_seq_len 8192` rejects most of them before the thinker.
 - **Sampling.** Requests with `repetition_penalty`, `min_p` or logprobs are rejected, because the draft workers verify without them. Rollout `/generate` requests default to `return_logprob: true`, so they must send `false`.
-- **Scheduling.** Async decode is turned off, and setting `enable_mixed_chunk` is rejected. EAGLE3 also runs prefill without CUDA graphs, since its draft extends on the composed multimodal embeddings. Sessions and weight updates are refused while a draft is loaded.
+- **Scheduling.** The ordinary async-decode path is turned off, and setting `enable_mixed_chunk` is rejected. Speculative decode overlap is available through the opt-in option below. EAGLE3 also runs prefill without CUDA graphs, since its draft extends on the composed multimodal embeddings. Sessions and weight updates are refused while a draft is loaded.
+
+Experimental decode overlap can be enabled with `--thinker.factory.enable_overlap true`
+when a draft is configured. It overlaps the next GPU round with CPU processing of
+the previous result; prefill remains synchronous. The option defaults to false,
+and the benchmark results below use the synchronous speculative loop.
 
 Text-only ASR on LibriSpeech test-clean (2,620 utterances, `--text-only`, thinker on one H100 80GB with FA3, greedy, `max_tokens 200`), in requests per second:
 
