@@ -71,6 +71,7 @@ from sglang_omni.scheduling.message import (
     StageScheduler,
 )
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
+from sglang_omni.utils.process import terminate_gpu_worker
 
 TorchProfiler = current_platform.get_torch_profiler()
 
@@ -380,16 +381,21 @@ class Stage:
         self.receive_tasks.clear()
         self.receive_lane_tails.clear()
         if self.scheduler is not None:
+            is_speculative_overlap = getattr(self.scheduler, "enable_overlap", False)
             try:
-                self.scheduler.stop()
+                if is_speculative_overlap and self.scheduler_thread is not None:
+                    self.scheduler.inbox.put(
+                        IncomingMessage(request_id="", type="stop")
+                    )
+                else:
+                    self.scheduler.stop()
             except Exception as exc:
                 _record_cleanup_error("scheduler", exc)
             # Note: (Jiaxin Deng) the scheduler thread emits its terminal
             # model-path events from its own finally, and the MPS validation
             # stage reads those files right after stop() returns, so wait for
             # the thread instead of letting a daemon thread be reclaimed at
-            # process exit. A slow thread is logged, not fatal: shutdown
-            # correctness must not start depending on this timeout.
+            # process exit.
             scheduler_thread = self.scheduler_thread
             if scheduler_thread is not None:
                 try:
@@ -399,15 +405,34 @@ class Stage:
                     )
                 except Exception as exc:
                     _record_cleanup_error("scheduler thread", exc)
+                    if is_speculative_overlap and scheduler_thread.is_alive():
+                        terminate_gpu_worker()
+                    else:
+                        pass
                 else:
                     if scheduler_thread.is_alive():
-                        logger.warning(
-                            "Stage %s scheduler thread did not stop within %gs",
-                            self.name,
-                            _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
-                        )
+                        if is_speculative_overlap:
+                            logger.error(
+                                f"Stage {self.name} speculative scheduler did not stop "
+                                f"within {_SCHEDULER_THREAD_JOIN_TIMEOUT_S:g}s; terminating worker"
+                            )
+                            terminate_gpu_worker()
+                        else:
+                            logger.warning(
+                                "Stage %s scheduler thread did not stop within %gs",
+                                self.name,
+                                _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                            )
                     else:
                         self.scheduler_thread = None
+                finally:
+                    if is_speculative_overlap and not scheduler_thread.is_alive():
+                        try:
+                            self.scheduler.stop()
+                        except Exception as exc:
+                            _record_cleanup_error("scheduler", exc)
+                    else:
+                        pass
             else:
                 pass
         else:

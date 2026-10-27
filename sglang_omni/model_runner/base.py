@@ -158,6 +158,9 @@ class ModelRunner(Generic[RequestDataInput]):
       - decode hooks for single-step autoregressive decode processing
     """
 
+    # note(YzXiao): opt in when next-round inputs are ready before CPU result collection and pending outputs retain their own storage.
+    supports_speculative_async_decode: bool = False
+
     # True when the model's own speculative verify applies repetition_penalty exactly.
     speculative_verifies_repetition_penalty: bool = False
     # An EAGLE draft extends on the embeddings the target prefilled with, which a
@@ -709,6 +712,15 @@ class ModelRunner(Generic[RequestDataInput]):
                 self.cleanup_prefill(forward_batch, schedule_batch, requests)
             else:
                 pass
+
+    def after_speculative_step(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Enqueue model-output snapshots on the current execution stream.
+        Attach owned snapshots through result.logits_output.auxiliary_device_output or result.auxiliary_host_output; their consume callback receives this round's stop-trimmed commits after copy_done.
+        Read device values on the CPU only in consume, after completion.
+        """
+        return None
 
     def on_speculative_tokens(
         self, scheduler_request: SchedulerRequest, token_ids: list[int]

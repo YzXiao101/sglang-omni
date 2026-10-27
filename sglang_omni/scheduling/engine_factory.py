@@ -114,6 +114,7 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
     # CUDA graph contract; a deployment override cannot enable it otherwise.
     supports_breakable_prefill_cuda_graph: bool = False
     supports_full_prefill_cuda_graph: bool = False
+    infrastructure_scheduler_options: SchedulerExtras[RequestDataT] | None = None
 
     def allowed_prefill_cuda_graph_backends(self) -> tuple[str, ...]:
         """Prefill graph backends the policy may accept for this model.
@@ -261,6 +262,14 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
         self.validate_before_infrastructure(server_args)
 
         infra_kwargs: InfrastructureOptions = {**self.infra_kwargs()}
+        self.infrastructure_scheduler_options = {
+            option_name: infra_kwargs[option_name]
+            for option_name in (
+                "enable_async_decode",
+                "should_run_top_priority_stream",
+            )
+            if option_name in infra_kwargs
+        }
         if self.model_arch_override is not None:
             infra_kwargs.setdefault("model_arch_override", self.model_arch_override)
         else:
@@ -558,6 +567,10 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
         }
         scheduler_kwargs.update(self.extra_scheduler_callbacks())
         scheduler_kwargs.update(extra_scheduler_kwargs)
+        if self.infrastructure_scheduler_options is not None:
+            scheduler_kwargs.update(self.infrastructure_scheduler_options)
+        else:
+            pass
         return omni_scheduler.OmniScheduler(**scheduler_kwargs)
 
     def post_scheduler_setup(
