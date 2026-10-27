@@ -1264,8 +1264,6 @@ def create_sglang_thinker_executor_from_config(
         else:
             pass
     else:
-        # note (wilsonzheng0327): the draft worker drives a synchronous loop that
-        # verifies whole blocks, so mixed prefill tails and the lookahead stay off.
         if not (speculative_algorithm.is_dflash() or speculative_algorithm.is_eagle3()):
             raise ValueError(
                 "Qwen3-Omni speculative thinker decoding supports DFLASH and EAGLE3, "
@@ -1294,7 +1292,6 @@ def create_sglang_thinker_executor_from_config(
         else:
             pass
         overrides["enable_mixed_chunk"] = False
-        enable_async_decode = False
         # note (wilsonzheng0327): an EAGLE draft extends on the composed multimodal
         # prefill embeddings, which a captured draft prefill graph would ignore.
         if speculative_algorithm.is_eagle():
