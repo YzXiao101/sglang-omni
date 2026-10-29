@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -87,6 +88,8 @@ def req_to_token_pool() -> SimpleNamespace:
 
 
 def init_sync_request_build_state(scheduler: OmniScheduler) -> None:
+    scheduler.enable_overlap = False
+    scheduler.result_queue = deque()
     scheduler.request_admission_lock = threading.RLock()
     scheduler.request_build_executor = None
     scheduler.request_build_max_pending = 0
@@ -325,6 +328,7 @@ def test_event_loops_run_without_autograd(loop_name: str) -> None:
         pass
 
     scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = False
     scheduler.running = True
     grad_modes: list[bool] = []
 
@@ -1416,6 +1420,7 @@ def test_immediate_finish_keeps_async_snapshot_aligned_until_resolve() -> None:
     live_batch = SimpleNamespace(reqs=list(reqs))
     snapshot = SimpleNamespace(reqs=list(reqs))
     scheduler = object.__new__(OmniScheduler)
+    scheduler.result_queue = deque()
     scheduler.running_batch = live_batch
     scheduler.cur_batch = live_batch
     scheduler.last_batch = None
@@ -3030,6 +3035,7 @@ def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
     monkeypatch.setattr(omni_scheduler_module, "_PENDING_STREAM_REQUEST_LIMIT", 3)
     monkeypatch.setattr(omni_scheduler_module, "_PENDING_STREAM_REQUEST_RETAINED", 2)
     scheduler = object.__new__(OmniScheduler)
+    scheduler.result_queue = deque()
     scheduler.running_batch = None
     scheduler.cur_batch = None
     scheduler.last_batch = None
@@ -3557,7 +3563,6 @@ def test_request_build_backlog_honors_configured_queue_limit(monkeypatch) -> Non
     ("enable_overlap", "enable_async_decode", "bind_late"),
     [
         (False, True, False),
-        (True, False, False),
         (False, True, True),
     ],
 )
@@ -3708,9 +3713,8 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     assert model_runner.async_enabled is enable_async_decode
 
 
-def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
-    """The async loop reuses the overlap batch-result contract; enabling both
-    would leak KV for finished requests, so construction must refuse."""
+def test_omni_scheduler_refuses_spec_overlap_without_a_draft(monkeypatch) -> None:
+    """The speculative loop requires the draft worker's result and handoff contract."""
     monkeypatch.setattr(
         OmniScheduler,
         "init_parallel_state",
@@ -3778,7 +3782,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="mutually exclusive"):
+    with pytest.raises(ValueError, match="requires a speculative worker"):
         OmniScheduler(
             tp_worker=tp_worker,
             tree_cache=None,
@@ -3789,6 +3793,124 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
             enable_overlap=True,
             enable_async_decode=True,
         )
+
+
+@pytest.mark.parametrize("forward_mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
+@pytest.mark.parametrize("resolve_before_prefill", [False, True])
+@pytest.mark.parametrize("fine_read_barrier", [False, True])
+def test_spec_overlap_orders_launch_consumption_and_shared_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_mode: ForwardMode,
+    resolve_before_prefill: bool,
+    fine_read_barrier: bool,
+) -> None:
+    """A next launch may pass result consumption, but shared writes must wait for reads."""
+    monkeypatch.setenv(
+        "SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP", str(int(resolve_before_prefill))
+    )
+    monkeypatch.setenv("SGLANG_FORCE_COARSE_WAR_BARRIER", "0")
+    events: list[str] = []
+    batches = []
+    for index in range(2):
+        batch = SimpleNamespace(
+            index=index,
+            forward_mode=forward_mode,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            grammar_needs_sync=lambda: False,
+        )
+        batch.copy = lambda batch=batch: batch
+        batches.append(batch)
+    selected_batches = iter([*batches, None])
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = True
+    scheduler.running = True
+    scheduler._engine_paused = (
+        False  # noqa: leading-underscore  # native scheduler contract
+    )
+    scheduler.require_mlp_sync = False
+    scheduler.last_batch = None
+    scheduler.result_queue = deque()
+    scheduler.process_admin_requests = lambda: None
+    scheduler.recv_requests = lambda: []
+    scheduler.take_deferred_request_payloads = lambda: []
+    scheduler.process_input_requests = lambda requests: None
+    scheduler.get_next_batch_to_run = lambda: next(selected_batches)
+    shared_reader = SimpleNamespace(shared_read_done_event=None)
+    scheduler.draft_worker = SimpleNamespace(last_shared_read_runner=shared_reader)
+    scheduler.forward_stream = object()
+    scheduler.schedule_stream = SimpleNamespace(
+        wait_event=lambda event: events.append(f"read {event}"),
+        wait_stream=lambda stream: events.append("read stream"),
+    )
+
+    def launch(batch: SimpleNamespace) -> int:
+        events.append(f"launch {batch.index}")
+        shared_reader.shared_read_done_event = (
+            batch.index if fine_read_barrier else None
+        )
+        return batch.index
+
+    scheduler.run_batch = launch
+    scheduler.process_batch_result = lambda batch, result: events.append(
+        f"consume {result}"
+    )
+    scheduler.self_check_during_idle = lambda: None
+    scheduler.sleep_during_idle = lambda: setattr(scheduler, "running", False)
+    scheduler.event_loop_spec_overlap()
+    scheduler.resolve_pending_async()
+
+    first = ["launch 0", "read 0" if fine_read_barrier else "read stream"]
+    second = ["launch 1", "read 1" if fine_read_barrier else "read stream"]
+    if forward_mode == ForwardMode.EXTEND and resolve_before_prefill:
+        expected = first + ["consume 0"] + second + ["consume 1"]
+    else:
+        expected = first + second + ["consume 0", "consume 1"]
+    assert events == expected
+    assert not scheduler.result_queue
+    assert shared_reader.shared_read_done_event is None
+
+
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_partial_spec_launch_failure_does_not_reclaim_inflight_kv(
+    enable_overlap: bool,
+) -> None:
+    """An overlap failure can leave GPU work queued against the batch's KV slots."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = enable_overlap
+    scheduler._run_batch = Mock(
+        side_effect=RuntimeError("partial launch")
+    )  # noqa: leading-underscore  # native runner entry point
+    scheduler.handle_batch_failure = Mock()
+    batch = SimpleNamespace()
+    if enable_overlap:
+        with pytest.raises(RuntimeError, match="partial launch"):
+            scheduler.run_batch(batch)
+        scheduler.handle_batch_failure.assert_not_called()
+    else:
+        scheduler.run_batch(batch)
+        assert scheduler.handle_batch_failure.call_args.args[0] is batch
+
+
+def test_spec_prefill_completion_precedes_host_result_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefill lifecycle events and CPU consumption must wait for the result copy."""
+    events: list[str] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = True
+    scheduler.emit_prefill_end_for_batch = lambda batch: events.append("prefill end")
+    monkeypatch.setattr(
+        sglang_scheduler_module.Scheduler,
+        "process_batch_result",
+        lambda self, batch, result: events.append("consume"),
+    )
+    scheduler.process_batch_result(
+        SimpleNamespace(forward_mode=ForwardMode.EXTEND, reqs=[]),
+        SimpleNamespace(
+            copy_done=SimpleNamespace(synchronize=lambda: events.append("copy done"))
+        ),
+    )
+    assert events == ["copy done", "prefill end", "consume"]
 
 
 def test_omni_scheduler_normalizes_prefill_coalesce_args(monkeypatch) -> None:
@@ -3836,6 +3958,7 @@ def test_stage_output_cache_tracks_bytes_and_detaches() -> None:
 
 def test_omni_scheduler_stop_runs_shutdown_callback_once() -> None:
     scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_overlap = False
     shutdowns: list[None] = []
     scheduler.running = True
     scheduler.request_admission_lock = threading.RLock()
@@ -4301,6 +4424,7 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     )
     scheduler = object.__new__(OmniScheduler)
     scheduler.mark_running_request_aborted = lambda _rid: True
+    scheduler.enable_overlap = False
     scheduler.request_admission_lock = threading.Lock()
     scheduler.aborted_request_ids = set()
     scheduler.aborted_request_id_order = collections.deque()
