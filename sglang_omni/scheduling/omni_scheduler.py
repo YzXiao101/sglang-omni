@@ -3837,21 +3837,9 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
 
     def event_loop_overlap(self) -> None:
-        # Model runners read Req.inflight_middle_chunks at forward time under
-        # a same-iteration process_batch_result contract. On this loop the
-        # decrement lags one iteration, so a final prefill chunk still reads
-        # as a middle chunk at forward time and the TTS model runners emit
-        # wrong chunk boundaries — silently. No construction site enables
-        # overlap today; refuse to run rather than corrupt chunked prefill if
-        # one ever does.
-        # The pre-guard loop body lives in git history ("Refuse the
-        # OmniScheduler overlap event loop"); reviving it needs that drain,
-        # not just deleting this raise.
+        # note (YzXiao): deleting this guard would let __getattr__ expose a loop without Omni's chunk boundary handling.
         raise NotImplementedError(
-            "OmniScheduler's overlap event loop is unsupported: "
-            "Req.inflight_middle_chunks lags one iteration on this loop. "
-            "Drain the result queue before the forward, then remove this "
-            "guard."
+            "Use event_loop_spec_overlap for speculative async decode"
         )
 
     @DynamicGradMode()
@@ -3879,9 +3867,15 @@ class OmniScheduler(Generic[RequestDataT]):
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             has_pending_result = bool(self.result_queue)
-            consume_before_launch = (
-                has_pending_result
-                and self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch)
+            # note (YzXiao): only result processing decrements inflight_middle_chunks; prefill hooks use it to recognize the final chunk.
+            consume_before_launch = has_pending_result and (
+                self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch)
+                or (
+                    batch is not None
+                    and any(
+                        request.inflight_middle_chunks > 0 for request in batch.reqs
+                    )
+                )
             )
             if consume_before_launch:
                 pending_batch, pending_result = self.result_queue.popleft()
